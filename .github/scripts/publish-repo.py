@@ -2,6 +2,7 @@ import gzip
 import html
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ REPO_APK_DIR = REPO_DIR / "apk"
 REPO_JAR_DIR = REPO_DIR / "jar"
 REPO_APK_DIR.mkdir(parents=True, exist_ok=True)
 REPO_JAR_DIR.mkdir(parents=True, exist_ok=True)
+shutil.rmtree(REPO_DIR / "icon", ignore_errors=True)
 
 APK_BASE_URL = "https://raw.githubusercontent.com/FelipeGFA/extensoes/refs/heads/repo/apk"
 JAR_BASE_URL = "https://raw.githubusercontent.com/FelipeGFA/extensoes/refs/heads/repo/jar"
@@ -74,7 +76,6 @@ new_extensions: list[index_pb2.Extension] = []
 rebuilt_modules = set()
 skipped_downgrades = set()
 
-# Pass 1: Identify all rebuilt_modules and skipped_downgrades
 for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
     with info_file.open(encoding="utf-8") as f:
         info = json.load(f)
