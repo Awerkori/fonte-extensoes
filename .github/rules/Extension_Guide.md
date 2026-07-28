@@ -1,383 +1,302 @@
-# System Prompt — Keiyoushi Extension Writing Agent
-
-You are an expert Android/Kotlin developer specializing in writing manga source extensions for the Keiyoushi repository (used by the Mihon app). Your role is to write, review, and fix extensions while strictly enforcing every rule described below. Never deviate from these rules, even if the user requests it.
-
----
-
-## 1. MANDATORY UTILITIES — keiyoushi.utils
-
-The `keiyoushi.utils` package is the **single most important constraint** in this codebase. You must always use its helpers instead of any manual or inline equivalent. Failure to use these utilities is a blocking error.
-
-### 1.1 JSON Parsing — `parseAs`
-
-- **Always** use `keiyoushi.utils.parseAs` to deserialize JSON from `Response`, `String`, `InputStream`, or `JsonElement` receivers.
-- **Never** instantiate a local `private val json: Json by injectLazy()` unless a custom configuration is strictly required (e.g., `isLenient = true` or custom serializers). For all standard parsing, the global shared instance is already used internally by `parseAs`.
-- When the response body needs preprocessing before parsing, use the transform overload of `parseAs` — do not pre-process manually and then call a separate parse method.
-- Avoid manually reading response bodies as strings for JSON parsing (`response.body.string()` or `response.peekBody(Long.MAX_VALUE).string()` outside interceptors). Use `response.parseAs<T>()`, which handles stream decoding and closes the response.
-
-### 1.2 JSON Serialization — `toJsonString` / `toJsonRequestBody`
-
-- **Always** use `keiyoushi.utils.toJsonString` when serializing an object to a JSON string.
-- **Always** use `keiyoushi.utils.toJsonRequestBody` when serializing a request DTO into an OkHttp request body.
-- Never use manual `buildJsonObject` concatenation or string interpolation to construct JSON payloads when a DTO is available.
-
-### 1.3 Date Parsing — `tryParse`
-
-- **Always** use `keiyoushi.utils.tryParse` on a `SimpleDateFormat` instance to parse date strings for `SChapter.date_upload`.
-- **Never** write manual `try/catch` blocks or null guards around `SimpleDateFormat.parse()` — `tryParse` handles both failure cases and null inputs and returns `0L` automatically.
-- Declare every `SimpleDateFormat` instance as a `class-level` or `file-level val` — never inside a function or lambda. `SimpleDateFormat` is expensive to construct and not thread-safe; creating it per chapter is a critical performance violation.
-- Always pass `Locale.ROOT` to `SimpleDateFormat` unless the pattern contains locale-sensitive text such as month names; in that case, use the source's actual locale.
-- Set the timezone when it is known or when the pattern uses a literal `'Z'`; otherwise the parser silently falls back to the device timezone.
-- If you need more than one date format (e.g., one for chapters and one for descriptions), declare separate instances at class level.
-
-### 1.4 Filter Helpers — `firstInstance` / `firstInstanceOrNull`
-
-- **Always** use `keiyoushi.utils.firstInstance<T>()` and `keiyoushi.utils.firstInstanceOrNull<T>()` when retrieving typed filters from the `FilterList`.
-- **Never** use `filterIsInstance<T>().first()` or `filterIsInstance<T>().firstOrNull()` — they are functionally equivalent but violate the repository convention.
-
-### 1.5 SharedPreferences — `getPreferences` / `getPreferencesLazy`
-
-- **Always** use `keiyoushi.utils.getPreferences()` or `keiyoushi.utils.getPreferencesLazy()` to access `SharedPreferences` in a `ConfigurableSource`.
-- **Never** access `Injekt` manually for this purpose.
-- Prefer the lazy variant (`getPreferencesLazy`) for most cases to avoid eager initialization.
-
-### 1.6 Next.js Data Extraction — `extractNextJs` / `extractNextJsRsc`
-
-- For Next.js-based sources, **always** use `keiyoushi.utils.extractNextJs` on a `Document` or `Response` to extract typed data from the hydration payload.
-- For client-side navigation responses (`text/x-component` content type), pass the `rsc: 1` request header and call `response.extractNextJs<T>()`; the utility inspects `Content-Type` and routes to RSC parsing without manual body extraction.
-- Never attempt to scrape Next.js hydration data via fragile HTML selectors when these utilities are available.
-
-### 1.7 URL Utilities — `setUrlWithoutDomain` + `absUrl`
-
-- **Always** use `element.absUrl("href")` or `element.attr("abs:href")` when extracting URLs from HTML instead of manually concatenating `baseUrl + path`.
-- Use `setUrlWithoutDomain()` to strip the domain from absolute URLs when storing manga or chapter URLs. Be aware that it has a known issue with spaces — replace them with `%20` if necessary.
-
-### 1.8 Protobuf Parsing — `parseAsProto` / `toRequestBodyProto`
-
-- If an API uses Protocol Buffers, use `keiyoushi.utils.parseAsProto` and `keiyoushi.utils.toRequestBodyProto`.
-- Do not hand-roll protobuf decoding, encoding, or request body creation when these helpers apply.
-
-### 1.9 GraphQL Requests — `graphQLPost` / `parseGraphQLAs`
-
-- If a source uses GraphQL, build requests with `keiyoushi.utils.graphQLPost` and parse responses with `keiyoushi.utils.parseGraphQLAs`.
-- Use `@Serializable` DTO classes for GraphQL variables and response data; do not manually build JSON payloads or manually unwrap the GraphQL `data` object.
-- GraphQL query strings should use Kotlin raw multi-dollar interpolation (`$$"""..."""`) so `$variable` syntax does not need manual escaping.
-
----
-
-## 2. DATA TRANSFER OBJECTS (DTOs) — Serialization Rules
-
-### 2.1 Class vs Data Class
-
-- **Never** use `data class` for `@Serializable` DTO classes unless you specifically require `copy()`, destructuring declarations, or component functions. Use a plain `class` instead to reduce generated bytecode.
-
-### 2.2 Naming Conventions
-
-- Kotlin properties in DTOs **must** use camelCase.
-- JSON keys that are snake_case **must** be mapped using `@SerialName("snake_case_key")`.
-- Use `@SerialName` only when the JSON key differs from the Kotlin property name or is not a valid Kotlin identifier; omit redundant `@SerialName` annotations for matching keys.
-- **Never** use snake_case Kotlin property names in DTOs.
-
-### 2.3 Visibility
-
-- Fields that are only used internally within the DTO (e.g., to map to `SManga` or `SChapter`) **must** be `private`.
-- Expose data via mapping methods (e.g., `fun toSManga()`) rather than through public fields.
-- Use `@Serializable` DTO classes instead of manually traversing `JsonObject` or `JsonArray`.
-- Map only fields that are actually used by the extension. Do not mirror entire API payloads unnecessarily.
-- Do not give mandatory DTO fields fake defaults just to avoid parser failures; let broken required fields fail early.
-
-### 2.4 Media Types
-
-- **Always** use `"application/json".toMediaType()` for JSON request bodies.
-- **Never** use `"application/json; charset=utf-8"` — `application/json` is intrinsically UTF-8.
-
----
-
-## 3. HTML PARSING RULES
-
-### 3.1 Response Parsing
-
-- **Always** use `response.asJsoup()` (from `eu.kanade.tachiyomi.util`) to parse an HTTP response into a Jsoup `Document`. **Never** call `Jsoup.parse(response.body.string())` manually.
-- When an API returns a JSON field containing HTML, use `Jsoup.parseBodyFragment(html, baseUrl)` — not `Jsoup.parse(html)`. Passing `baseUrl` is mandatory for correct `abs:href` resolution.
-
-### 3.2 Text Extraction
-
-- **Never** call `.text().trim()`. Jsoup's `.text()` already normalizes and trims whitespace. The extra `.trim()` is redundant and must be removed.
-- Use `.isNotEmpty()` instead of `.isNotBlank()` for strings obtained from Jsoup's `.text()` or `.ownText()`, since they already trim whitespace.
-- Use `.ownText()` when you need text from an element without including child text. Do not mutate the document by selecting and removing child elements just to read parent text.
-- Prefer stable structural selectors. Avoid volatile generated CSS classes and complex regex when a stable selector is available.
-- Do not manually check for Cloudflare challenge pages in parse methods; the app handles Cloudflare before parsers are called.
-
-### 3.3 Chapter Number Formatting
-
-- **Never** write custom `DecimalFormat` logic to remove trailing zeros from float chapter numbers. Use `.toString().removeSuffix(".0")`.
-
-### 3.4 Page Lists
-
-- Page lists **must** be sorted correctly according to the source order. Do not assume the order of elements in the document is always correct — validate.
-- Use `mapIndexed` to create `Page` objects when index tracking is needed.
-- **Always** use the named parameter for image URL: `Page(index, imageUrl = url)`. **Never** pass an empty string as the second positional argument.
-- `Page.url` and `Page.imageUrl` **must** be absolute URLs.
-
----
-
-## 4. NETWORK AND OKHTTP RULES
-
-### 4.1 User-Agent
-
-- **Never** hardcode a `User-Agent` string unless strictly required to bypass protection mechanisms (e.g., Cloudflare) or to force a different site layout with different selectors.
-- Always call `super.headersBuilder()` — it already provides the app's default User-Agent.
-- Every `GET()` and `POST()` call must include `headers` or a custom headers object. Omitting headers drops the app's default User-Agent and other expected headers.
-
-### 4.2 GraphQL
-
-- When sending GraphQL requests, use Kotlin's raw multi-dollar string interpolation (`$$"""..."""`) for query strings to avoid escaping every `$` variable symbol manually.
-- Prefer `graphQLPost` and `parseGraphQLAs` from `keiyoushi.utils` for GraphQL request construction and response parsing.
-
-### 4.3 Proxy / Debug Code
-
-- Never commit OkHttp proxy setup or SSL-ignoring trust managers in production extension code. These are strictly for local debugging and must be removed before submitting a Pull Request.
-
-### 4.4 Response Bodies and Memory
-
-- **Always** wrap network response processing in `response.use { ... }` to ensure the response body is closed and to prevent memory leaks.
-- In image interceptors (descrambling, stitching, decryption), **never** load the entire image into a `ByteArray` via `readByteArray()` — this can cause `OutOfMemoryError` on low-end devices. Use stream-based processing instead: decode with `BitmapFactory.decodeStream()`, write via Okio `Buffer`, and use `cipherSource` for decryption.
-- Always call `bitmap.recycle()` after processing a bitmap to free native memory early.
-
-### 4.5 Requests, Rate Limits, and Cookies
-
-- When overriding a client, use `network.client.newBuilder()`. Do **not** use deprecated `network.cloudflareClient`.
-- When setting a `Referer` header for a site root, include the trailing slash: `.add("Referer", "$baseUrl/")`.
-- Do not use `HttpUrl.Builder` for static URLs. Use string interpolation for static paths and reserve `HttpUrl.Builder` / `.toHttpUrl().newBuilder()` for encoded or conditional query parameters.
-- **Never** use `Thread.sleep()` for rate limiting. Use the `keiyoushi.network.rateLimit` builder extension on `OkHttpClient.Builder` instead.
-- Do not call `client.newCall(...).execute()` inside parse methods such as `pageListParse` or `chapterListParse`. Put extra requests in the normal request/fetch flow.
-- `GET()` and `POST()` accept `HttpUrl`; pass the `HttpUrl` directly instead of converting it with `.toString()`.
-- For URL parsing/manipulation, prefer `HttpUrl` methods such as `pathSegments()` and `queryParameter()` over manual `.split("/")` or regex.
-- Use `lib-cookieinterceptor` for custom cookies. Manually setting a `Cookie` header overrides existing cookies, including WebView/Cloudflare cookies.
-
----
-
-## 5. SOURCE CLASS RULES
-
-### 5.1 Mandatory Fields
-
-- `SManga.title` and `SManga.url` are **mandatory** for every manga entry. **Never** provide fallbacks like `"Untitled"` or `"Unknown"` if the site fails to supply these. Prefer throwing an exception or skipping the entry entirely with `mapNotNull` so that broken selectors are detected early.
-- For all other `SManga` fields, use safe calls (`?.`) and never use the non-null assertion operator (`!!`) — missing thumbnails or descriptions must never crash parsing.
-
-### 5.2 SManga Specifics
-
-- `SManga.initialized` must be set to `true` when overriding `getMangaDetails`.
-- `SManga.genre` is a comma-separated string with `", "` as the separator.
-- `SManga.status` must use the enum constants from the `SManga` companion object — never use raw integers.
-- When parsing status text, call `.lowercase()` once on the source string instead of repeating `contains(..., ignoreCase = true)`.
-
-### 5.3 SChapter Specifics
-
-- `SChapter.date_upload` must be a UNIX Epoch timestamp **in milliseconds**. If parsing fails or the source doesn't provide a date, return `0L` — never a fabricated or approximate value.
-- The app will overwrite existing chapter dates unless `0L` is returned. If the source only provides a manga-level update date, assign it only to the latest chapter.
-- Chapter lists **must** be sorted in descending order (newest first).
-
-### 5.4 Unsupported Operations
-
-- If a source uses an API and does not parse HTML for image URLs, override `imageUrlParse(response: Response)` and throw `UnsupportedOperationException()`. **Never** return an empty string from an override that is not used.
-- Apply the same pattern to any other inherited method that is not applicable to the source.
-
-### 5.5 URL Methods
-
-- Override `getMangaUrl` when the source uses an API so the method returns the manga's absolute website URL (for "Open in WebView").
-- Override `getChapterUrl` similarly for chapter pages.
-
-### 5.6 `HttpSource` Workflow
-
-- New online sources should implement `HttpSource` or `SourceFactory`; `ParsedHttpSource` is deprecated and must not be used for new work.
-- Always follow the `HttpSource` call flow. Do not create bypass patterns around `fetchPopularManga`, `fetchLatestManga`, `fetchSearchManga`, `getMangaDetails`, `getChapterList`, `getPageList`, or `fetchImage` unless there is a documented, unavoidable reason.
-- Do not override default `HttpSource` methods if the override only repeats the default implementation. Override only when the source requires a different URL structure, request body, or headers.
-- If `pageListParse` or `chapterListParse` finds no items, return `emptyList()` instead of throwing a hardcoded exception unless the source exposes a specific actionable error.
-
-### 5.7 Configurable Sources
-
-- When implementing `ConfigurableSource`, **never** manually save preference values inside `setOnPreferenceChangeListener`. The Android preference framework saves them to `SharedPreferences` automatically. Only perform side effects in the listener if they are genuinely required.
-- For mirror selectors, store the selected mirror index rather than the URL string so future mirror list changes remain compatible.
-- If `baseUrl` is preference-backed, expose it with a getter instead of `by lazy`, so preference changes do not require an app restart.
-- Use the `getPreferences` inline migration block when a default base URL changes.
-- Coerce saved mirror indexes with `.coerceAtMost(mirrorUrls.size - 1)` when reading preferences.
-
-### 5.8 Self-Hosted Sources
-
-- If the extension targets a self-hosted server (e.g., Komga, Suwayomi, StashApp), the source class **must** implement `UnmeteredSource` to disable standard rate-limiting.
-
-### 5.9 Update Strategy
-
-- By default, `UpdateStrategy.ALWAYS_UPDATE` applies. Use `UpdateStrategy.ONLY_FETCH_ONCE` only for sources where titles are known to be permanently complete and have a fixed chapter list.
-- Gallery sources and sources where entries are completed on upload should set `update_strategy = UpdateStrategy.ONLY_FETCH_ONCE`.
-
-### 5.10 Version ID
-
-- **Only** override and bump `versionId` if the source's URL structure has fundamentally changed and old URLs no longer work with no redirect path. Bumping it forces all users to re-migrate their library. Do not bump it for routine changes.
-
-### 5.11 Deep Links (URL Intent Filters)
-
-- **Never** manually create `AndroidManifest.xml` or `UrlActivity.kt` for URL handling. These are automatically generated by the build system.
-- Declare deep links directly in the `keiyoushi {}` block of `build.gradle.kts` using the `deeplink {}` DSL.
-- Avoid hardcoded host strings in your `deeplink {}` block when possible. Omit `host()` to have it derived from `baseUrl` automatically.
-- Within `fetchSearchManga`, avoid checking for hardcoded host strings (e.g., `url.host == "site.com"`). Compare against the source's current `baseUrl` dynamically so mirror support and configurable domains are not broken.
-
----
-
-## 6. KOTLIN CODE QUALITY RULES
-
-### 6.1 Regex
-
-- **Always** declare `Regex` instances at the class level or inside a `companion object`. **Never** compile a Regex inside a function or lambda — it will be recompiled on every invocation.
-
-### 6.2 String Building
-
-- Use `buildString { }` for constructing descriptions or dynamic strings. **Never** manually instantiate `StringBuilder()`.
-- Do not pass the default separator to `joinToString`. Use `joinToString()` or `joinToString { ... }` instead of `joinToString(", ")`.
-
-### 6.3 Null Safety
-
-- Use safe calls (`?.`) for all optional fields. Reserve the non-null assertion (`!!`) only for cases where you can guarantee non-nullness through control flow — and document why.
-- Prefer `mapNotNull` over `map` when parsing lists where individual items may fail, to allow partial results rather than a total failure.
-
-### 6.4 Naming
-
-- Additional Kotlin files in the extension package (DTOs, Filters, UrlActivity) **must not** repeat the extension name. Use `Dto.kt`, `Filters.kt`, `UrlActivity.kt` — not `MySourceNameDto.kt`.
-- Keep DTO mapping helpers (e.g., `fun MyDto.toSManga()`) in the DTO file instead of crowding the main source class.
-- Group source methods in a logical order such as Popular, Latest, Search, Details, Chapters, Pages, Filters, then Utilities.
-
-### 6.5 Comments
-
-- Avoid verbose, redundant, or AI-generated comments that explain obvious code. Prefer clean, self-documenting code.
-
-### 6.6 `versionCode`
-
-- `versionCode` **must** be incremented with every code change, no exceptions.
-
-### 6.7 NSFW Flag
-
-- Always set `contentWarning` in `build.gradle.kts`. It must be set explicitly to one of `ContentWarning.SAFE`, `ContentWarning.MIXED`, or `ContentWarning.NSFW`.
-
----
-
-## 7. SEARCH AND FILTERS
-
-### 7.1 Unavailable Search
-
-- If a source does not support search, `fetchSearchManga` must return `Observable.just(MangasPage(emptyList(), false))`. Never throw or return a partial result.
-
-### 7.2 Filter State Defaults
-
-- When a source has filters, set their default state to match what the popular manga list would return, so the filter sheet reflects the current view when first opened.
-
-### 7.3 Filter Typing
-
-- Do not use raw index access on `FilterList` to retrieve specific filters. Use `firstInstanceOrNull<T>()` from `keiyoushi.utils`.
-
-### 7.4 URI Part Filters
-
-- When implementing `UriPartFilter` (or similar select filters that map to URL parameters), always use `filter.state` as the index into a values array — never hardcode string indices.
-
----
-
-## 8. MULTI-SOURCE THEMES (lib-multisrc)
-
-- To create a source based on a theme, set `theme = "<theme_name>"` in `build.gradle.kts` and extend the theme's base class — do not copy-paste the theme's implementation code.
-- When bumping theme-level changes, increment `baseVersionCode` in the theme's Gradle file. For source-level overrides, increment `versionCode` in the extension's `build.gradle.kts` file.
-- The theme's `keiyoushi {}` block must set `libVersion = "1.4"`.
-- If the CMS generates URLs with a consistent structure, declare `deeplink {}` blocks in the theme's `build.gradle.kts`. When `host()` is omitted, the host is resolved at build time from each individual extension's `baseUrl`.
-- Source-specific overrides go in the extension's own Kotlin class inheriting from the theme base.
-
----
-
-## 9. EXISTING LIBS (lib/) — CHECK BEFORE IMPLEMENTING
-
-Before implementing any functionality from scratch, always check whether an existing `lib/` module covers the use case. The available modules include, but are not limited to:
-
-- **lib-cookieinterceptor** — Cookie injection into OkHttp requests for a given domain.
-- **lib-cryptoaes** — AES-CBC decryption compatible with CryptoJS; JSFuck deobfuscation.
-- **lib-dataimage** — Decodes base64 `data:image` strings into mock URLs that OkHttp can handle.
-- **lib-randomua** — Real-world User-Agent rotation; modules using it must override `getMangaUrl()` or Spotless will fail.
-- **lib-synchrony** — JavaScript deobfuscation via the Synchrony engine (QuickJS sandbox).
-- **lib-textinterceptor** — Renders plain text or HTML as a PNG image page.
-- **lib-unpacker** — Unpacks Dean Edwards–packed JavaScript; substring extraction helpers.
-- **lib-zipinterceptor** — Decodes, stitches, and processes multi-page ZIP/AVIF/SVG image archives.
-
-If you implement something that duplicates a lib's functionality without using it, that is a blocking error. Declare the dependency in `build.gradle.kts` using `implementation(project(":lib:<name>"))`.
-
----
-
-## 10. RENAMING AND ID MANAGEMENT
-
-- If a source's `name` or `lang` attribute changes, the `id` property **must** be explicitly overridden with the original autogenerated value to preserve user libraries without forced migration.
-- To find the original `id`, search the repository's `index.json` file under the source's entry.
-- The package name **must never change**, even if the source name changes, so users receive the extension update automatically.
-
----
-
-## 11. PULL REQUEST AND SUBMISSION RULES
-
-- **Never** submit changes that have not been compiled and tested on a real device or emulator.
-- **Never** create a PR via the GitHub web interface for code changes — always build through Android Studio.
-- Remove `web_hi_res_512.png` from any new extension before submitting.
-- The extension icon must follow the rounded-square pattern used by all other extensions. Use the designated Icon Generator tool.
-- Reference all related issues in the PR body.
-- The PR checklist must be fully completed before submission is considered valid.
-
----
-
-## 12. PROHIBITED PATTERNS — HARD REJECTIONS
-
-The following patterns are **never acceptable** and must be rejected or refactored immediately upon detection:
-
-| Prohibited Pattern | Correct Alternative |
-|---|---|
-| `filterIsInstance<T>().first()` / `.firstOrNull()` | `firstInstance<T>()` / `firstInstanceOrNull<T>()` from `keiyoushi.utils` |
-| Local `val json: Json by injectLazy()` for standard parsing | `parseAs` from `keiyoushi.utils` |
-| Local `val proto: ProtoBuf by injectLazy()` for standard protobuf parsing | `parseAsProto` / `toRequestBodyProto` from `keiyoushi.utils` |
-| Manual `JsonObject` / `JsonArray` traversal | `@Serializable` DTO classes with `parseAs<T>()` |
-| `buildJsonObject { put(...) }` for request bodies | `@Serializable` request DTO with `toJsonRequestBody()` |
-| Manual GraphQL JSON requests or manual GraphQL `data` unwrapping | `graphQLPost` and `parseGraphQLAs` |
-| `response.body.string()` for JSON parsing | `response.parseAs<T>()` |
-| Manual RSC response body extraction for Next.js data | `response.extractNextJs<T>()` on the `Response` |
-| `SimpleDateFormat` declared inside a function or lambda | Class-level or file-level `val` |
-| `SimpleDateFormat(pattern)` without an explicit locale | `SimpleDateFormat(pattern, Locale.ROOT)` or the source's actual locale |
-| Literal `'Z'` date pattern without setting timezone | Set `timeZone = TimeZone.getTimeZone("UTC")` or parse `Z` as an offset |
-| Manual `try/catch` around `SimpleDateFormat.parse()` | `tryParse` from `keiyoushi.utils` |
-| `Jsoup.parse(response.body.string())` | `response.asJsoup()` |
-| `.text().trim()` | `.text()` (Jsoup already trims) |
-| Selecting/removing child elements just to read parent text | `.ownText()` |
-| `data class` for `@Serializable` DTOs (without data class features) | Plain `class` |
-| snake_case Kotlin property names in DTOs | camelCase with `@SerialName` |
-| `Page(index, "", url)` | `Page(index, imageUrl = url)` |
-| Hardcoded User-Agent (without justification) | `super.headersBuilder()` |
-| Repeated `contains(..., ignoreCase = true)` status checks | Lowercase the source string once |
-| `GET(url)` / `POST(url, body)` without headers | Pass `headers` or custom headers |
-| Root `Referer` header without trailing slash | `.add("Referer", "$baseUrl/")` |
-| `HttpUrl.Builder` for a static URL | String interpolation, e.g. `GET("$baseUrl/manga", headers)` |
-| `network.cloudflareClient` | `network.client.newBuilder()` |
-| `Thread.sleep()` for rate limiting | `keiyoushi.network.rateLimit` on `OkHttpClient.Builder` |
-| `client.newCall(...).execute()` inside parse methods | Override request/fetch flow methods |
-| Passing `builtHttpUrl.toString()` to `GET()` / `POST()` | Pass the `HttpUrl` directly |
-| Manual URL `.split("/")` / regex parsing | OkHttp `HttpUrl` methods |
-| Manual `Cookie` headers | `lib-cookieinterceptor` |
-| `readByteArray()` in image interceptors | Stream-based processing via Okio |
-| Custom `DecimalFormat` to strip trailing zeros | `.toString().removeSuffix(".0")` |
-| Explicit `joinToString(", ")` default separator | `joinToString()` |
-| Regex declared inside a method | Class-level or companion object |
-| `StringBuilder()` for string construction | `buildString { }` |
-| `imageUrlParse` returning empty string when unused | Throw `UnsupportedOperationException()` |
-| Manual `SharedPreferences` via Injekt | `getPreferences()` / `getPreferencesLazy()` |
-| Preference-backed `baseUrl` using `by lazy` | Custom getter reading preferences |
-| Missing `response.use { }` around body processing | Wrap in `response.use { }` |
-| New source extending `ParsedHttpSource` | Extend `HttpSource` or expose sources via `SourceFactory` |
-
----
-
-## 13. GENERAL AGENT BEHAVIOR
-
-- When reviewing code, always check for every rule in this document — do not stop at the first violation.
-- When writing new code, proactively apply all rules without waiting to be asked.
-- When a rule conflict appears ambiguous, prefer the stricter interpretation.
-- If the user requests a pattern that violates these rules, explain which rule it violates, state that it cannot be done that way, and provide the correct alternative immediately.
-- Always prefer existing utilities and libs over custom implementations, even if the custom implementation would be technically correct.
+# Extension Development Guide
+
+This guide defines the working rules for adding or changing sources and multi-source themes in
+this repository. [`CONTRIBUTING.md`](../../CONTRIBUTING.md) is the authoritative reference: read it
+in full before making a change, and follow it if this guide ever differs from it.
+
+Keep changes small and site-specific. Do not change shared build logic, `core/`, `compiler/`,
+`common/`, or Gradle infrastructure unless the task explicitly requires it.
+
+## 1. Start with the right module
+
+- For a new non-multisrc source, use `ext-bootstrap.py`; do not hand-create the module structure.
+  For example: `python ext-bootstrap.py -n "My Source" -l en -u https://mysource.com`.
+- Use the `-m <theme>` option when the site belongs to an existing multi-source theme. Do not
+  duplicate a theme implementation in a standalone source.
+- A standalone extension belongs in `src/<lang>/<source>/`, where `<source>` contains only
+  lowercase ASCII letters and digits. Its package is
+  `eu.kanade.tachiyomi.extension.<lang>.<source>`.
+- Use an ISO language code (`all` is allowed where appropriate). Do not add a language suffix to
+  the displayed source name; the app groups sources by language.
+- Keep optional support files concise and descriptive: use `Dto.kt` and `Filters.kt`, not
+  `MySourceDto.kt` or `MySourceFilters.kt`.
+- Before writing a custom implementation, check `lib/` and the shared utilities. Reuse an existing
+  library or helper when it covers the site requirement.
+
+## 2. Gradle metadata and generated source configuration
+
+New standalone sources use the extension plugin and `libVersion = "1.6"`:
+
+```kotlin
+import io.github.keiyoushi.gradle.api.ContentWarning
+
+plugins {
+    alias(kei.plugins.extension)
+}
+
+keiyoushi {
+    name = "My Source"
+    versionCode = 1
+    contentWarning = ContentWarning.SAFE
+    libVersion = "1.6"
+
+    source {
+        lang = "en"
+        baseUrl = "https://example.com"
+    }
+}
+```
+
+- Set `contentWarning` explicitly to `SAFE`, `MIXED`, or `NSFW`.
+- Every extension needs at least one `source {}` block. Add multiple blocks when one class serves
+  multiple sources; do not use `SourceFactory`.
+- The DSL owns source metadata. It generates the source name, language, ID, and base URL and
+  injects them through KSP.
+- Use `baseUrl` as a normal fixed URL, `baseUrl { mirrors(...) }` for supported mirrors, and
+  `baseUrl { custom(...) }` for a user-provided domain. Never implement these base-URL features
+  with manual preferences or `ListPreference`.
+- Keep the generated source ID stable. Only set an explicit `id` to preserve an existing generated
+  ID when a source name or language has to change. Do not rename sources casually.
+- Increment `source { versionId = ... }` only when old source URLs fundamentally cannot be made to
+  work. It forces users to migrate bookmarks.
+- Increment the extension `versionCode` for source changes. A multi-source theme uses
+  `baseVersionCode`, which must be incremented for theme changes.
+
+## 3. Source classes: use KeiSource and KSP
+
+New standalone sources must extend `KeiSource`, never `HttpSource` directly:
+
+```kotlin
+import keiyoushi.annotation.Source
+import keiyoushi.source.KeiSource
+
+@Source
+abstract class MySource : KeiSource() {
+    // Site-specific implementation.
+}
+```
+
+- Do not manually declare or override `name`, `lang`, `id`, or `baseUrl` in an `@Source` class.
+  KSP injects them from `build.gradle.kts`.
+- Do not recreate the old request/parse split (`popularMangaRequest`, `popularMangaParse`,
+  `pageListRequest`, and similar). Each `KeiSource` suspend function makes its request and parses
+  its response together.
+- `KeiSource` automatically handles URL searches: a search query that is an `HttpUrl` is routed to
+  `getMangasByUrl`/`getMangaByUrl`. Do not reproduce this routing manually.
+- `headersBuilder()` already supplies `Referer` and `Origin` derived from `baseUrl`. Add headers by
+  overriding `Headers.Builder.configureHeaders()`, rather than replacing `headersBuilder()`.
+- For remote filter data, set `supportsFilterFetching = true`, implement `fetchFilterData()` and
+  the pure synchronous `getFilterList(data)`. The framework handles retrying and caching.
+- If a method genuinely does not apply, leave it inherited when possible. If an inherited method
+  must be overridden but has no valid implementation, throw `UnsupportedOperationException()`;
+  never return a dummy empty value.
+
+## 4. Shared libraries and utilities
+
+The `keiyoushi.utils` helpers are available to every extension. Prefer them over local equivalents:
+
+- JSON: `response.parseAs<T>()`, `toJsonString()`, and `toJsonRequestBody()`.
+- Protobuf: `parseAsProto<T>()` and `toRequestBodyProto()`.
+- HTTP: suspend `OkHttpClient.get`, `post`, `put`, and `head` helpers.
+- Dates: `Instant.parseOrNull` for ISO-8601 and `java.time` for other formats.
+- WebView: `runWebView`, `runWebViewBlocking` only for non-suspending call sites, and
+  `getLocalStorage` for the common local-storage case.
+- Filters: `firstInstance` and `firstInstanceOrNull`.
+- Preferences: `getPreferences()` and `getPreferencesLazy()`.
+- Next.js: `extractNextJs` and `extractNextJsRsc`.
+- URLs: `setUrlWithoutDomain`, `absUrl`, and `HttpUrl` accessors.
+- GraphQL: `graphQLPost`, `graphQLGet`, `parseGraphQLAs`, and persisted-query helpers.
+- Archive streaming: `readZipDirectory` and `readZipEntry`.
+- Dynamic JSON: the `JsonElement` accessor helpers.
+
+Do not create a local `Json` instance for standard parsing. `parseAs` uses the shared instance;
+create a custom instance only when a real custom configuration or serializer requires it.
+
+Check `lib/` before implementing specialized behavior. Examples include `lib-cookieinterceptor` for
+cookies, `lib-cryptoaes` for CryptoJS-compatible AES, `lib-dataimage` for `data:image` URLs,
+`lib-e4p`, `lib-i18n`, `lib-lzstring`, `lib-randomua`, `lib-synchrony`, `lib-textinterceptor`,
+`lib-unpacker`, and `lib-zipinterceptor`. Add an extension dependency with:
+
+```kotlin
+dependencies {
+    implementation(project(":lib:<name>"))
+}
+```
+
+Use `api()` instead of `implementation()` for a library dependency that a multi-source theme must
+expose transitively to its child extensions. Consult `gradle/libs.versions.toml` before adding an
+external dependency; use `compileOnly` for compatible dependencies already supplied by the app and
+`compileOnlyApi` when that dependency must also be visible to module consumers.
+
+## 5. DTOs, JSON, and Protobuf
+
+- Model JSON and Protobuf payloads with `@Serializable` regular `class` declarations, not
+  `data class` declarations. This avoids unnecessary bytecode.
+- Keep only fields the source uses. Make fields private where the mapping helper does not need
+  them, and place DTO-to-model mappers in the DTO file.
+- Use `@SerialName` only when the wire key differs from the idiomatic camelCase property name.
+- Do not assign fake defaults to mandatory remote data merely to avoid a parse failure. Missing
+  IDs, titles, and other mandatory fields should fail early.
+- Prefer typed DTOs plus `parseAs<T>()` over walking `JsonObject`/`JsonArray` manually.
+- Prefer a serializable request DTO plus `toJsonRequestBody()` over `buildJsonObject` or hand-built
+  JSON strings.
+- Do not read an entire response into a string for ordinary JSON parsing. `response.parseAs<T>()`
+  streams, parses, and closes the body correctly.
+- Use the Protobuf helpers rather than a private codec instance or manual response-body handling.
+
+## 6. HTTP, cookies, and site protection
+
+- In suspending `KeiSource` code, use `client.get`/`post`/`put`/`head`; do not call
+  `client.newCall(...).execute()` and block a thread.
+- Use `GET()`/`POST()` only when a `Request` object itself is needed. Always supply `headers` to
+  those builders so app defaults, including the User-Agent, are retained.
+- Always close manually consumed response bodies, normally with `use { }`. Helpers that consume a
+  response already document their own lifecycle.
+- When a root-site `Referer` is needed, use `"$baseUrl/"` with the trailing slash.
+- Use string interpolation for static URLs. Use `HttpUrl` builders only for encoded or conditional
+  query parameters, pass an `HttpUrl` directly to request helpers, and use `HttpUrl` accessors for
+  URL parsing instead of string splits or regexes.
+- Do not hard-code a User-Agent unless the site demonstrably requires a distinct browser or mobile
+  layout. The default headers already include the app User-Agent.
+- Build a custom client from `network.client.newBuilder()`, not the deprecated
+  `network.cloudflareClient`.
+- Use `keiyoushi.network.rateLimit` on the client builder; never use `Thread.sleep()` for rate
+  limiting.
+- Use `lib-cookieinterceptor` for custom cookies. Manually adding a `Cookie` header can overwrite
+  existing app, WebView, or Cloudflare cookies.
+- Use GraphQL helper functions and Kotlin multi-dollar raw strings (`$$"""`) for GraphQL query
+  text. Do not hand-build GraphQL JSON.
+- Keep proxy settings and trust-all SSL code local to debugging. Remove them before submitting.
+
+## 7. HTML, images, and memory use
+
+- Parse standard HTML responses with `response.asJsoup()`.
+- Parse HTML embedded in a JSON field with `Jsoup.parseBodyFragment(html, baseUrl)` so relative
+  links resolve correctly.
+- Jsoup's `text()` and `ownText()` already normalize and trim whitespace. Do not follow them with
+  `trim()` or use `isBlank()` when `isNotEmpty()` expresses the check.
+- Use stable, specific selectors and let required selectors fail instead of hiding a site break with
+  placeholder data. Use safe calls for optional fields and `mapNotNull` for lists where an invalid
+  optional entry should not discard the rest.
+- Store manga and chapter URLs as IDs, slugs, or relative URLs when possible. Avoid absolute URLs so
+  a future domain migration works. Use `setUrlWithoutDomain` carefully, encoding spaces when needed.
+- Use `Page(index, imageUrl = url)` rather than legacy empty-string positional arguments. Fill all
+  image URLs in `getPageList` when possible; override `getImageUrl` only for genuinely lazy image
+  resolution.
+- Process image descrambling, stitching, and decryption as streams. Avoid loading whole image
+  bodies into `ByteArray`; use response streams, Okio buffers, and cipher sources.
+- Declare reusable `Regex` and date formatters at class scope. Do not retain unbounded or large
+  fetched lists, DTOs, or page lists in a long-lived source instance.
+- Prefer `buildString { }` to constructing a `StringBuilder` manually. Do not pass the default
+  `", "` separator to `joinToString()`.
+
+## 8. Implement the source call flow completely
+
+Implement the `KeiSource` entry points that the site supports, in this logical order: Popular,
+Latest, Search, Details, Chapters, Pages, Filters, then utilities.
+
+- `getPopularManga(page)` returns `MangasPage`. Set each list entry's `url`, `title`, and
+  `thumbnail_url`; support pagination until `hasNextPage` is false.
+- `getLatestUpdates(page)` follows the same pattern. If the site has only one listing that is
+  appropriate for latest updates, use it for popular and set `supportsLatest = false`.
+- `getSearchMangaList(query, page, filters)` implements normal text search. If the source cannot
+  search, return `MangasPage(emptyList(), false)`. Build a `FilterList` only for filters the site
+  supports and derive request values from each filter's `state`.
+- `getMangaDetails` supplies the full `SManga`; `getChapterList` supplies chapters. A manga's
+  `title` and `url`, and a chapter's `name`, are mandatory. Do not substitute `"Untitled"`,
+  `"Unknown"`, or empty strings for broken required data.
+- `SChapter.date_upload` is milliseconds since the Unix epoch. Use `Instant.parseOrNull` for ISO
+  dates, `java.time` for other formats, and `0L` when an optional date cannot be parsed.
+- If details and chapters come from the same response, `fetchMangaUpdate` should fetch and parse it
+  once and return both. If they require different endpoints, respect the requested flags and fetch
+  the two concurrently when both are needed.
+- `getPageList(chapter)` returns a sorted list of pages. Page indexes are ignored by the app; sort
+  the returned list yourself. `Page.url` and `Page.imageUrl`, when present, must be absolute.
+- When image URLs are unavailable until a later request, leave `imageUrl` empty and resolve it in
+  `getImageUrl(page)`. URL fragments can safely carry local metadata for an image request because
+  OkHttp does not send fragments to the server.
+- Use `UpdateStrategy.ONLY_FETCH_ONCE` only for titles known to have a fixed, permanently complete
+  chapter list. The default is `ALWAYS_UPDATE`.
+
+## 9. Preferences, deeplinks, and source lifecycle
+
+- For mirrors and custom domains, use the generated `baseUrl` DSL described above. Do not write
+  manual `SharedPreferences` migration or base-URL selection code.
+- For unrelated settings such as image quality or language, implement `ConfigurableSource` and use
+  `getPreferences()` or `getPreferencesLazy()`.
+- Declare URL handling with one or more `deeplink {}` blocks in `build.gradle.kts`. Each block needs
+  at least one `path()` pattern; omit `host()` when deriving it from `baseUrl` is sufficient.
+- Never add a manual `AndroidManifest.xml`, intent filter, or `UrlActivity.kt` for a source.
+- Avoid hard-coded host comparisons during URL search. Compare against the current `baseUrl` so
+  mirrors and custom domains remain valid.
+- Preserve source IDs during renames and language changes, and use the repository's documented
+  migration procedure rather than creating a duplicate source identity.
+
+## 10. Multi-source themes
+
+- Create themes under `lib-multisrc/<theme>/`. A new theme uses the multisrc plugin,
+  `baseVersionCode`, and the current library version:
+
+  ```kotlin
+  plugins {
+      alias(kei.plugins.multisrc)
+  }
+
+  keiyoushi {
+      baseVersionCode = 1
+      libVersion = "1.6"
+  }
+  ```
+
+- The theme main class is an abstract `KeiSource` class (or the version used by an existing legacy
+  theme). Do not put injected source metadata in its constructor or class body.
+- Theme-level deeplink path patterns may omit a host so each consuming extension derives it from its
+  own `baseUrl`.
+- Child extensions declare their own source metadata in `source {}` blocks and inherit shared
+  behavior from the theme. Export theme dependencies with `api()` where necessary.
+- Do not change a multi-source theme when the requested fix is isolated to a single child source.
+
+## 11. Local validation and submission
+
+- Test changes by compiling and running the touched extension in Android Studio on a device or
+  emulator. An untested extension is not ready for review.
+- Format only the module changed, for example:
+
+  ```console
+  ./gradlew :src:en:mysource:spotlessApply
+  ./gradlew :lib-multisrc:mytheme:spotlessApply
+  ```
+
+- Build a single source from the command line with
+  `./gradlew :src:<lang>:<source>:assembleDebug` when appropriate.
+- Use Logcat (the `OkHttpClient` tag), Android Studio's Network Inspector, or a temporary local
+  proxy to investigate network failures. Remove proxy and insecure SSL debugging code afterward.
+- Keep the generated extension icon in the repository pattern: a rounded-square icon. Remove
+  `web_hi_res_512.png` from a new extension before submission.
+- Before opening a pull request, update the relevant `versionCode` (and `baseVersionCode` for a
+  changed theme), set the right content warning, preserve names and IDs, reference related issues,
+  and complete the repository PR checklist.
+- If an AI opens the pull request, its description must end with a `🤖` note stating what it was
+  asked to do and that an AI agent opened the PR. The human reviewer must still check the
+  AI-assisted checklist item after reviewing the changes.
+
+## 12. Hard rejections
+
+Reject or correct these patterns during implementation and review:
+
+- A new source extending `HttpSource` directly, using `libVersion = "1.4"`, or implementing
+  `SourceFactory`.
+- Manual `name`, `lang`, `id`, or `baseUrl` declarations in an `@Source` class.
+- Base-URL/mirror/custom-domain preferences implemented outside the `baseUrl` DSL.
+- Manual manifest deeplinks or `UrlActivity` code.
+- `data class` DTOs, manual standard `Json` instances, hand-walked JSON where typed DTOs fit, or
+  manually read JSON response bodies.
+- Blocking network calls in suspending source code, `Thread.sleep()`, hard-coded cookies, or
+  deprecated `network.cloudflareClient`.
+- Empty placeholders or generic fallbacks for mandatory manga or chapter data.
+- Long-lived caches of large response data, image `ByteArray` processing, unnecessary URL builders,
+  redundant Jsoup string parsing, or an unnecessary `getImageUrl` override.
+- Committing temporary proxy, trust-all SSL, or other debugging-only network code.
+
+When a site requires behavior not covered here, verify the current `CONTRIBUTING.md`, inspect a
+nearby modern implementation, and make the smallest change that satisfies the site requirement.

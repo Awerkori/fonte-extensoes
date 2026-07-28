@@ -112,6 +112,7 @@ jobs:
           retention-days: 1
 
       - name: Clean up CI files
+        if: always()
         run: rm signingkey.jks
 
   publish:
@@ -166,6 +167,8 @@ jobs:
             git commit -m "Update extensions repo"
             git push
             curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.min.json
+            curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.json
+            curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.pb
           else
             echo "No changes to commit"
           fi
