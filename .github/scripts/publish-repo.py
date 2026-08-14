@@ -18,8 +18,8 @@ ARTIFACTS_DIR = Path.home() / "apk-artifacts"
 # The checked-out `repo` branch we publish into (the working directory).
 REPO_DIR = Path.cwd()
 
-ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/FelipeGFA/fonte-extensoes@main"
-REPO_NAME = "FelipeGFA/extensoes"
+ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main"
+REPO_NAME = "Awerkori/extensoes"
 RELEASE_BASE_URL = f"https://github.com/{REPO_NAME}/releases/download"
 ASSET_LIMIT = 495  # Actual limit is 1000 but we upload 2 items per extension.
 RETRY_ATTEMPTS = 4
@@ -234,12 +234,11 @@ final_extensions.extend(ext for ext, _, _, _ in new_extensions)
 final_extensions.sort(key=lambda ext: ext.packageName)
 
 index = index_pb2.Index(
-    name="FelipeGFA",
-    badgeLabel="FGFA",
-    signingKey="9bf5754a79fd686cb77e6335a2a9e5351ad73ca824c27b09e7b3437f806fea77",
+    name="Project Nox",
+    badgeLabel="NOX",
+    signingKey="144f44e865cbfae6bde110489ef7ec142f0b1681f627a093a218650e21db5dad",
     contact=index_pb2.Contact(
-        website="https://felipegfa.github.io",
-        discord="https://discord.gg/QpyjwsWENq",
+        website="https://github.com/Awerkori/fonte-extensoes",
     ),
     extensionList=index_pb2.ExtensionList(extensions=final_extensions),
 )
@@ -356,7 +355,7 @@ def create_release(tag: str):
         "--title",
         f"Repository Update {tag}",
         "--notes",
-        f"Automated update from FelipeGFA/fonte-extensoes@{current_sha}",
+        f"Automated update from Awerkori/fonte-extensoes@{current_sha}",
     )
 
 
