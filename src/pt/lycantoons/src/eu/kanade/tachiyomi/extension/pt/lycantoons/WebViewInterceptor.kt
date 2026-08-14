@@ -1,9 +1,12 @@
 package eu.kanade.tachiyomi.extension.pt.lycantoons
 
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import keiyoushi.utils.applicationContext
@@ -30,6 +33,8 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
     private var latch: CountDownLatch? = null
     private var result: FetchResult? = null
     private var errorMessage: Throwable? = null
+    private var mainFrameHttpError: Int? = null
+    private var challengeDetected = false
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val req = chain.request()
@@ -45,7 +50,7 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
         }
 
         val resultData = fetchViaJs(url, req.method, req.headers, requestBody, isImage)
-        if (!resultData.success) throw IOException("[WebView]: " + resultData.result)
+        if (!resultData.success) throw IOException(resultData.toErrorMessage())
 
         val resultConentType = resultData.contentType ?: "text/html"
         return if (isImage) {
@@ -84,6 +89,11 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
                                 result = FetchResult(false, error)
                                 latch?.countDown()
                             }
+
+                            @JavascriptInterface
+                            fun challengeDetected() {
+                                this@WebViewInterceptor.challengeDetected = true
+                            }
                         },
                         bridgeName,
                     )
@@ -112,22 +122,52 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
         latch = CountDownLatch(1)
         result = null
         errorMessage = null
+        mainFrameHttpError = null
+        challengeDetected = false
 
         val isRsc = headers["RSC"] == "1"
+        val isApiGet = method == "GET" && url.startsWith("$baseUrl/api/")
 
         mainHandler.post {
             try {
                 val webView = globalWebView
                 webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                        mainFrameHttpError = null
+                    }
+
+                    override fun onReceivedHttpError(
+                        view: WebView,
+                        request: WebResourceRequest,
+                        errorResponse: WebResourceResponse,
+                    ) {
+                        if ((isRsc || isApiGet) && request.isForMainFrame) {
+                            mainFrameHttpError = errorResponse.statusCode
+                        }
+                    }
+
                     override fun onPageFinished(view: WebView, pageUrl: String?) {
-                        if (isRsc) {
+                        if (isRsc || isApiGet) {
                             if (result != null) return
                             view.evaluateJavascript(
                                 """
                             (function() {
                                 if (document.title === 'Just a moment...' ||
-                                    document.querySelector('.main-wrapper #challenge-error-text')) return;
-                                window.$bridgeName.passResult(document.documentElement.outerHTML, document.contentType);
+                                    document.querySelector('.main-wrapper #challenge-error-text')) {
+                                    window.$bridgeName.challengeDetected();
+                                    return;
+                                }
+                                ${mainFrameHttpError?.let { "window.$bridgeName.passError('HTTP $it'); return;" }.orEmpty()}
+                                if (document.title.startsWith('Bloqueado')) {
+                                    window.$bridgeName.passError('HTTP 403');
+                                    return;
+                                }
+                                if (document.title.startsWith('404')) {
+                                    window.$bridgeName.passError('HTTP 404');
+                                    return;
+                                }
+                                const content = ${if (isApiGet) "document.body.innerText" else "document.documentElement.outerHTML"};
+                                window.$bridgeName.passResult(content, document.contentType);
                             })();
                                 """.trimIndent(),
                                 null,
@@ -194,8 +234,8 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
                     }
                 }
 
-                if (isRsc) {
-                    webView.loadUrl(url.substringBefore('?')) // document fetch-dest and drop rsc
+                if (isRsc || isApiGet) {
+                    webView.loadUrl(if (isRsc) url.substringBefore('?') else url)
                     return@post
                 }
 
@@ -210,7 +250,7 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
         latch?.await(
             if (isImage) {
                 10
-            } else if (isRsc) {
+            } else if (isRsc || isApiGet) {
                 20
             } else {
                 5
@@ -218,7 +258,17 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
             TimeUnit.SECONDS,
         )
 
-        return result ?: FetchResult(false, (errorMessage ?: "Timed out").toString())
+        return result ?: FetchResult(false, if (challengeDetected) "CLOUDFLARE" else (errorMessage ?: "Timed out").toString())
+    }
+
+    private fun FetchResult.toErrorMessage(): String = when {
+        result == "HTTP 401" -> "A Lycan Toons exige login para acessar este conteúdo. Entre pelo WebView e tente novamente."
+        result == "CLOUDFLARE" -> "O site exige verificação. Abra no WebView, conclua a verificação e tente novamente."
+        result == "HTTP 403" -> "O site bloqueou a requisição da extensão."
+        result == "HTTP 404" -> "O conteúdo não foi encontrado. O site pode ter alterado ou removido o endereço."
+        result == "HTTP 429" -> "A Lycan Toons limitou temporariamente as requisições. Tente novamente mais tarde."
+        result.matches(Regex("HTTP 5\\d\\d")) -> "A Lycan Toons está com uma falha temporária ($result)."
+        else -> "Falha ao acessar a Lycan Toons: $result"
     }
 
     private fun String.toResponse(request: Request, contentType: String): Response = this.toByteArray(Charsets.UTF_8).toResponse(request, contentType)

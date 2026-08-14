@@ -15,6 +15,7 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
 import okhttp3.Request
 import okhttp3.Response
+import rx.Observable
 
 @Source
 abstract class LycanToons : HttpSource() {
@@ -73,18 +74,63 @@ abstract class LycanToons : HttpSource() {
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url}"
 
-    override fun mangaDetailsRequest(manga: SManga): Request = rscRequest("$baseUrl/series/${manga.slug()}")
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val payload = SearchRequestBody(
+            limit = 20,
+            page = 1,
+            search = manga.title,
+            seriesType = "",
+            status = "",
+            tags = emptyList(),
+        )
 
-    override fun mangaDetailsParse(response: Response): SManga = response.extractNextJs<SeriesDto>()!!.toSManga()
+        return POST("$baseUrl/api/series?slug=${manga.slug()}", headers, payload.toJsonRequestBody())
+    }
+
+    override fun mangaDetailsParse(response: Response): SManga {
+        val slug = response.request.url.queryParameter("slug")!!
+        return response.parseAs<SearchResponse>().toSManga(slug)
+    }
 
     // =====================Chapters=====================
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/api/series/${manga.slug()}/chapters", headers)
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
+        val slug = manga.slug()
+        val chapters = mutableListOf<SChapter>()
+        var skip = 0
+        var total: Int? = null
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val slug = response.request.url.pathSegments.dropLast(1).last()
-        return response.parseAs<ChapterResponse>().toSChapters(slug)
+        do {
+            val page = client.newCall(chapterListRequest(slug, skip)).execute().use { response ->
+                response.parseAs<ChapterResponse>()
+            }
+
+            if (total == null) {
+                total = page.total
+            } else {
+                check(page.total == total) { "A quantidade de capítulos mudou durante a paginação. Tente novamente." }
+            }
+
+            val batch = page.toSChapters(slug)
+            check(batch.isNotEmpty() || skip >= page.total) {
+                "A API interrompeu a lista de capítulos em $skip/${page.total}."
+            }
+
+            chapters += batch
+            skip += page.size
+        } while (skip < total)
+
+        val uniqueChapters = chapters.distinctBy { it.url }
+        check(uniqueChapters.size == total) {
+            "A API retornou uma lista de capítulos incompleta: ${uniqueChapters.size}/$total."
+        }
+
+        uniqueChapters.sortedByDescending { it.chapter_number }
     }
+
+    private fun chapterListRequest(slug: String, skip: Int) = GET("$baseUrl/api/series/$slug/chapters?skip=$skip&take=$CHAPTER_LIMIT", headers)
+
+    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
 
     // =====================Pages========================
 
@@ -92,9 +138,11 @@ abstract class LycanToons : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val dto = response.extractNextJs<PageList>()
+            ?: error("O site alterou o formato da página do capítulo.")
 
-        return dto?.imageUrls?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
-            ?: emptyList()
+        check(dto.imageUrls.isNotEmpty()) { "O site não retornou imagens para este capítulo." }
+
+        return dto.imageUrls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()

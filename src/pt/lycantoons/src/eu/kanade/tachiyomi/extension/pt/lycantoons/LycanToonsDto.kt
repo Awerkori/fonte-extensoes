@@ -30,6 +30,8 @@ class SeriesDto(
     private val genre: List<String>? = null,
     private val status: String? = null,
 ) {
+    fun hasSlug(slug: String) = this.slug == slug
+
     fun toSManga() = SManga.create().apply {
         title = this@SeriesDto.title
         url = "/series/$slug"
@@ -65,21 +67,20 @@ class SearchResponse(
     private val series: List<SeriesDto>,
 ) {
     fun toMangasPage() = MangasPage(series.map { it.toSManga() }, false)
+
+    fun toSManga(slug: String) = series.firstOrNull { it.hasSlug(slug) }?.toSManga()
+        ?: error("A obra não foi encontrada na API da Lycan Toons.")
 }
 
 @Serializable
 class ChapterResponse(
     private val chapters: List<ChapterDto>,
-    private val total: Int,
+    val total: Int,
 ) {
-    fun toSChapters(slug: String): List<SChapter> {
-        check(chapters.size == total) { "Lista de capítulos incompleta: ${chapters.size}/$total" }
+    val size: Int
+        get() = chapters.size
 
-        return chapters
-            .map { it.toSChapter(slug) }
-            .distinctBy { it.url }
-            .sortedByDescending { it.chapter_number }
-    }
+    fun toSChapters(slug: String) = chapters.map { it.toSChapter(slug) }
 }
 
 @Serializable
