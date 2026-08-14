@@ -32,27 +32,14 @@ jobs:
       delete: ${{ steps.generate-matrices.outputs.delete }}
     steps:
       - name: Checkout main branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.BOT_PAT }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Set up Java
-        uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
-        with:
-          java-version: 17
-          distribution: temurin
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
-        with:
-          cache-read-only: true
 
       - name: Get last successful CI commit
         uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
         with:
-          gh-token: ${{ secrets.BOT_PAT }}
           fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
 
       - id: generate-matrices
@@ -70,14 +57,12 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout main branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.BOT_PAT }}
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Set up Java
-        uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           java-version: 17
           distribution: temurin
@@ -113,7 +98,7 @@ jobs:
 
       - name: Clean up CI files
         if: always()
-        run: rm signingkey.jks
+        run: rm -f signingkey.jks
 
   publish:
     name: Publish extension repo
@@ -127,7 +112,7 @@ jobs:
       needs.build.result != 'cancelled' &&
       needs.prepare.outputs.delete != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 120
     steps:
       - name: Download APK artifacts
         if: needs.build.result == 'success'
@@ -136,15 +121,14 @@ jobs:
           path: ~/apk-artifacts
 
       - name: Checkout main branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.BOT_PAT }}
           ref: main
           path: main
           persist-credentials: false
 
       - name: Checkout repo branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: FelipeGFA/extensoes
           token: ${{ secrets.BOT_PAT }}
@@ -155,10 +139,11 @@ jobs:
       - name: Publish and deploy repo
         env:
           DELETE: ${{ needs.prepare.outputs.delete }}
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           cd repo
           pip install protobuf
-          python ../main/.github/scripts/publish-repo.py "$DELETE"
+          python -u ../main/.github/scripts/publish-repo.py "$DELETE" "$GITHUB_SHA"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
           git status
@@ -166,7 +151,6 @@ jobs:
             git add .
             git commit -m "Update extensions repo"
             git push
-            curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.min.json
             curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.json
             curl https://purge.jsdelivr.net/gh/FelipeGFA/extensoes@repo/index.pb
           else
