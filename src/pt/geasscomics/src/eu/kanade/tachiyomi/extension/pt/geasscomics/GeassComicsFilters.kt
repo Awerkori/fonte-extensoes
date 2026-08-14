@@ -3,88 +3,83 @@ package eu.kanade.tachiyomi.extension.pt.geasscomics
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 
-fun getFilters(
-    genres: List<Pair<String, String>> = emptyList(),
-    tags: List<Pair<String, String>> = emptyList(),
-    showNsfw: Boolean = false,
-): FilterList = FilterList(
-    listOf(
+fun getFilters(data: FilterDataDto?, showNsfw: Boolean): FilterList {
+    val genres = data?.genres.orEmpty().filter { showNsfw || !it.isNsfw }
+    val tags = data?.tags.orEmpty().filter { showNsfw || !it.isNsfw }
+
+    return FilterList(
         SortFilter(),
-        StatusFilter(),
-    ) + when {
-        !showNsfw -> listOf(Filter.Header("Não Mostrar conteúdo +18"))
-        else -> listOf(NsfwFilter())
-    } + listOf(
+        TypeFilter(),
         Filter.Separator(),
-    ) + when {
-        genres.isEmpty() && tags.isEmpty() -> listOf(Filter.Header("Clique em 'Redefinir' para carregar os filtros"))
-        genres.isEmpty() -> listOf(Filter.Header("Clique em 'Redefinir' para carregar os gêneros"))
-        else -> listOf(GenreFilter(genres))
-    } + when {
-        genres.isEmpty() && tags.isEmpty() -> emptyList()
-        tags.isEmpty() -> listOf(Filter.Header("Clique em 'Redefinir' para carregar as tags"))
-        else -> listOf(TagFilter(tags))
-    },
-)
+        Filter.Header(
+            if (showNsfw) {
+                "Conteúdo +18 habilitado nas preferências"
+            } else {
+                "Conteúdo +18 oculto nas preferências"
+            },
+        ),
+        Filter.Separator(),
+        if (genres.isEmpty()) {
+            Filter.Header("Toque em 'Redefinir' para carregar os gêneros")
+        } else {
+            GenreFilter(genres)
+        },
+        if (tags.isEmpty()) {
+            Filter.Header("Toque em 'Redefinir' para carregar as tags")
+        } else {
+            TagFilter(tags)
+        },
+    )
+}
 
 class SortFilter :
     Filter.Select<String>(
         "Ordenar por",
         SORT_OPTIONS.map { it.first }.toTypedArray(),
     ) {
-    val selected: String get() = SORT_OPTIONS[state].second
-
-    val order: String
-        get() = when (state) {
-            3 -> "asc"
-
-            // Title A-Z
-            else -> "desc"
-        }
+    val sortBy get() = SORT_OPTIONS[state].second.first
+    val sortDir get() = SORT_OPTIONS[state].second.second
 
     companion object {
         private val SORT_OPTIONS = listOf(
-            "Mais Recentes" to "updatedAt",
-            "Mais Vistos" to "views",
-            "Melhor Avaliados" to "rating",
-            "Título (A-Z)" to "title",
-            "Qtd. de Capítulos" to "chapterCount",
+            "Mais recentes" to ("recent" to "desc"),
+            "Melhor avaliados" to ("rating" to "desc"),
+            "Título (A-Z)" to ("title" to "asc"),
+            "Título (Z-A)" to ("title" to "desc"),
         )
     }
 }
 
-class StatusFilter :
-    Filter.Select<String>(
-        "Status",
-        STATUS_OPTIONS.map { it.first }.toTypedArray(),
+class TypeFilter :
+    Filter.Group<TypeCheckBox>(
+        "Tipo",
+        listOf(
+            TypeCheckBox("Manhwa", "manhwa"),
+            TypeCheckBox("Manhua", "manhua"),
+            TypeCheckBox("Mangá", "manga"),
+        ),
     ) {
-    val selected: String? get() = STATUS_OPTIONS[state].second
-
-    companion object {
-        private val STATUS_OPTIONS = listOf(
-            "Todos" to null,
-            "Em Andamento" to "ongoing",
-            "Completo" to "completed",
-            "Hiato" to "hiatus",
-            "Cancelado" to "cancelled",
-        )
-    }
+    val selectedValues get() = state.filter { it.state }.map { it.value }
 }
 
-class NsfwFilter : Filter.TriState("Mostrar conteúdo +18", TriState.STATE_IGNORE)
+class TypeCheckBox(name: String, val value: String) : Filter.CheckBox(name)
 
-class GenreFilter(genres: List<Pair<String, String>>) :
+class GenreFilter(genres: List<FilterOptionDto>) :
     Filter.Group<GenreCheckBox>(
         "Gêneros",
-        genres.map { GenreCheckBox(it.first, it.second) },
-    )
+        genres.map { GenreCheckBox(it.label, it.slug) },
+    ) {
+    val selectedValues get() = state.filter { it.state }.map { it.value }
+}
 
-class GenreCheckBox(name: String, val id: String) : Filter.CheckBox(name, false)
+class GenreCheckBox(name: String, val value: String) : Filter.CheckBox(name)
 
-class TagFilter(tags: List<Pair<String, String>>) :
+class TagFilter(tags: List<FilterOptionDto>) :
     Filter.Group<TagCheckBox>(
         "Tags",
-        tags.map { TagCheckBox(it.first, it.second) },
-    )
+        tags.map { TagCheckBox(it.label, it.slug) },
+    ) {
+    val selectedValues get() = state.filter { it.state }.map { it.value }
+}
 
-class TagCheckBox(name: String, val id: String) : Filter.CheckBox(name, false)
+class TagCheckBox(name: String, val value: String) : Filter.CheckBox(name)
