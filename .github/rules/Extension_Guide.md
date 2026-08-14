@@ -93,21 +93,24 @@ abstract class MySource : KeiSource() {
 
 ## 4. Shared libraries and utilities
 
-The `keiyoushi.utils` helpers are available to every extension. Prefer them over local equivalents:
+The `core` module provides built-in utilities in `keiyoushi.utils.*`, `keiyoushi.network.*`, and `keiyoushi.zip.*`. These are automatically available to every extension. Always reuse these core helpers rather than writing custom parsing, hashing, or network logic:
 
-- JSON: `response.parseAs<T>()`, `toJsonString()`, and `toJsonRequestBody()`.
-- Protobuf: `parseAsProto<T>()` and `toRequestBodyProto()`.
-- HTTP: suspend `OkHttpClient.get`, `post`, `put`, and `head` helpers.
-- Dates: `Instant.parseOrNull` for ISO-8601 and `java.time` for other formats.
-- WebView: `runWebView`, `runWebViewBlocking` only for non-suspending call sites, and
-  `getLocalStorage` for the common local-storage case.
-- Filters: `firstInstance` and `firstInstanceOrNull`.
-- Preferences: `getPreferences()` and `getPreferencesLazy()`.
-- Next.js: `extractNextJs` and `extractNextJsRsc`.
-- URLs: `setUrlWithoutDomain`, `absUrl`, and `HttpUrl` accessors.
-- GraphQL: `graphQLPost`, `graphQLGet`, `parseGraphQLAs`, and persisted-query helpers.
-- Archive streaming: `readZipDirectory` and `readZipEntry`.
-- Dynamic JSON: the `JsonElement` accessor helpers.
+- **JSON (`keiyoushi.utils.Json`):** `response.parseAs<T>()`, `toJsonString()`, and `toJsonRequestBody()`. Streams and parses using the shared `Json` configuration.
+- **Protobuf (`keiyoushi.utils.Protobuf`):** `parseAsProto<T>()`, `toRequestBodyProto()`, `decodeProto()`, and `encodeProto()`.
+- **Dates (`keiyoushi.utils.Date`):** `Instant.tryParse(dateStr)` for strict ISO-8601, and `tryParseDate(dateStr, zoneId)`, `tryParseDateTime(dateStr, zoneId)`, `tryParseZonedDateTime(dateStr)` with `java.time.format.DateTimeFormatter` for site-specific formats. Never use `SimpleDateFormat` in new code.
+- **Cryptography & Hashing (`keiyoushi.utils.Crypto`):** `md5()`, `sha1()`, `sha256()`, and cipher/AES helper extensions.
+- **Binary Conversions (`keiyoushi.utils.Binary`):** `decodeBase64()`, `encodeBase64()`, `decodeHex()`, `encodeHex()`, and byte array transformations.
+- **Decompression (`keiyoushi.utils.Inflater`):** `inflate()` and zlib/deflate stream decompression.
+- **HTTP & URLs (`keiyoushi.network.OkHttp`):** Suspend helpers `client.get`, `client.post`, `client.put`, `client.head`, `response.asJsoup()`, `setUrlWithoutDomain()`, `absUrl()`, and `HttpUrl` accessors.
+- **Rate Limiting (`keiyoushi.network.RateLimit`):** `clientBuilder.rateLimit(permits, period, unit)`.
+- **WebView (`keiyoushi.utils.WebView`):** `runWebView` (suspending), `runWebViewBlocking` (non-suspending only), and `getLocalStorage`.
+- **Next.js & React Flight (`keiyoushi.utils.NextJs`, `keiyoushi.utils.reactFlight.*`):** `extractNextJs()`, `extractNextJsRsc()`, and React Server Components data extractors (`ReactFlightBigInt`, `ReactFlightDate`, `ReactFlightNumber`).
+- **GraphQL (`keiyoushi.utils.GraphQL`):** `graphQLPost()`, `graphQLGet()`, `parseGraphQLAs()`, and persisted-query helpers.
+- **Filter Inspection (`keiyoushi.utils.Collections`):** `firstInstance<T>()` and `firstInstanceOrNull<T>()`.
+- **Preferences (`keiyoushi.utils.Preferences`):** `getPreferences()` and `getPreferencesLazy()`.
+- **Dynamic JSON (`keiyoushi.utils.JsonElement`):** Null-safe `JsonElement` property and primitive accessors (`string`, `int`, `boolean`, `jsonObject`, `jsonArray`).
+- **Archive Streaming (`keiyoushi.zip.Zip`):** `readZipDirectory()` and `readZipEntry()` for memory-efficient zip stream processing.
+- **Application Context (`keiyoushi.utils.Context`):** `appContext` for components that legitimately require an Android `Context`.
 
 Do not create a local `Json` instance for standard parsing. `parseAs` uses the shared instance;
 create a custom instance only when a real custom configuration or serializer requires it.
@@ -205,8 +208,9 @@ Latest, Search, Details, Chapters, Pages, Filters, then utilities.
 - `getMangaDetails` supplies the full `SManga`; `getChapterList` supplies chapters. A manga's
   `title` and `url`, and a chapter's `name`, are mandatory. Do not substitute `"Untitled"`,
   `"Unknown"`, or empty strings for broken required data.
-- `SChapter.date_upload` is milliseconds since the Unix epoch. Use `Instant.parseOrNull` for ISO
-  dates, `java.time` for other formats, and `0L` when an optional date cannot be parsed.
+- `SChapter.date_upload` is milliseconds since the Unix epoch. Use `Instant.tryParse(dateStr)` for
+  ISO-8601 dates, and `DateTimeFormatter` with `tryParseDate`, `tryParseDateTime`, or
+  `tryParseZonedDateTime` for site-specific formats. Avoid `SimpleDateFormat`.
 - If details and chapters come from the same response, `fetchMangaUpdate` should fetch and parse it
   once and return both. If they require different endpoints, respect the requested flags and fetch
   the two concurrently when both are needed.
@@ -291,6 +295,8 @@ Reject or correct these patterns during implementation and review:
 - Manual manifest deeplinks or `UrlActivity` code.
 - `data class` DTOs, manual standard `Json` instances, hand-walked JSON where typed DTOs fit, or
   manually read JSON response bodies.
+- Using `SimpleDateFormat` in new code or manual try-catch date parsing instead of the shared
+  `tryParse` helpers.
 - Blocking network calls in suspending source code, `Thread.sleep()`, hard-coded cookies, or
   deprecated `network.cloudflareClient`.
 - Empty placeholders or generic fallbacks for mandatory manga or chapter data.

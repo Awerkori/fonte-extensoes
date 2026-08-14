@@ -27,37 +27,32 @@ RETRY_BASE_DELAY = 60  # Documented minimum wait; doubles per attempt.
 UPLOAD_CHUNK_SIZE = 80
 UPLOAD_CHUNK_INTERVAL = 30
 
-to_delete: list[str] = json.loads(sys.argv[1])
-current_sha = sys.argv[2]
+to_delete: list[str] = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+current_sha = sys.argv[2] if len(sys.argv) > 2 else "0000000000000000000000000000000000000000"
 current_sha_short = current_sha[:7]
-
-with REPO_DIR.joinpath("index.json").open() as f:
-    remote_proto = json_format.Parse(f.read(), index_pb2.Index())
-
-remote_extensions = {
-    ext.packageName: ext for ext in remote_proto.extensionList.extensions
-}
-
-release_assets_path = REPO_DIR / "release-assets.json"
-if release_assets_path.exists():
-    with release_assets_path.open() as f:
-        release_assets = json.load(f)
-else:
-    release_assets = {}
-
-updated_release_assets = {
-    package_name: assets
-    for package_name, assets in release_assets.items()
-    if not any(package_name.endswith(f".{module}") for module in to_delete)
-}
-
-# Build index entries for the freshly built apks. Each extension's metadata comes from the
-# source-info JSON emitted by its assembleRelease task (see GenerateSourceInfoTask); its APK is a
-# sibling in the same build dir. aapt reads the icon out of the APK
-new_extensions: list[tuple[index_pb2.Extension, Path, Path, bool]] = []
 
 SOURCE_DIR = Path(__file__).resolve().parents[2]
 ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
+
+
+def pkg_to_module(pkg: str) -> str:
+    return pkg.removeprefix("eu.kanade.tachiyomi.extension.")
+
+
+def get_existing_modules() -> set[str]:
+    modules = set()
+    src_dir = SOURCE_DIR / "src"
+    if not src_dir.is_dir():
+        src_dir = REPO_DIR.parent / "main/src"
+    if not src_dir.is_dir():
+        return modules
+    for lang_dir in src_dir.iterdir():
+        if not lang_dir.is_dir():
+            continue
+        for ext_dir in lang_dir.iterdir():
+            if ext_dir.is_dir() and (ext_dir / "build.gradle.kts").is_file():
+                modules.add(f"{lang_dir.name}.{ext_dir.name}")
+    return modules
 
 
 def get_icon_url(module: str, theme: str | None) -> str:
@@ -73,10 +68,49 @@ def get_icon_url(module: str, theme: str | None) -> str:
     return f"{ICON_BASE_URL}/core/src/main/{ICON_FILE}"
 
 
+# Load current remote index
+with REPO_DIR.joinpath("index.json").open() as f:
+    remote_proto = json_format.Parse(f.read(), index_pb2.Index())
+
+remote_extensions = {
+    ext.packageName: ext for ext in remote_proto.extensionList.extensions
+}
+remote_modules = {
+    pkg_to_module(ext.packageName): ext.packageName
+    for ext in remote_proto.extensionList.extensions
+}
+
+# Load current release assets
+release_assets_path = REPO_DIR / "release-assets.json"
+if release_assets_path.exists():
+    with release_assets_path.open() as f:
+        release_assets = json.load(f)
+else:
+    release_assets = {}
+
+# Build index entries for the freshly built apks.
+new_extensions: list[tuple[index_pb2.Extension, Path, Path, bool]] = []
+rebuilt_modules: set[str] = set()
+skipped_downgrades: set[str] = set()
+
 for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
     with info_file.open(encoding="utf-8") as f:
         info = json.load(f)
     package_name = info["packageName"]
+    version_code = info["versionCode"]
+    module = pkg_to_module(package_name)
+
+    # SAFEGUARD: Downgrade protection
+    remote_ext = remote_extensions.get(package_name)
+    if remote_ext is not None and version_code < remote_ext.versionCode:
+        skipped_downgrades.add(module)
+        print(
+            f"Skipping downgrade for {package_name}: "
+            f"local code {version_code} < remote code {remote_ext.versionCode}",
+            file=sys.stderr,
+        )
+        continue
+
     apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
     if apk is None:
         raise FileNotFoundError(
@@ -106,7 +140,7 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
         or release_assets[package_name] != assets
     )
 
-    updated_release_assets[package_name] = assets
+    rebuilt_modules.add(module)
 
     ext = index_pb2.Extension(
         name=info["name"],
@@ -115,7 +149,7 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
             iconUrl=get_icon_url(info["module"], info.get("theme")),
         ),
         extensionLib=info["extensionLib"],
-        versionCode=info["versionCode"],
+        versionCode=version_code,
         versionName=info["versionName"],
         contentWarning=info["contentWarning"],
         sources=[
@@ -130,6 +164,41 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
         ],
     )
     new_extensions.append((ext, apk, jar, changed))
+
+# SAFEGUARD: Detect genuinely deleted modules (orphaned in remote index)
+existing_modules = get_existing_modules()
+genuinely_deleted = set(remote_modules.keys()) - existing_modules if existing_modules else set()
+if genuinely_deleted:
+    print(f"Removing genuinely deleted modules: {sorted(genuinely_deleted)}")
+
+# SAFEGUARD: Safe deletion set.
+# Only replace rebuilt modules or genuinely deleted modules.
+# Never wipe unbuilt extensions when a core change triggers a broad to_delete list.
+safe_to_delete = (rebuilt_modules | genuinely_deleted) - skipped_downgrades
+
+print(
+    f"Modules rebuilt: {len(rebuilt_modules)}, genuinely deleted: {len(genuinely_deleted)}, "
+    f"safe to replace/delete: {len(safe_to_delete)}"
+)
+
+# Update release_assets map
+updated_release_assets = {
+    package_name: assets
+    for package_name, assets in release_assets.items()
+    if not any(package_name.endswith(f".{module}") for module in safe_to_delete)
+}
+
+for ext, apk, jar, _ in new_extensions:
+    updated_release_assets[ext.packageName] = {
+        "apk": {
+            "name": apk.name,
+            "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
+        },
+        "jar": {
+            "name": jar.name,
+            "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+        },
+    }
 
 new_extensions.sort(key=lambda item: item[0].packageName)
 
@@ -154,12 +223,12 @@ for i, (ext, apk, jar, changed) in enumerate(new_extensions):
         ext.resources.apkUrl = old_resources.apkUrl
         ext.resources.jarUrl = old_resources.jarUrl
 
-# Merge with the already-published index, dropping the deleted/rebuilt modules.
+# Merge with the already-published index, safely dropping only rebuilt/deleted modules.
 final_extensions = []
 final_extensions.extend(
     ext
     for ext in remote_proto.extensionList.extensions
-    if not any(ext.packageName.endswith(f".{module}") for module in to_delete)
+    if not any(ext.packageName.endswith(f".{module}") for module in safe_to_delete)
 )
 final_extensions.extend(ext for ext, _, _, _ in new_extensions)
 final_extensions.sort(key=lambda ext: ext.packageName)
