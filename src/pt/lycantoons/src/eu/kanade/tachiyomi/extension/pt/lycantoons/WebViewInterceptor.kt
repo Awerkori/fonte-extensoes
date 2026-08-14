@@ -4,8 +4,6 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import keiyoushi.utils.applicationContext
@@ -33,8 +31,6 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
     private var result: FetchResult? = null
     private var errorMessage: Throwable? = null
 
-    var hasErrored = false
-
     override fun intercept(chain: Interceptor.Chain): Response {
         val req = chain.request()
         val url = req.url.toString()
@@ -48,12 +44,7 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
             null
         }
 
-        var resultData = fetchViaJs(url, req.method, req.headers, requestBody, isImage)
-
-        if (resultData.result == "HTTP 403") {
-            hasErrored = !hasErrored
-            resultData = fetchViaJs(url, req.method, req.headers, requestBody, isImage)
-        }
+        val resultData = fetchViaJs(url, req.method, req.headers, requestBody, isImage)
         if (!resultData.success) throw IOException("[WebView]: " + resultData.result)
 
         val resultConentType = resultData.contentType ?: "text/html"
@@ -128,32 +119,14 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
             try {
                 val webView = globalWebView
                 webView.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView,
-                        request: WebResourceRequest,
-                    ): WebResourceResponse? = if (!isRsc || "/series/" in request.url.toString()) {
-                        null
-                    } else {
-                        WebResourceResponse(null, null, null)
-                    }
-
-                    override fun onReceivedHttpError(
-                        view: WebView,
-                        request: WebResourceRequest,
-                        errorResponse: WebResourceResponse,
-                    ) {
-                        if (request.isForMainFrame) {
-                            result = FetchResult(false, "HTTP ${errorResponse.statusCode}")
-                            latch?.countDown()
-                        }
-                    }
-
                     override fun onPageFinished(view: WebView, pageUrl: String?) {
                         if (isRsc) {
                             if (result != null) return
                             view.evaluateJavascript(
                                 """
                             (function() {
+                                if (document.title === 'Just a moment...' ||
+                                    document.querySelector('.main-wrapper #challenge-error-text')) return;
                                 window.$bridgeName.passResult(document.documentElement.outerHTML, document.contentType);
                             })();
                                 """.trimIndent(),
@@ -221,7 +194,7 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
                     }
                 }
 
-                if (isRsc && !hasErrored) {
+                if (isRsc) {
                     webView.loadUrl(url.substringBefore('?')) // document fetch-dest and drop rsc
                     return@post
                 }
@@ -234,7 +207,16 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
             }
         }
 
-        latch?.await(if (isImage) 10 else 5, TimeUnit.SECONDS)
+        latch?.await(
+            if (isImage) {
+                10
+            } else if (isRsc) {
+                20
+            } else {
+                5
+            },
+            TimeUnit.SECONDS,
+        )
 
         return result ?: FetchResult(false, (errorMessage ?: "Timed out").toString())
     }
