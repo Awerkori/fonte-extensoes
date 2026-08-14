@@ -15,8 +15,6 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.Jsoup
-import rx.Observable
 
 @Source
 abstract class LycanToons : HttpSource() {
@@ -81,50 +79,12 @@ abstract class LycanToons : HttpSource() {
 
     // =====================Chapters=====================
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        val slug = manga.slug()
-        val seriesUrl = "$baseUrl/series/$slug"
+    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/api/series/${manga.slug()}/chapters", headers)
 
-        client.newCall(GET(seriesUrl, headers)).execute().use { response ->
-            if (response.isSuccessful) {
-                val document = Jsoup.parse(response.body.string(), seriesUrl)
-                val chapters = document.select("a[href*=\"/series/$slug/\"]")
-                    .mapNotNull { element ->
-                        val href = element.absUrl("href").ifBlank { element.attr("href") }
-                        val path = href.substringAfter(baseUrl, href)
-                            .substringBefore("?")
-                            .substringBefore("#")
-                            .trimEnd('/')
-                        val numberString = path.substringAfterLast('/')
-                        val number = numberString.toFloatOrNull() ?: return@mapNotNull null
-
-                        SChapter.create().apply {
-                            name = element.text().trim().ifBlank { "Capítulo $numberString" }
-                            url = path
-                            chapter_number = number
-                        }
-                    }
-                    .distinctBy { it.url }
-                    .sortedByDescending { it.chapter_number }
-
-                if (chapters.isNotEmpty()) return@fromCallable chapters
-            }
-        }
-
-        client.newCall(chapterPageRequest(slug)).execute().use { response ->
-            if (!response.isSuccessful) error("HTTP ${response.code}")
-
-            response.extractNextJs<ChapterResponse>()?.capitulos
-                ?.map { it.toSChapter(slug) }
-                ?.sortedByDescending { it.chapter_number }
-                ?.takeIf { it.isNotEmpty() }
-                ?: error("Lycan Toons: capítulos não encontrados")
-        }
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val slug = response.request.url.pathSegments.dropLast(1).last()
+        return response.parseAs<ChapterResponse>().toSChapters(slug)
     }
-
-    private fun chapterPageRequest(slug: String): Request = rscRequest("$baseUrl/series/$slug/1")
-
-    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
 
     // =====================Pages========================
 

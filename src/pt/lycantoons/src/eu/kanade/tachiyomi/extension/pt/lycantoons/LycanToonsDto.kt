@@ -69,19 +69,28 @@ class SearchResponse(
 
 @Serializable
 class ChapterResponse(
-    val capitulos: List<ChapterDto>,
-)
+    private val chapters: List<ChapterDto>,
+    private val total: Int,
+) {
+    fun toSChapters(slug: String): List<SChapter> {
+        check(chapters.size == total) { "Lista de capítulos incompleta: ${chapters.size}/$total" }
+
+        return chapters
+            .map { it.toSChapter(slug) }
+            .distinctBy { it.url }
+            .sortedByDescending { it.chapter_number }
+    }
+}
 
 @Serializable
 class ChapterDto(
     private val numero: JsonElement,
     private val createdAt: String? = null,
-    private val pageCount: Int? = null,
 ) {
     fun toSChapter(slug: String) = SChapter.create().apply {
         val numberString = numero.jsonPrimitive.content
         name = "Capítulo $numberString"
-        url = "/series/$slug/$numberString" + (pageCount?.let { "?pages=$it" }.orEmpty())
+        url = "/series/$slug/$numberString"
         date_upload = dateFormat.tryParse(createdAt)
         chapter_number = numberString.toFloatOrNull() ?: -1f
     }

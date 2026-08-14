@@ -113,7 +113,7 @@ class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : 
         result = null
         errorMessage = null
 
-        val isRsc = "/series/" in url
+        val isRsc = headers["RSC"] == "1"
 
         mainHandler.post {
             try {
