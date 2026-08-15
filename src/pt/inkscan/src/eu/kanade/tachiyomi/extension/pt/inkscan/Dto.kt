@@ -79,6 +79,11 @@ internal class SearchResultDto(
 }
 
 @Serializable
+internal class LatestChapterDto(
+    @SerialName("obras") val work: WorkDto? = null,
+)
+
+@Serializable
 internal class ChapterDto(
     private val id: String,
     private val numero: Double,
@@ -174,6 +179,26 @@ internal class SearchRequestDto(
     @SerialName("search_term") private val searchTerm: String,
     @SerialName("max_results") private val maxResults: Int,
     @SerialName("acervo_b_only") private val archiveBOnly: Boolean,
+)
+
+@Serializable
+internal class AuthRequestDto(
+    @SerialName("refresh_token") private val refreshToken: String? = null,
+)
+
+@Serializable
+internal class AuthResponseDto(
+    @SerialName("access_token") val accessToken: String? = null,
+    @SerialName("refresh_token") val refreshToken: String? = null,
+    @SerialName("expires_in") val expiresIn: Long? = null,
+)
+
+@Serializable
+internal class AuthStorageDto(
+    @SerialName("access_token") val accessToken: String? = null,
+    @SerialName("refresh_token") val refreshToken: String? = null,
+    @SerialName("expires_at") val expiresAt: Long? = null,
+    @SerialName("expires_in") val expiresIn: Long? = null,
 )
 
 @Serializable
