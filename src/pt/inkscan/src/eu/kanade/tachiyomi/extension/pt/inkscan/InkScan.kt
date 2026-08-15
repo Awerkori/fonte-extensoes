@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.inkscan
 
+import android.content.ComponentName
+import android.content.Intent
 import android.util.Log
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
@@ -14,6 +16,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.getLocalStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
@@ -52,6 +55,23 @@ abstract class InkScan :
             .remove(LEGACY_PREF_EMAIL)
             .remove(LEGACY_PREF_PASSWORD)
             .apply()
+
+        if (!auth.hasSession()) {
+            Preference().apply {
+                title = "Login necessário"
+                summary = "A Ink Scan exige uma conta. Use Entrar na Ink Scan e autentique-se no WebView."
+            }.let(screen::addPreference)
+        }
+
+        Preference().apply {
+            title = "Entrar na Ink Scan"
+            summary = "Abra o site e faça login normalmente, incluindo o CAPTCHA"
+            setOnPreferenceClickListener {
+                openLoginWebView()
+                true
+            }
+        }.let(screen::addPreference)
+
         Preference().apply {
             title = "Sessão da Ink Scan"
             summary = if (auth.hasSession()) "Conectado" else "Não conectado — faça login pelo WebView"
@@ -71,6 +91,20 @@ abstract class InkScan :
             }
         }.let(screen::addPreference)
     }
+
+    private fun openLoginWebView(): Boolean = runCatching {
+        val context = applicationContext
+        val intent = Intent().apply {
+            component = ComponentName(context, WEBVIEW_ACTIVITY)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra("url_key", "$baseUrl/")
+            putExtra("source_key", id)
+            putExtra("title_key", "Entre na sua conta Ink Scan")
+        }
+        context.startActivity(intent)
+    }.onFailure {
+        Log.w(LOG_TAG, "unable to open login WebView", it)
+    }.isSuccess
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Accept", "application/json, text/plain, */*")
@@ -111,6 +145,7 @@ abstract class InkScan :
             if (!response.isSuccessful) {
                 throw IOException("Falha ao carregar atualizações: HTTP ${response.code}")
             }
+            if (!auth.hasSession()) throw IOException(loginMessage())
 
             val latest = response.parseAs<List<LatestChapterDto>>()
                 .asSequence()
@@ -370,7 +405,7 @@ abstract class InkScan :
         return MangasPage(works.map { it.toSManga() }, hasNextPage)
     }
 
-    private fun loginMessage() = "É necessário entrar na sua conta Ink Scan pelo WebView antes de carregar o catálogo."
+    private fun loginMessage() = "Login necessário. Abra Configurações → Entrar na Ink Scan, faça login no WebView e atualize a página."
 
     private fun SManga.workId(): String = "$baseUrl$url".toHttpUrl().pathSegments[1]
 
@@ -418,6 +453,7 @@ abstract class InkScan :
             "sb-sjybfvyoznmtxmjhycoj-auth-token",
         )
         private const val LOG_TAG = "InkScanAuth"
+        private const val WEBVIEW_ACTIVITY = "eu.kanade.tachiyomi.ui.webview.WebViewActivity"
     }
 
     private inner class InkScanAuth {
@@ -512,11 +548,15 @@ abstract class InkScan :
                 preferences.edit()
                     .putString(PREF_ACCESS_TOKEN, access)
                     .putString(PREF_REFRESH_TOKEN, auth.refreshToken)
-                    .putLong(PREF_TOKEN_EXPIRES, System.currentTimeMillis() + (auth.expiresIn ?: 3600) * 1000L)
+                    .putLong(PREF_TOKEN_EXPIRES, auth.expiresAtMillis())
                     .apply()
                 return access
             }
         }
+
+        private fun AuthResponseDto.expiresAtMillis(): Long = expiresAt?.let {
+            if (it < 100_000_000_000L) it * 1000L else it
+        } ?: (System.currentTimeMillis() + (expiresIn ?: 3600L) * 1000L)
 
         private val authHeaders: Headers = Headers.Builder()
             .set("apikey", API_KEY)

@@ -6,6 +6,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -191,6 +192,9 @@ internal class AuthResponseDto(
     @SerialName("access_token") val accessToken: String? = null,
     @SerialName("refresh_token") val refreshToken: String? = null,
     @SerialName("expires_in") val expiresIn: Long? = null,
+    @SerialName("expires_at") val expiresAt: Long? = null,
+    @SerialName("token_type") val tokenType: String? = null,
+    val user: JsonObject? = null,
 )
 
 @Serializable
