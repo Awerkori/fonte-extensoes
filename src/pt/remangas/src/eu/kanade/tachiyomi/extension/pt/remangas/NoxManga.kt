@@ -9,116 +9,92 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
-import keiyoushi.network.rateLimit
-import keiyoushi.utils.parseAs
-import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class NoxManga : HttpSource() {
+    override val supportsLatest = true
 
-    override val supportsLatest: Boolean = true
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/home", headers)
 
-    override val client: OkHttpClient = network.client.newBuilder()
-        .rateLimit(3, 1.seconds)
-        .build()
+    override fun popularMangaParse(response: Response): MangasPage = parseCards(response, ".cx-card")
 
-    private val apiUrl: String = "https://xodneo.site/api/v1/comics"
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/home", headers)
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Origin", baseUrl)
+    override fun latestUpdatesParse(response: Response): MangasPage = parseCards(response, ".cx-side-item")
 
-    // ====================== Popular ====================================
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/search?q=${query.trim().replace(" ", "+")}", headers)
 
-    override fun popularMangaRequest(page: Int): Request {
-        val url = apiUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("per_page", "24")
-            .addQueryParameter("sort", "popular")
-            .addQueryParameter("period", "week")
-            .addQueryParameter("page", page.toString())
-            .build()
-        return GET(url, headers)
+    override fun searchMangaParse(response: Response): MangasPage = parseCards(response, "a[href^='/manga/']")
+
+    private fun parseCards(response: Response, selector: String): MangasPage {
+        val cards = response.asJsoup().select(selector).mapNotNull { card ->
+            val link = card.selectFirst("a[href^='/manga/']") ?: if (card.tagName() == "a") card else null
+            val href = link?.attr("href") ?: return@mapNotNull null
+            val title = card.selectFirst(".cx-card-title, .cx-side-name, .cx-title")?.text()?.trim()
+                ?: card.selectFirst("img[alt]")?.attr("alt")?.trim()
+                ?: return@mapNotNull null
+            SManga.create().apply {
+                url = href.substringAfter("/manga/")
+                this.title = title
+                thumbnail_url = card.selectFirst("img")?.absUrl("src")
+            }
+        }.distinctBy { it.url }
+        require(cards.isNotEmpty()) { "O HTML do NixManga não contém obras; o layout pode ter mudado." }
+        return MangasPage(cards, false)
     }
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val dto = response.parseAs<PageableDto<MangaDto>>()
-        val mangas = dto.list.map(MangaDto::toSManga)
-        return MangasPage(mangas, hasNextPage = dto.hasNextPage())
-    }
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga/${manga.url}"
 
-    // ====================== Latest ====================================
-
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = apiUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("per_page", "24")
-            .addQueryParameter("sort", "latest")
-            .addQueryParameter("period", "week")
-            .addQueryParameter("page", page.toString())
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
-
-    // ====================== Search ====================================
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$apiUrl/search".toHttpUrl().newBuilder()
-            .addQueryParameter("q", query)
-            .addQueryParameter("page", page.toString())
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
-
-    // ====================== Details ====================================
+    override fun mangaDetailsRequest(manga: SManga): Request = GET(getMangaUrl(manga), headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
+        val doc = response.asJsoup()
+        val title = doc.selectFirst("h1, .detail-title")?.text()?.trim()
+            ?: throw Exception("O HTML do NixManga não contém o título da obra.")
         return SManga.create().apply {
-            title = document.selectFirst(".detail-title")!!.text()
-            thumbnail_url = document.selectFirst(".detail-cover img")?.absUrl("src")
-            description = document.selectFirst(".detail-description")?.text()
-            genre = document.select(".detail-tags a").joinToString { it.text() }
-            genre = document.select(".detail-tags a").joinToString { it.text() }
-            document.selectFirst(".status-badge")?.text()?.let {
-                status = when (it.lowercase()) {
-                    "em andamento" -> SManga.ONGOING
-                    "hiato" -> SManga.ONGOING
-                    "completo" -> SManga.COMPLETED
-                    "cancelado" -> SManga.CANCELLED
-                    else -> SManga.UNKNOWN
-                }
+            this.title = title
+            thumbnail_url = doc.selectFirst("img[alt='$title'], .detail-cover img, img[alt]")?.absUrl("src")
+            description = doc.selectFirst(".detail-description, .synopsis, [class*=description]")?.text()?.trim()
+            genre = doc.select(".tag-chip, .detail-tags a").joinToString { it.text().trim() }
+            val statusText = doc.selectFirst("p:matches(^Status:)")?.text()?.lowercase().orEmpty()
+            status = when {
+                "completo" in statusText -> SManga.COMPLETED
+                "hiato" in statusText -> SManga.ON_HIATUS
+                "cancelado" in statusText -> SManga.CANCELLED
+                "andamento" in statusText -> SManga.ONGOING
+                else -> SManga.UNKNOWN
             }
         }
     }
 
-    // ====================== Chapters ====================================
-
-    override fun chapterListRequest(manga: SManga): Request {
-        val slug = manga.url.substringAfterLast("/")
-        val url = "$apiUrl/slug/$slug/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("page", "1")
-            .addQueryParameter("per_page", "999")
-            .addQueryParameter("sort", "newest")
-            .build()
-        return GET(url, headers)
-    }
+    override fun chapterListRequest(manga: SManga): Request = GET(getMangaUrl(manga), headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val pathSegments = response.request.url.pathSegments
-        val dto = response.parseAs<PageableDto<ChapterDto>>()
-        return dto.list.map { it.toSChapter(pathSegments[pathSegments.size - 2]) }
+        val chapters = response.asJsoup().select(".chapter-item-modern[href^='/read/']").mapNotNull { link ->
+            val href = link.attr("href")
+            val number = Regex("(?:capitulo|capítulo)[- ]([0-9]+(?:\\.[0-9]+)?)", RegexOption.IGNORE_CASE)
+                .find(href)?.groupValues?.get(1)?.toFloatOrNull() ?: return@mapNotNull null
+            SChapter.create().apply {
+                url = href
+                name = link.text().trim().ifEmpty { "Capítulo $number" }
+                chapter_number = number
+            }
+        }.distinctBy { it.url }
+        require(chapters.isNotEmpty()) { "O HTML do NixManga não contém capítulos." }
+        return chapters
     }
 
-    override fun pageListParse(response: Response): List<Page> = response.asJsoup().select("section > img").mapIndexed { index, element ->
-        Page(index, imageUrl = element.absUrl("src"))
+    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
+
+    override fun pageListParse(response: Response): List<Page> {
+        val pages = response.asJsoup().select("img[alt*='Página'], .reader-content img, main img")
+            .mapNotNull { it.absUrl("src").takeIf(String::isNotBlank) }
+            .distinct()
+        require(pages.isNotEmpty()) { "O HTML do NixManga não contém páginas de leitura." }
+        return pages.mapIndexed { index, url -> Page(index, imageUrl = url) }
     }
 
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 }

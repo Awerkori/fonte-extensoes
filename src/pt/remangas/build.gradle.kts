@@ -5,14 +5,14 @@ plugins {
 }
 
 keiyoushi {
-    name = "NoxManga"
-    versionCode = 53
+    name = "NixManga"
+    versionCode = 54
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://noxtoons.com"
+        baseUrl = "https://noxmangas.org"
         id = 7462657023971681136
     }
 }
