@@ -11,7 +11,7 @@ keiyoushi {
         baseUrl = "https://inkscann.live"
     }
     name = "Ink Scan"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
 }
