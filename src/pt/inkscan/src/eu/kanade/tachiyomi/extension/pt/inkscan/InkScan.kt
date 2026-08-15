@@ -1,8 +1,14 @@
 package eu.kanade.tachiyomi.extension.pt.inkscan
 
-import android.content.ComponentName
-import android.content.Intent
+import android.app.Dialog
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -16,7 +22,6 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.applicationContext
 import keiyoushi.utils.getLocalStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
@@ -45,66 +50,349 @@ abstract class InkScan :
     private val apiUrl = "https://delicate-hill-05c1inkscan.inkscann.workers.dev"
     private val apiHost = apiUrl.toHttpUrl().host
 
+    init {
+        debug("source_created version=1.4.3 baseUrl=$baseUrl workerUrl=$apiUrl")
+        prefDebug("source_created class=${this::class.java.name}")
+        prefDebug("source_id=$id")
+        prefDebug("configurable_source=${this is ConfigurableSource}")
+    }
+
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor { chain -> auth.intercept(chain) }
         .rateLimit(3, 1.seconds) { it.host == apiHost }
         .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        prefDebug("setup_entered=true")
+        prefDebug("source_class=${this::class.java.name}")
+        prefDebug("source_id=$id")
+        prefDebug("screen_class=${screen::class.java.name}")
+        prefDebug("context_class=${screen.context::class.java.name}")
+        var addedCount = 0
+        prefDebug("initial_count=unavailable_in_extension_api")
+        debug("settings_open session=${auth.hasSession()}")
         preferences.edit()
             .remove(LEGACY_PREF_EMAIL)
             .remove(LEGACY_PREF_PASSWORD)
             .apply()
 
-        if (!auth.hasSession()) {
-            Preference().apply {
-                title = "Login necessário"
-                summary = "A Ink Scan exige uma conta. Use Entrar na Ink Scan e autentique-se no WebView."
-            }.let(screen::addPreference)
+        lateinit var actionPref: Preference
+        lateinit var sessionStatus: Preference
+        lateinit var clearSession: Preference
+
+        fun updateUiState() {
+            val loggedIn = auth.hasSession()
+            if (loggedIn) {
+                actionPref.title = "Abrir Ink Scan"
+                actionPref.summary = "Abre o site da Ink Scan."
+                sessionStatus.summary = "Conectado"
+                setPreferenceVisible(clearSession, true)
+            } else {
+                actionPref.title = "Entrar na Ink Scan"
+                actionPref.summary = "Abre o login oficial da Ink Scan."
+                sessionStatus.summary = "Não conectado"
+                setPreferenceVisible(clearSession, false)
+            }
         }
 
-        Preference().apply {
-            title = "Entrar na Ink Scan"
-            summary = "Abra o site e faça login normalmente, incluindo o CAPTCHA"
+        actionPref = createPreference(screen.context).apply {
+            key = PREF_HOW_TO_LOGIN
+            title = if (auth.hasSession()) "Abrir Ink Scan" else "Entrar na Ink Scan"
+            summary = if (auth.hasSession()) "Abre o site da Ink Scan." else "Abre o login oficial da Ink Scan."
             setOnPreferenceClickListener {
-                openLoginWebView()
+                loginDebug("preference_clicked")
+                loginDebug("preference_click_consumed=true")
+                prefDebug("login_preference_clicked")
+                showLoginWebView(screen.context) {
+                    updateUiState()
+                }
                 true
             }
-        }.let(screen::addPreference)
+        }
+        setPreferenceSelectable(actionPref, true)
+        prefDebugSnapshot("HOW_TO_LOGIN", actionPref, "before_add")
+        val actionPrefAdded = screen.addPreference(actionPref)
+        if (actionPrefAdded) addedCount++
+        prefDebug("added=HOW_TO_LOGIN count=$addedCount result=$actionPrefAdded")
+        prefDebugSnapshot("HOW_TO_LOGIN", actionPref, "after_add")
 
-        Preference().apply {
+        sessionStatus = createPreference(screen.context).apply {
+            key = PREF_SESSION_STATUS
             title = "Sessão da Ink Scan"
-            summary = if (auth.hasSession()) "Conectado" else "Não conectado — faça login pelo WebView"
-        }.let(screen::addPreference)
+            summary = if (auth.hasSession()) "Conectado" else "Não conectado"
+            setOnPreferenceClickListener { true }
+        }
+        setPreferenceSelectable(sessionStatus, false)
+        prefDebugSnapshot("SESSION_STATUS", sessionStatus, "before_add")
+        val sessionStatusAdded = screen.addPreference(sessionStatus)
+        if (sessionStatusAdded) addedCount++
+        prefDebug("added=SESSION_STATUS count=$addedCount result=$sessionStatusAdded")
+        prefDebugSnapshot("SESSION_STATUS", sessionStatus, "after_add")
 
-        Preference().apply {
-            title = "Limpar sessão da Ink Scan"
-            summary = "Remove os tokens salvos nesta extensão"
+        clearSession = createPreference(screen.context).apply {
+            key = PREF_CLEAR_SESSION
+            title = "Sair da conta"
+            summary = "Remove a sessão salva da Ink Scan neste aplicativo."
             setOnPreferenceClickListener {
-                preferences.edit()
-                    .remove(PREF_ACCESS_TOKEN)
-                    .remove(PREF_REFRESH_TOKEN)
-                    .remove(PREF_TOKEN_EXPIRES)
-                    .apply()
-                Log.d(LOG_TAG, "session cleared")
+                showLogoutConfirmation(screen.context) {
+                    preferences.edit()
+                        .remove(PREF_ACCESS_TOKEN)
+                        .remove(PREF_REFRESH_TOKEN)
+                        .remove(PREF_TOKEN_EXPIRES)
+                        .apply()
+                    debug("auth session_cleared")
+                    updateUiState()
+                }
                 true
             }
-        }.let(screen::addPreference)
+        }
+        setPreferenceSelectable(clearSession, true)
+        setPreferenceVisible(clearSession, auth.hasSession())
+        prefDebugSnapshot("CLEAR_SESSION", clearSession, "before_add")
+        val clearSessionAdded = screen.addPreference(clearSession)
+        if (clearSessionAdded) addedCount++
+        prefDebug("added=CLEAR_SESSION count=$addedCount result=$clearSessionAdded")
+        prefDebugSnapshot("CLEAR_SESSION", clearSession, "after_add")
+        updateUiState()
+        val foundHowToLogin = screen.findPreferenceDebugObject(PREF_HOW_TO_LOGIN)
+        val foundSessionStatus = screen.findPreferenceDebugObject(PREF_SESSION_STATUS)
+        val foundClearSession = screen.findPreferenceDebugObject(PREF_CLEAR_SESSION)
+        prefDebug("find_how_to_login=${foundHowToLogin != null} found_identity=${foundHowToLogin?.let(System::identityHashCode)} same_instance=${foundHowToLogin === actionPref}")
+        prefDebug("find_session_status=${foundSessionStatus != null} found_identity=${foundSessionStatus?.let(System::identityHashCode)} same_instance=${foundSessionStatus === sessionStatus}")
+        prefDebug("find_clear_session=${foundClearSession != null} found_identity=${foundClearSession?.let(System::identityHashCode)} same_instance=${foundClearSession === clearSession}")
+        prefDebug("setup_finished count=$addedCount")
     }
 
-    private fun openLoginWebView(): Boolean = runCatching {
-        val context = applicationContext
-        val intent = Intent().apply {
-            component = ComponentName(context, WEBVIEW_ACTIVITY)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            putExtra("url_key", "$baseUrl/")
-            putExtra("source_key", id)
-            putExtra("title_key", "Entre na sua conta Ink Scan")
+    private fun createPreference(context: android.content.Context): Preference = runCatching {
+        Preference::class.java.getConstructor(android.content.Context::class.java).newInstance(context)
+    }.getOrElse { Preference() }
+
+    private fun setPreferenceVisible(preference: Preference, visible: Boolean) {
+        runCatching {
+            preference::class.java.methods.firstOrNull { method ->
+                method.name == "setVisible" && method.parameterTypes.contentEquals(arrayOf(Boolean::class.javaPrimitiveType))
+            }?.invoke(preference, visible)
+        }.onFailure {
+            prefDebug("set_visible_failed class=${preference::class.java.name}")
         }
-        context.startActivity(intent)
-    }.onFailure {
-        Log.w(LOG_TAG, "unable to open login WebView", it)
-    }.isSuccess
+    }
+
+    private fun showLogoutConfirmation(context: android.content.Context, onConfirmed: () -> Unit) {
+        android.app.AlertDialog.Builder(context)
+            .setTitle("Sair da Ink Scan?")
+            .setMessage("Isso removerá a sessão salva neste aplicativo.")
+            .setPositiveButton("Sair") { _, _ ->
+                onConfirmed()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showLoginWebView(context: android.content.Context, onSessionImported: () -> Unit) {
+        loginDebug("webview_opened")
+        loginDebug("login_ui_opened")
+        val dialog = Dialog(context)
+        val webView = WebView(context)
+        loginDebug("webview_created")
+        val handler = Handler(Looper.getMainLooper())
+        var finished = false
+        var destroyed = false
+
+        fun stopPolling() {
+            handler.removeCallbacksAndMessages(null)
+        }
+
+        fun closeWebView(autoClosed: Boolean = false) {
+            if (destroyed) return
+            destroyed = true
+            stopPolling()
+            webView.stopLoading()
+            if (dialog.isShowing) {
+                dialog.dismiss()
+            }
+            if (autoClosed) {
+                loginDebug("webview_auto_closed")
+            }
+            loginDebug("login_ui_closed")
+            prefDebug("login_webview_closed")
+            webView.destroy()
+        }
+
+        val rootLayout = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        val density = context.resources.displayMetrics.density
+        val topBar = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            val padH = (16 * density).toInt()
+            val padV = (12 * density).toInt()
+            setPadding(padH, padV, padH, padV)
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+        }
+
+        val backButton = android.widget.TextView(context).apply {
+            text = "←"
+            textSize = 22f
+            val padR = (16 * density).toInt()
+            setPadding(0, 0, padR, 0)
+            setOnClickListener {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    closeWebView()
+                }
+            }
+        }
+
+        val titleView = android.widget.TextView(context).apply {
+            text = "Ink Scan"
+            textSize = 17f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val closeButton = android.widget.TextView(context).apply {
+            text = "✕"
+            textSize = 20f
+            val padL = (16 * density).toInt()
+            setPadding(padL, 0, 0, 0)
+            setOnClickListener {
+                closeWebView()
+            }
+        }
+
+        topBar.addView(backButton)
+        topBar.addView(titleView)
+        topBar.addView(closeButton)
+
+        val progressBar = android.widget.ProgressBar(
+            context,
+            null,
+            android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            isIndeterminate = true
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                (3 * density).toInt().coerceAtLeast(1),
+            )
+        }
+
+        rootLayout.addView(topBar)
+        rootLayout.addView(progressBar)
+        rootLayout.addView(
+            webView,
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            ),
+        )
+
+        lateinit var checkSession: () -> Unit
+        checkSession = {
+            if (!finished && !destroyed && dialog.isShowing) {
+                loginDebug("session_check")
+                val js = """
+                    (function() {
+                        try {
+                            var d = localStorage.getItem('sb-delicate-hill-05c1inkscan-auth-token');
+                            if (d && d !== 'null') return 'delicate:::' + d;
+                            var s = localStorage.getItem('sb-sjybfvyoznmtxmjhycoj-auth-token');
+                            if (s && s !== 'null') return 'sjy:::' + s;
+                        } catch (e) {}
+                        return null;
+                    })()
+                """.trimIndent()
+                webView.evaluateJavascript(js) { result ->
+                    if (finished || destroyed) return@evaluateJavascript
+                    val payload = runCatching { result.parseAs<String?>() }.getOrNull()
+                    if (payload.isNullOrBlank() || payload == "null") {
+                        loginDebug("session_found=false")
+                        if (!finished && !destroyed && dialog.isShowing) {
+                            handler.postDelayed({ checkSession() }, 1_000L)
+                        }
+                        return@evaluateJavascript
+                    }
+                    loginDebug("session_found")
+                    loginDebug("session_found=true")
+                    val keyLabel = payload.substringBefore(":::")
+                    val jsonContent = payload.substringAfter(":::")
+                    val access = auth.saveStorageSession(jsonContent, keyLabel)
+                    val parseSuccess = access != null
+                    loginDebug("session_parse_success=$parseSuccess")
+                    loginDebug("session_persisted=$parseSuccess")
+                    if (parseSuccess) {
+                        finished = true
+                        loginDebug("session_import_success")
+                        onSessionImported()
+                        closeWebView(autoClosed = true)
+                    } else {
+                        if (!finished && !destroyed && dialog.isShowing) {
+                            handler.postDelayed({ checkSession() }, 1_000L)
+                        }
+                    }
+                }
+            }
+        }
+
+        with(webView.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
+        }
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                progressBar.visibility = if (newProgress >= 100) android.view.View.GONE else android.view.View.VISIBLE
+            }
+        }
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                progressBar.visibility = android.view.View.GONE
+                loginDebug("page_loaded")
+                stopPolling()
+                checkSession()
+            }
+        }
+
+        dialog.setContentView(rootLayout)
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.setOnShowListener {
+            dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == android.view.KeyEvent.KEYCODE_BACK && event.action == android.view.KeyEvent.ACTION_UP) {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                    return@setOnKeyListener true
+                }
+            }
+            false
+        }
+        dialog.setOnDismissListener {
+            if (!destroyed) {
+                destroyed = true
+                stopPolling()
+                webView.stopLoading()
+                loginDebug("login_ui_closed")
+                prefDebug("login_webview_closed")
+                webView.destroy()
+            }
+        }
+        dialog.show()
+        webView.loadUrl(baseUrl)
+    }
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Accept", "application/json, text/plain, */*")
@@ -130,6 +418,13 @@ abstract class InkScan :
 
     // ============================= Popular ================================
 
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> = if (!auth.sessionAvailable()) {
+        debug("LOGIN_CARD operation=POPULAR")
+        Observable.just(loginCardPage())
+    } else {
+        super.fetchPopularManga(page)
+    }
+
     override fun popularMangaRequest(page: Int): Request = worksRequest(page, POPULAR_SORT, FilterList())
 
     override fun popularMangaParse(response: Response): MangasPage = response.toWorksPage()
@@ -140,36 +435,50 @@ abstract class InkScan :
 
     override fun latestUpdatesParse(response: Response): MangasPage = response.toWorksPage()
 
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = Observable.fromCallable {
-        client.newCall(latestChaptersRequest()).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("Falha ao carregar atualizações: HTTP ${response.code}")
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        if (!auth.sessionAvailable()) {
+            debug("LOGIN_CARD operation=LATEST")
+            return Observable.just(loginCardPage())
+        }
+        return Observable.fromCallable {
+            client.newCall(latestChaptersRequest()).execute().use { response ->
+                debug("response operation=LATEST http=${response.code}")
+                if (!response.isSuccessful) {
+                    throw IOException(if (response.code == 401) loginMessage() else "Falha ao carregar atualizações: HTTP ${response.code}")
+                }
+                val latest = response.parseAs<List<LatestChapterDto>>()
+                    .asSequence()
+                    .filter { it.work != null }
+                    .distinctBy { it.work!!.id() }
+                    .map { it.work!!.toSManga() }
+                    .toList()
+                debug("response operation=LATEST items=${latest.size}")
+                if (latest.isEmpty() && !auth.hasSession()) throw IOException(loginMessage())
+                val offset = (page - 1) * PAGE_SIZE
+                MangasPage(latest.drop(offset).take(PAGE_SIZE), latest.size > offset + PAGE_SIZE)
             }
-            if (!auth.hasSession()) throw IOException(loginMessage())
-
-            val latest = response.parseAs<List<LatestChapterDto>>()
-                .asSequence()
-                .filter { it.work != null }
-                .distinctBy { it.work!!.id() }
-                .map { it.work!!.toSManga() }
-                .toList()
-            Log.d(LOG_TAG, "latest records=${latest.size}")
-            val offset = (page - 1) * PAGE_SIZE
-            MangasPage(latest.drop(offset).take(PAGE_SIZE), latest.size > offset + PAGE_SIZE)
         }
     }
 
     // ============================= Search =================================
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        if (!auth.sessionAvailable()) {
+            debug("LOGIN_CARD operation=SEARCH")
+            return Observable.just(loginCardPage())
+        }
         if (query.isBlank()) {
             return super.fetchSearchManga(page, query, filters)
         }
 
         return Observable.fromCallable {
             val ids = client.newCall(searchIdsRequest(query)).execute().use { response ->
-                if (!auth.hasSession()) throw IOException(loginMessage())
-                response.parseAs<List<SearchResultDto>>().also { Log.d(LOG_TAG, "search records=${it.size}") }.map { it.id() }
+                if (response.code == 401) throw IOException(loginMessage())
+                if (!response.isSuccessful) throw IOException("Falha na busca: HTTP ${response.code}")
+                response.parseAs<List<SearchResultDto>>().also {
+                    debug("response operation=SEARCH http=${response.code} items=${it.size}")
+                    if (it.isEmpty() && !auth.hasSession()) throw IOException(loginMessage())
+                }.map { it.id() }
             }
 
             if (ids.isEmpty()) {
@@ -177,7 +486,9 @@ abstract class InkScan :
             }
 
             val works = client.newCall(worksByIdsRequest(ids, filters)).execute().use { response ->
-                response.parseAs<List<WorkDto>>()
+                if (response.code == 401) throw IOException(loginMessage())
+                if (!response.isSuccessful) throw IOException("Falha ao carregar resultados: HTTP ${response.code}")
+                response.parseAs<List<WorkDto>>().also { debug("response operation=SEARCH results_items=${it.size}") }
             }
 
             val orderedWorks = ids.mapNotNull { id -> works.firstOrNull { it.id() == id } }
@@ -200,7 +511,14 @@ abstract class InkScan :
 
     // ============================= Details ================================
 
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> = if (manga.url == LOGIN_REQUIRED_URL) {
+        Observable.just(loginCardManga())
+    } else {
+        super.fetchMangaDetails(manga)
+    }
+
     override fun mangaDetailsRequest(manga: SManga): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/obras".toHttpUrl().newBuilder()
             .addQueryParameter("select", DETAILS_SELECT)
             .addQueryParameter("id", "eq.${manga.workId()}")
@@ -210,14 +528,25 @@ abstract class InkScan :
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
+        debug("response operation=DETAILS http=${response.code}")
+        if (response.code == 401) throw IOException(loginMessage())
+        if (!response.isSuccessful) throw IOException("Falha ao carregar detalhes: HTTP ${response.code}")
         if (!auth.hasSession()) throw IOException(loginMessage())
-        return response.parseAs<List<WorkDto>>().firstOrNull()?.toSManga(initialized = true)
+        val works = try {
+            response.parseAs<List<WorkDto>>()
+        } catch (error: Throwable) {
+            debugError("DETAILS", error)
+            throw error
+        }
+        debug("response operation=DETAILS body_empty=${works.isEmpty()} parse_success=true")
+        return works.firstOrNull()?.toSManga(initialized = true)
             ?: throw IOException("A resposta da Ink Scan não contém os detalhes da obra.")
     }
 
     // ============================= Chapters ===============================
 
     override fun chapterListRequest(manga: SManga): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/capitulos".toHttpUrl().newBuilder()
             .addQueryParameter("select", CHAPTERS_SELECT)
             .addQueryParameter("obra_id", "eq.${manga.workId()}")
@@ -228,32 +557,48 @@ abstract class InkScan :
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
+        debug("response operation=CHAPTERS http=${response.code}")
+        if (response.code == 401) throw IOException(loginMessage())
+        if (!response.isSuccessful) throw IOException("Falha ao carregar capítulos: HTTP ${response.code}")
         val workId = response.request.url.queryParameter("obra_id")?.removePrefix("eq.").orEmpty()
-        return response.parseAs<List<ChapterDto>>()
+        if (!auth.hasSession()) throw IOException(loginMessage())
+        val chapters = try {
+            response.parseAs<List<ChapterDto>>()
+        } catch (error: Throwable) {
+            debugError("CHAPTERS", error)
+            throw error
+        }
+        debug("response operation=CHAPTERS items=${chapters.size}")
+        return chapters
             .map { it.toSChapter(workId) }
             .sortedWith(compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload })
     }
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        val chapters = buildList {
-            var offset = 0
-            while (true) {
-                val response = client.newCall(chapterListRequest(manga, offset)).execute()
-                val page = response.use {
-                    if (!it.isSuccessful) {
-                        throw IOException("Falha ao carregar capítulos: HTTP ${it.code}")
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
+        if (manga.url == LOGIN_REQUIRED_URL) return Observable.just(emptyList())
+
+        return Observable.fromCallable {
+            val chapters = buildList {
+                var offset = 0
+                while (true) {
+                    val response = client.newCall(chapterListRequest(manga, offset)).execute()
+                    val page = response.use {
+                        debug("response operation=CHAPTERS http=${it.code}")
+                        if (!it.isSuccessful) {
+                            throw IOException(if (it.code == 401) loginMessage() else "Falha ao carregar capítulos: HTTP ${it.code}")
+                        }
+                        it.parseAs<List<ChapterDto>>().also { chapters -> debug("response operation=CHAPTERS items=${chapters.size}") }
                     }
-                    it.parseAs<List<ChapterDto>>()
+                    if (page.isEmpty()) break
+                    addAll(page.map { it.toSChapter(manga.workId()) })
+                    if (page.size < CHAPTER_PAGE_SIZE) break
+                    offset += CHAPTER_PAGE_SIZE
                 }
-                if (page.isEmpty()) break
-                addAll(page.map { it.toSChapter(manga.workId()) })
-                if (page.size < CHAPTER_PAGE_SIZE) break
-                offset += CHAPTER_PAGE_SIZE
             }
+            chapters
+                .distinctBy { it.url }
+                .sortedWith(compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload })
         }
-        chapters
-            .distinctBy { it.url }
-            .sortedWith(compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload })
     }
 
     // ============================= Pages ==================================
@@ -264,6 +609,7 @@ abstract class InkScan :
         val chapterId = chapterUrl.queryParameter("id") ?: throw IOException("ID do capitulo ausente")
 
         val folder = client.newCall(folderRequest(workId)).execute().use { response ->
+            debug("response operation=READER http=${response.code}")
             if (!response.isSuccessful) {
                 throw IOException("Falha ao carregar a obra: HTTP ${response.code}")
             }
@@ -271,10 +617,13 @@ abstract class InkScan :
         }
 
         client.newCall(chapterPagesRequest(chapterId)).execute().use { response ->
+            debug("response operation=READER http=${response.code}")
             if (!response.isSuccessful) {
                 throw IOException("Falha ao carregar as páginas: HTTP ${response.code}")
             }
-            response.parseAs<ChapterPagesDto>().toPageList(folder)
+            val pages = response.parseAs<ChapterPagesDto>().toPageList(folder)
+            debug("response operation=READER pages=${pages.size}")
+            pages
         }
     }
 
@@ -300,6 +649,7 @@ abstract class InkScan :
     override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url.substringBefore("?")}"
 
     private fun worksRequest(page: Int, sort: String, filters: FilterList): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/obras".toHttpUrl().newBuilder()
             .addQueryParameter("select", CATALOG_SELECT)
             .addQueryParameter("or", "(is_acervo_b.is.null,is_acervo_b.eq.false)")
@@ -313,6 +663,7 @@ abstract class InkScan :
     }
 
     private fun chapterListRequest(manga: SManga, offset: Int): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/capitulos".toHttpUrl().newBuilder()
             .addQueryParameter("select", CHAPTERS_SELECT)
             .addQueryParameter("obra_id", "eq.${manga.workId()}")
@@ -325,6 +676,7 @@ abstract class InkScan :
     }
 
     private fun latestChaptersRequest(): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/capitulos".toHttpUrl().newBuilder()
             .addQueryParameter("select", LATEST_SELECT)
             .addQueryParameter("created_at", "gte.${latestSince()}")
@@ -340,6 +692,7 @@ abstract class InkScan :
         .toString()
 
     private fun worksByIdsRequest(ids: List<String>, filters: FilterList): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/obras".toHttpUrl().newBuilder()
             .addQueryParameter("select", CATALOG_SELECT)
             .addQueryParameter("id", "in.(${ids.joinToString()})")
@@ -351,6 +704,7 @@ abstract class InkScan :
     }
 
     private fun searchIdsRequest(query: String): Request {
+        auth.ensureSession()
         val payload = SearchRequestDto(
             searchTerm = query.trim(),
             maxResults = SEARCH_LIMIT,
@@ -361,6 +715,7 @@ abstract class InkScan :
     }
 
     private fun folderRequest(workId: String): Request {
+        auth.ensureSession()
         val url = "$apiUrl/rest/v1/obras".toHttpUrl().newBuilder()
             .addQueryParameter("select", FOLDER_SELECT)
             .addQueryParameter("id", "eq.$workId")
@@ -370,6 +725,7 @@ abstract class InkScan :
     }
 
     private fun chapterPagesRequest(chapterId: String): Request {
+        auth.ensureSession()
         val payload = ChapterRequestDto(chapterId).toJsonRequestBody()
         return POST("$apiUrl/functions/v1/get-chapter", functionHeaders, payload)
     }
@@ -395,17 +751,90 @@ abstract class InkScan :
     }
 
     private fun Response.toWorksPage(): MangasPage {
-        if (!auth.hasSession()) throw IOException(loginMessage())
+        debug("response operation=CATALOG http=$code")
+        if (code == 401) throw IOException(loginMessage())
+        if (!isSuccessful) throw IOException("Falha ao carregar catálogo: HTTP $code")
         val page = request.url.queryParameter("offset")?.toIntOrNull()?.div(PAGE_SIZE)?.plus(1) ?: 1
         val works = parseAs<List<WorkDto>>()
-        Log.d(LOG_TAG, "catalog records=${works.size}")
+        debug("response operation=CATALOG items=${works.size}")
+        if (works.isEmpty() && !auth.hasSession()) throw IOException(loginMessage())
         val total = header("content-range")?.substringAfter("/")?.toIntOrNull()
         val hasNextPage = total?.let { page * PAGE_SIZE < it } ?: (works.size == PAGE_SIZE)
 
         return MangasPage(works.map { it.toSManga() }, hasNextPage)
     }
 
-    private fun loginMessage() = "Login necessário. Abra Configurações → Entrar na Ink Scan, faça login no WebView e atualize a página."
+    private fun loginMessage() = "Login necessário. Abra o WebView da Ink Scan pelo ícone do globo, entre na sua conta e tente novamente."
+
+    private fun loginCardPage(): MangasPage = MangasPage(listOf(loginCardManga()), false)
+
+    private fun loginCardManga(): SManga = SManga.create().apply {
+        title = "🔐 Login necessário"
+        url = LOGIN_REQUIRED_URL
+        description = "Abra o WebView da Ink Scan pelo ícone do globo, entre normalmente na sua conta e depois volte e atualize a fonte."
+    }
+
+    private fun debug(message: String) = Log.d(DEBUG_TAG, "INKSCAN_DEBUG $message")
+
+    private fun loginDebug(message: String) = Log.d(LOGIN_DEBUG_TAG, "INKSCAN_LOGIN_DEBUG $message")
+
+    private fun prefDebug(message: String) = Log.d(PREF_DEBUG_TAG, "INKSCAN_PREF_DEBUG $message")
+
+    private fun prefDebugSnapshot(label: String, preference: Preference, phase: String) {
+        prefDebug("pref=$label phase=$phase class=${preference::class.java.name}")
+        prefDebug("pref=$label key=${preference.key}")
+        prefDebug("pref=$label title_present=${!preference.title.isNullOrBlank()} title=${preference.title}")
+        prefDebug("pref=$label summary_present=${!preference.summary.isNullOrBlank()}")
+        prefDebug("pref=$label visible=${preference.optionalBooleanProperty("isVisible")}")
+        prefDebug("pref=$label enabled=${preference.optionalBooleanProperty("isEnabled")}")
+        prefDebug("pref=$label selectable=${preference.optionalBooleanProperty("isSelectable")}")
+        prefDebug("pref=$label order=${preference.optionalProperty("getOrder")}")
+        prefDebug("pref=$label layout=${preference.optionalProperty("getLayoutResource")}")
+        prefDebug("pref=$label widget_layout=${preference.optionalProperty("getWidgetLayoutResource")}")
+        prefDebug("pref=$label identity=${System.identityHashCode(preference)}")
+    }
+
+    private fun setPreferenceSelectable(preference: Preference, selectable: Boolean) {
+        runCatching {
+            preference::class.java.methods.firstOrNull { method ->
+                method.name == "setSelectable" && method.parameterTypes.contentEquals(arrayOf(Boolean::class.javaPrimitiveType))
+            }?.invoke(preference, selectable)
+        }.onFailure {
+            prefDebug("set_selectable_failed class=${preference::class.java.name}")
+        }
+    }
+
+    private fun Preference.optionalBooleanProperty(name: String): String = optionalProperty(name) ?: "unavailable"
+
+    private fun Preference.optionalProperty(name: String): String? = runCatching {
+        javaClass.methods.firstOrNull { it.name == name && it.parameterTypes.isEmpty() }
+            ?.invoke(this)
+            ?.toString()
+    }.getOrNull()
+
+    private fun PreferenceScreen.findPreferenceDebugObject(key: String): Preference? = runCatching {
+        javaClass.methods.firstOrNull { method ->
+            method.name == "findPreference" && method.parameterTypes.contentEquals(arrayOf(String::class.java))
+        }?.invoke(this, key) as? Preference
+    }.getOrNull()
+
+    private fun debugError(operation: String, error: Throwable) {
+        val safeMessage = error.message.orEmpty()
+            .replace(Regex("(?i)(access_token|refresh_token|authorization|password|captcha_token)[^,\\s}]*"), "<redacted>")
+            .take(160)
+        debug("error operation=$operation type=${error::class.java.simpleName} message=$safeMessage")
+    }
+
+    private fun operationFor(url: HttpUrl): String = when {
+        url.host != apiHost -> "READER"
+        url.encodedPath.contains("fuzzy_search_obras") -> "SEARCH"
+        url.encodedPath.contains("get-chapter") -> "READER"
+        url.encodedPath.endsWith("/capitulos") && url.queryParameter("select")?.contains("obras!inner") == true -> "LATEST"
+        url.encodedPath.endsWith("/capitulos") -> "CHAPTERS"
+        url.encodedPath.endsWith("/obras") && url.queryParameter("id")?.startsWith("eq.") == true -> "DETAILS"
+        url.encodedPath.endsWith("/obras") -> "CATALOG"
+        else -> "OTHER"
+    }
 
     private fun SManga.workId(): String = "$baseUrl$url".toHttpUrl().pathSegments[1]
 
@@ -427,7 +856,6 @@ abstract class InkScan :
         private const val LATEST_LIMIT = 1000
         private const val LATEST_WINDOW_SECONDS = 54 * 60 * 60L
         private const val TOKEN_REFRESH_MARGIN = 60_000L
-        private const val WEBVIEW_CHECK_INTERVAL = 60_000L
         private const val SEARCH_LIMIT = 120
         private const val POPULAR_SORT = "total_views.desc"
         private const val LATEST_SORT = "created_at.desc"
@@ -448,27 +876,35 @@ abstract class InkScan :
         private const val PREF_TOKEN_EXPIRES = "inkscan_token_expires"
         private const val LEGACY_PREF_EMAIL = "inkscan_auth_email"
         private const val LEGACY_PREF_PASSWORD = "inkscan_auth_password"
+        private const val KEY_DELICATE = "sb-delicate-hill-05c1inkscan-auth-token"
+        private const val KEY_SJY = "sb-sjybfvyoznmtxmjhycoj-auth-token"
         private val STORAGE_KEYS = listOf(
-            "sb-delicate-hill-05c1inkscan-auth-token",
-            "sb-sjybfvyoznmtxmjhycoj-auth-token",
+            KEY_DELICATE,
+            KEY_SJY,
         )
         private const val LOG_TAG = "InkScanAuth"
-        private const val WEBVIEW_ACTIVITY = "eu.kanade.tachiyomi.ui.webview.WebViewActivity"
+        private const val DEBUG_TAG = "InkScanDebug"
+        private const val LOGIN_DEBUG_TAG = "InkScanLoginDebug"
+        private const val PREF_DEBUG_TAG = "InkScanPrefDebug"
+        private const val LOGIN_REQUIRED_URL = "__inkscan_login_required__"
+        private const val PREF_HOW_TO_LOGIN = "inkscan_how_to_login"
+        private const val PREF_SESSION_STATUS = "inkscan_session_status"
+        private const val PREF_CLEAR_SESSION = "inkscan_clear_session"
     }
 
     private inner class InkScanAuth {
         private val authClient = network.client
         private val lock = Any()
-        private var lastWebViewCheck = 0L
 
         fun intercept(chain: okhttp3.Interceptor.Chain): Response {
+            val operation = operationFor(chain.request().url)
             val token = synchronized(lock) { validAccessToken() }
             val request = chain.request().newBuilder().apply {
                 if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
             }.build()
-            Log.d(LOG_TAG, "bearer applied=${!token.isNullOrBlank()}")
+            debug("request operation=$operation url=${request.url} bearer=${!token.isNullOrBlank()}")
             val response = chain.proceed(request)
-            Log.d(LOG_TAG, "api http=${response.code}")
+            debug("response operation=$operation http=${response.code}")
             if (response.code != 401) return response
 
             response.close()
@@ -477,45 +913,101 @@ abstract class InkScan :
                 importWebViewSession()
             }
             if (refreshed.isNullOrBlank()) return chain.proceed(request)
-            Log.d(LOG_TAG, "retrying request after session import")
+            debug("auth retry_after_401=true")
             return chain.proceed(request.newBuilder().header("Authorization", "Bearer $refreshed").build())
         }
 
         fun hasSession(): Boolean = preferences.getString(PREF_ACCESS_TOKEN, null).orEmpty().isNotBlank()
 
-        private fun validAccessToken(): String? {
-            val access = preferences.getString(PREF_ACCESS_TOKEN, null)
-            val expires = preferences.getLong(PREF_TOKEN_EXPIRES, 0L)
-            if (!access.isNullOrBlank() && expires > System.currentTimeMillis() + TOKEN_REFRESH_MARGIN) return access
-            refreshStoredToken()?.let { return it }
-            clearStoredSession()
-            return importWebViewSession()
+        fun sessionAvailable(): Boolean = synchronized(lock) { validAccessToken() != null }
+
+        fun importFromWebView(): Boolean = synchronized(lock) {
+            importWebViewSession() != null
         }
 
-        private fun importWebViewSession(): String? {
+        fun saveStorageSession(jsonContent: String, keyLabel: String): String? = synchronized(lock) {
             val now = System.currentTimeMillis()
-            if (now - lastWebViewCheck < WEBVIEW_CHECK_INTERVAL) return null
-            lastWebViewCheck = now
-            val stored = STORAGE_KEYS.asSequence()
-                .mapNotNull { key ->
-                    val value = runCatching { runBlocking { getLocalStorage(baseUrl, key) } }.getOrNull()
-                    if (!value.isNullOrBlank()) key to value else null
-                }
-                .firstOrNull()
-            Log.d(LOG_TAG, "localStorage found=${stored != null}, key=${stored?.first ?: "none"}")
-            val session = runCatching { stored?.second?.parseAs<AuthStorageDto>() }.getOrNull()
-            Log.d(LOG_TAG, "session json parsed=${session != null}, access=${session?.accessToken != null}, refresh=${session?.refreshToken != null}")
-            val access = session?.accessToken ?: return null
-            val expiresAt = session.expiresAt?.times(1000L)
-                ?: (System.currentTimeMillis() + (session.expiresIn ?: 3600L) * 1000L)
-            Log.d(LOG_TAG, "token expired=${expiresAt <= System.currentTimeMillis()}")
-            if (expiresAt <= System.currentTimeMillis()) return null
+            val session = runCatching { jsonContent.parseAs<AuthStorageDto>() }
+                .onFailure { debugError("LOCALSTORAGE_PARSE", it) }
+                .getOrNull()
+            val access = session?.accessToken
+            val expiresAt = session?.expiresAt?.times(1000L)
+                ?: (now + (session?.expiresIn ?: 3600L) * 1000L)
+            val usable = !access.isNullOrBlank() && expiresAt > now
+            debug("localstorage key=$keyLabel parsed=${session != null}")
+            debug("localstorage key=$keyLabel access_present=${!access.isNullOrBlank()}")
+            debug("localstorage key=$keyLabel refresh_present=${!session?.refreshToken.isNullOrBlank()}")
+            debug("localstorage key=$keyLabel expired=${expiresAt <= now}")
+            if (!usable) return null
             preferences.edit()
                 .putString(PREF_ACCESS_TOKEN, access)
                 .putString(PREF_REFRESH_TOKEN, session.refreshToken)
                 .putLong(PREF_TOKEN_EXPIRES, expiresAt)
                 .apply()
-            return access
+            debug("auth bearer_available=true")
+            access
+        }
+
+        fun ensureSession() {
+            val token = synchronized(lock) { validAccessToken() }
+            if (token.isNullOrBlank()) {
+                debug("LOGIN_REQUIRED")
+                throw IOException(loginMessage())
+            }
+            debug("auth bearer_available=true")
+        }
+
+        private fun validAccessToken(): String? {
+            val access = preferences.getString(PREF_ACCESS_TOKEN, null)
+            val expires = preferences.getLong(PREF_TOKEN_EXPIRES, 0L)
+            val present = !access.isNullOrBlank()
+            val valid = present && expires > System.currentTimeMillis() + TOKEN_REFRESH_MARGIN
+            debug("auth persisted_access_token=$present")
+            debug("auth persisted_refresh_token=${!preferences.getString(PREF_REFRESH_TOKEN, null).isNullOrBlank()}")
+            debug("auth persisted_expiry=${expires > 0L}")
+            debug("auth persistent_session_valid=$valid")
+            if (valid) {
+                debug("auth selected_session=PERSISTED")
+                debug("auth bearer_available=true")
+                return access
+            }
+            val refreshPresent = !preferences.getString(PREF_REFRESH_TOKEN, null).isNullOrBlank()
+            debug("refresh needed=${!valid}")
+            debug("refresh attempted=$refreshPresent")
+            if (refreshPresent) {
+                val refreshed = refreshStoredToken()
+                debug("refresh success=${!refreshed.isNullOrBlank()}")
+                refreshed?.let { return it }
+            }
+            clearStoredSession()
+            debug("auth selected_session=NONE")
+            return importWebViewSession()
+        }
+
+        private fun importWebViewSession(): String? {
+            debug("localstorage import_start")
+            debug("localstorage origin=https://inkscann.live")
+            val imported = STORAGE_KEYS.asSequence()
+                .mapNotNull { key ->
+                    val value = runCatching { runBlocking { getLocalStorage(baseUrl, key) } }
+                        .onFailure { debugError("LOCALSTORAGE", it) }
+                        .getOrNull()
+                    val label = if (key.startsWith("sb-sjy")) "sjy" else "delicate"
+                    if (value.isNullOrBlank()) {
+                        debug("localstorage key=$label found=false")
+                        return@mapNotNull null
+                    }
+                    debug("localstorage key=$label found=true")
+                    val access = saveStorageSession(value, label)
+                    if (access != null) key to access else null
+                }
+                .firstOrNull()
+            val selectedKey = imported?.first ?: run {
+                debug("auth selected_session=NONE")
+                return null
+            }
+            debug("auth selected_session=${if (selectedKey.startsWith("sb-sjy")) "SJY" else "DELICATE"}")
+            return imported.second
         }
 
         private fun refreshStoredToken(): String? {
@@ -529,7 +1021,7 @@ abstract class InkScan :
                         AuthRequestDto(refreshToken = refresh).toJsonRequestBody(),
                     ),
                 )
-            }.onFailure { Log.d(LOG_TAG, "refresh failed") }.getOrNull()
+            }.onFailure { debugError("REFRESH", it) }.getOrNull()
         }
 
         private fun clearStoredSession() {
@@ -542,6 +1034,7 @@ abstract class InkScan :
 
         private fun authenticate(request: Request): String {
             authClient.newCall(request).execute().use { response ->
+                debug("refresh http=${response.code}")
                 if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
                 val auth = response.parseAs<AuthResponseDto>()
                 val access = auth.accessToken ?: throw IOException("Token de acesso ausente")
@@ -550,6 +1043,7 @@ abstract class InkScan :
                     .putString(PREF_REFRESH_TOKEN, auth.refreshToken)
                     .putLong(PREF_TOKEN_EXPIRES, auth.expiresAtMillis())
                     .apply()
+                debug("refresh success=true")
                 return access
             }
         }
