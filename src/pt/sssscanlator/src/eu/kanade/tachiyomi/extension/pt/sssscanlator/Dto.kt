@@ -10,6 +10,25 @@ import java.util.Locale
 import java.util.TimeZone
 
 @Serializable
+class GarimpoResponse(
+    val garimpo: String,
+)
+
+@Serializable
+class SearchMangaDto(
+    val title: String,
+    val cover: String? = null,
+    val slug: String,
+    val type: String? = null,
+) {
+    fun toSManga(): SManga = SManga.create().apply {
+        title = this@SearchMangaDto.title
+        thumbnail_url = cover?.takeUnless(String::isBlank)
+        url = "/obra/$slug"
+    }
+}
+
+@Serializable
 class LibraryResponseDto(
     val pagination: LibraryPaginationDto = LibraryPaginationDto(),
 )

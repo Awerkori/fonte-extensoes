@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Yomu Comics"
-    versionCode = 52
+    versionCode = 53
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
     libVersion = "1.4"
 
@@ -15,4 +15,8 @@ keiyoushi {
         baseUrl = "https://yomu.com.br"
         id = 1497838059713668619L
     }
+}
+
+dependencies {
+    implementation(project(":lib:cryptoaes"))
 }
