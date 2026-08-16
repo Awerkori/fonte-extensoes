@@ -6,11 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Manga Stop"
-    versionCode = 11
+    versionCode = 44
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
-    theme = "mangathemesia"
-
     source {
         lang = "pt-BR"
         baseUrl = "https://mangastop.net"
