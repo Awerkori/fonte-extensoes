@@ -37,7 +37,7 @@ jobs:
           echo "$CERTS_OUTPUT"
           
           EXPECTED="144f44e865cbfae6bde110489ef7ec142f0b1681f627a093a218650e21db5dad"
-          ACTUAL=$(echo "$CERTS_OUTPUT" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+          ACTUAL=$(echo "$CERTS_OUTPUT" | grep -i "certificate SHA-256 digest" | head -n 1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
           
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "ERRO: Fingerprint incompativel ($ACTUAL != $EXPECTED)"
