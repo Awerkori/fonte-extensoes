@@ -7,6 +7,14 @@ import kotlinx.serialization.Serializable
 data class ApiResponse<T>(
     val success: Boolean,
     val data: T,
+    val meta: MetaDto? = null,
+)
+
+@Serializable
+data class MetaDto(
+    @SerialName("current_page") val currentPage: Int,
+    @SerialName("last_page") val lastPage: Int,
+    @SerialName("has_more") val hasMore: Boolean,
 )
 
 @Serializable
@@ -18,6 +26,8 @@ data class MangaDto(
     @SerialName("descricao_brasil") private val descricaoBrasil: String? = null,
     private val imagem: String? = null,
     val generos: List<String> = emptyList(),
+    val categoria: String? = null,
+    val capitulos: List<ChapterDto>? = null,
     @SerialName("views_mes") private val viewsMes: String? = null,
     @SerialName("qnt_capitulo") val qntCapitulo: Int? = null,
 ) {
