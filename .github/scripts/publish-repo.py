@@ -252,6 +252,31 @@ with REPO_DIR.joinpath("index.json").open("w", encoding="utf-8") as f:
         )
     )
 
+legacy_min_index = []
+for ext in final_extensions:
+    apk_filename = ext.resources.apkUrl.split("/")[-1]
+    sources_list = []
+    for s in ext.sources:
+        sources_list.append({
+            "name": s.name,
+            "lang": s.language,
+            "id": str(s.id),
+            "baseUrl": s.homeUrl,
+        })
+    legacy_min_index.append({
+        "name": ext.name,
+        "pkg": ext.packageName,
+        "apk": apk_filename,
+        "lang": ext.sources[0].language if ext.sources else "all",
+        "code": ext.versionCode,
+        "version": ext.versionName,
+        "nsfw": 1 if ext.contentWarning == index_pb2.CONTENT_WARNING_NSFW else 0,
+        "sources": sources_list,
+    })
+
+with REPO_DIR.joinpath("index.min.json").open("w", encoding="utf-8") as f:
+    json.dump(legacy_min_index, f, separators=(",", ":"))
+
 with REPO_DIR.joinpath("index.pb").open("wb") as f:
     f.write(gzip.compress(index.SerializeToString(deterministic=True), mtime=0))
 
