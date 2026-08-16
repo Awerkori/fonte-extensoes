@@ -1,0 +1,56 @@
+name: Sign Cerise Asset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Cerise 1.4.64 APK
+        run: |
+          curl -L -o tachiyomi-pt.cerisescans-v1.4.64.apk "https://github.com/Awerkori/extensoes/releases/download/b3902c3/tachiyomi-pt.cerisescans-v1.4.64.apk"
+
+      - name: Prepare signing key
+        run: |
+          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
+
+      - name: Sign APK with official key
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          BUILD_TOOLS_DIR=$(find "$ANDROID_SDK_ROOT/build-tools" -maxdepth 1 -mindepth 1 | sort -V | tail -n 1)
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          "$APKSIGNER" sign \
+            --ks signingkey.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$KEY_STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            tachiyomi-pt.cerisescans-v1.4.64.apk
+
+          CERTS_OUTPUT=$("$APKSIGNER" verify --print-certs tachiyomi-pt.cerisescans-v1.4.64.apk)
+          echo "$CERTS_OUTPUT"
+          
+          EXPECTED="144f44e865cbfae6bde110489ef7ec142f0b1681f627a093a218650e21db5dad"
+          ACTUAL=$(echo "$CERTS_OUTPUT" | grep -i "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+          
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERRO: Fingerprint incompativel ($ACTUAL != $EXPECTED)"
+            exit 1
+          fi
+          echo "Fingerprint verificado com sucesso: $ACTUAL"
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f signingkey.jks
+
+      - name: Upload signed APK to release
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          gh release upload b3902c3 tachiyomi-pt.cerisescans-v1.4.64.apk --repo Awerkori/extensoes --clobber
