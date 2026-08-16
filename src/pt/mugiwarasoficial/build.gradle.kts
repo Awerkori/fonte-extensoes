@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Mugiwaras Oficial"
-    versionCode = 4
+    versionCode = 56
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 
