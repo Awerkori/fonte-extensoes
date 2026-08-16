@@ -16,6 +16,11 @@ class SearchResponse(
 )
 
 @Serializable
+class HomeResponse(
+    val updates: List<SearchMangaDto> = emptyList(),
+)
+
+@Serializable
 class SearchMangaDto(
     private val id: Int,
     private val slug: String,
