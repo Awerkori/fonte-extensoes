@@ -1,53 +1,102 @@
-# Keiyoushi Extensions
+# Project Nox
 
-### Please give the repo a :star:
+Repositório de código-fonte das extensões mantidas pelo **Project Nox** para Mihon e forks compatíveis.
 
-| Build                                                                                                                                                                               | Need Help?                                                                                                                                              |
-|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [![CI](https://github.com/keiyoushi/extensions-source/actions/workflows/build_push.yml/badge.svg)](https://github.com/keiyoushi/extensions-source/actions/workflows/build_push.yml) | [![Discord](https://img.shields.io/discord/1193460528052453448.svg?label=discord&labelColor=7289da&color=2c2f33&style=flat)](https://discord.gg/3FbCpdKbdY) |
+O projeto acompanha o ecossistema do **Keiyoushi**, mantendo suas atualizações sempre que possível, além de correções e adaptações próprias para algumas fontes.
 
-## Usage
-**If you are new to repository/extensions, please read the [Keiyoushi Getting Started guide](https://keiyoushi.github.io/docs/guides/getting-started#adding-the-extension-repo) first.**
+> Este projeto é mantido de forma independente e comunitária.
 
-* You can add our repo by visiting the [Keiyoushi Website](https://keiyoushi.github.io/add-repo)
-* Otherwise, copy & paste the following URL: https://github.com/keiyoushi/extensions/raw/repo/index.pb
+---
 
-## Requests
+## Links
 
-To request a new source or bug fix, [create an issue](https://github.com/keiyoushi/extensions-source/issues/new/choose).
+- **Código-fonte:** https://github.com/Awerkori/fonte-extensoes
+- **Repositório de extensões:** https://github.com/Awerkori/extensoes
+- **Discord:** https://discord.gg/QpyjwsWENq
+- **Fluxer:** https://fluxer.gg/q456UCVt
 
-Please note that creating an issue does not mean that the source will be added or fixed in a timely
-fashion, because the work is volunteer-based. Some sources may also be impossible to do or prohibitively
-difficult to maintain.
+---
 
-If you would like to see a request fulfilled and have the necessary skills to do so, consider contributing!
-Issues are up-for-grabs for any developer if there is no assigned user already.
+## Pedidos de extensões e correções
 
-## Contributing
+Quer pedir uma **nova extensão**, informar que uma fonte parou de funcionar ou solicitar alguma correção?
 
-Contributions are welcome!
+Entre na comunidade do Project Nox e faça o pedido por lá:
 
-Check out the repo's [issue backlog](https://github.com/keiyoushi/extensions-source/issues) for source requests and bug reports.
+**Discord:**  
+https://discord.gg/QpyjwsWENq
 
-## License
+**Fluxer:**  
+https://fluxer.gg/q456UCVt
 
-    Copyright 2015 Javier Tomás
+Pedidos pelo GitHub não são o canal principal do projeto.
 
-    Licensed under the Apache License, Version 2.0 (the "License");
-    you may not use this file except in compliance with the License.
-    You may obtain a copy of the License at
+Antes de solicitar uma nova fonte, verifique se ela já existe no Project Nox ou no Keiyoushi.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+> Um pedido não garante que a extensão será adicionada ou corrigida imediatamente. Algumas fontes podem exigir bastante manutenção ou não serem tecnicamente viáveis.
 
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
+---
 
-## Disclaimer
+## Sobre o Project Nox
 
-This project does not have any affiliation with the content providers available.
+O Project Nox mantém extensões próprias e também acompanha atualizações vindas do ecossistema Keiyoushi.
 
-This project is not affiliated with Mihon/Tachiyomi. Don't ask for help about these extensions at the
-official support means of Mihon/Tachiyomi. All credits to the codebase goes to the original contributors.
+Quando necessário, algumas fontes recebem correções ou implementações específicas do Nox para continuar funcionando corretamente.
+
+O objetivo é manter o repositório simples, atualizado e compatível com Mihon e seus forks.
+
+---
+
+## Créditos
+
+Este projeto só existe graças ao trabalho de projetos e desenvolvedores anteriores.
+
+### Keiyoushi
+
+Grande parte da base de extensões e da infraestrutura utilizada pelo Project Nox vem do:
+
+https://github.com/keiyoushi/extensions-source
+
+Agradecimentos a todos os mantenedores e contribuidores do **Keiyoushi**.
+
+### FelipeGFA
+
+A estrutura inicial utilizada pelo Project Nox foi baseada no trabalho de:
+
+https://github.com/FelipeGFA/fonte-extensoes
+
+Agradecimentos ao **FelipeGFA** pelo trabalho no repositório e pela base que ajudou na construção da infraestrutura atual do Project Nox.
+
+### Contribuidores originais
+
+Também ficam os créditos a todos os desenvolvedores e contribuidores do ecossistema Tachiyomi/Mihon/Keiyoushi que participaram da criação e manutenção do código utilizado pelas extensões.
+
+---
+
+## Contribuindo
+
+Contribuições técnicas são bem-vindas.
+
+Antes de alterar ou criar uma extensão, consulte:
+
+- `CONTRIBUTING.md`
+- `.github/rules/Extension_Guide.md`
+
+Para pedidos comuns de novas fontes ou correções, prefira utilizar o **Discord** ou o **Fluxer** do Project Nox.
+
+---
+
+## Aviso
+
+O Project Nox não possui afiliação com os sites e provedores de conteúdo suportados pelas extensões.
+
+O projeto também não é afiliado oficialmente ao Mihon, Tachiyomi ou Keiyoushi.
+
+Não solicite suporte para extensões do Project Nox nos canais oficiais desses projetos.
+
+---
+
+<p align="center">
+  <b>Project Nox</b><br>
+  Extensões, correções e comunidade.
+</p>
