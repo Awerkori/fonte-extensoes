@@ -6,10 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Manga Online"
-    versionCode = 4
+    versionCode = 57
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
-    theme = "madara"
 
     source {
         lang = "pt-BR"
