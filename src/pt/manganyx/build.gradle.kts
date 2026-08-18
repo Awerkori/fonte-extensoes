@@ -5,17 +5,14 @@ plugins {
 }
 
 keiyoushi {
-    name = "ReiManga"
-    versionCode = 5
+    name = "Manga NXY"
+    versionCode = 0
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
+    theme = "aurora"
 
     source {
-        lang = "en"
-        baseUrl = "https://reimanga.net"
-    }
-
-    deeplink {
-        path("/manga/..*")
+        lang = "pt-BR"
+        baseUrl = "https://manganyx.com"
     }
 }
