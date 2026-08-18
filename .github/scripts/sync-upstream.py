@@ -102,51 +102,88 @@ def path_exists(ref: str, path: str) -> bool:
 
 
 _VERSION_CODE_RE = re.compile(r"(versionCode\s*=\s*)(\d+)")
+_THEME_RE = re.compile(r"""theme\s*=\s*["']([^"']+)["']""")
+_BASE_VERSION_CODE_RE = re.compile(r"baseVersionCode\s*=\s*(\d+)")
 
 
-def _read_version_code_from_text(text: str) -> int | None:
-    m = _VERSION_CODE_RE.search(text)
-    return int(m.group(2)) if m else None
-
-
-def read_version_code(ref: str, gradle_path: str) -> int | None:
-    """Read versionCode from build.gradle.kts at the given git ref."""
+def _read_file_text(ref: str | None, path: str) -> str | None:
+    if ref is None:
+        p = Path(path)
+        return p.read_text() if p.exists() else None
     result = subprocess.run(
-        ["git", "show", f"{ref}:{gradle_path}"],
+        ["git", "show", f"{ref}:{path}"],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
+    return result.stdout if result.returncode == 0 else None
+
+
+def read_base_version_code(ref: str | None, theme: str) -> int:
+    theme_gradle = f"lib-multisrc/{theme}/build.gradle.kts"
+    content = _read_file_text(ref, theme_gradle)
+    if not content:
+        return 0
+    m = _BASE_VERSION_CODE_RE.search(content)
+    return int(m.group(1)) if m else 0
+
+
+def effective_version_code(ref: str | None, unit: str) -> tuple[int, int, int] | None:
+    """Read (raw_version, base_version, effective_version) for an extension unit."""
+    gradle_path = f"{unit}/build.gradle.kts"
+    content = _read_file_text(ref, gradle_path)
+    if not content:
         return None
-    return _read_version_code_from_text(result.stdout)
+
+    v_match = _VERSION_CODE_RE.search(content)
+    if not v_match:
+        return None
+
+    raw_vc = int(v_match.group(2))
+    t_match = _THEME_RE.search(content)
+    theme = t_match.group(1) if t_match else None
+    base_vc = read_base_version_code(ref, theme) if theme else 0
+    return raw_vc, base_vc, raw_vc + base_vc
 
 
-def bump_version_code_if_needed(unit: str, upstream_ref: str) -> int | None:
-    """If upstream changed a protected unit, ensure local versionCode > upstream versionCode.
+def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int, int, int, int, int, int] | None:
+    """If upstream effective version >= local effective version, bump local raw versionCode.
 
-    Returns the new versionCode if a bump was performed, None otherwise.
+    Returns (loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw) if bumped, None otherwise.
     Only rewrites the file on disk; caller must `git add` it.
     """
+    local_info = effective_version_code(None, unit)
+    upstream_info = effective_version_code(upstream_ref, unit)
+
+    if local_info is None or upstream_info is None:
+        return None
+
+    loc_raw, loc_base, loc_eff = local_info
+    up_raw, up_base, up_eff = upstream_info
+
+    if up_eff < loc_eff:
+        return None
+
+    desired_effective = up_eff + 1
+    new_raw = desired_effective - loc_base
+
     gradle_path = f"{unit}/build.gradle.kts"
     local_file = Path(gradle_path)
-    if not local_file.exists():
-        return None
-
     local_text = local_file.read_text()
-    local_version = _read_version_code_from_text(local_text)
-    upstream_version = read_version_code(upstream_ref, gradle_path)
-
-    if local_version is None or upstream_version is None:
-        return None
-
-    # Bump only if upstream has caught up or surpassed Nox.
-    if upstream_version < local_version:
-        return None
-
-    new_version = upstream_version + 1
-    new_text = _VERSION_CODE_RE.sub(lambda m: f"{m.group(1)}{new_version}", local_text)
+    new_text = _VERSION_CODE_RE.sub(lambda m: f"{m.group(1)}{new_raw}", local_text)
     local_file.write_text(new_text)
-    return new_version
+
+    return loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw
+
+
+def get_protected_nox_units(base: str, upstream_ref: str) -> list[str]:
+    """Protected Nox extensions: src/<lang>/<ext> modified locally vs merge-base and existing in upstream."""
+    main_entries = changed_entries(base, "HEAD")
+    main_units, _ = collect_units(main_entries)
+    protected = []
+    for unit in sorted(main_units):
+        if unit.startswith("src/") and path_exists(upstream_ref, f"{unit}/build.gradle.kts"):
+            protected.append(unit)
+    return protected
 
 
 def update_sync_branch(upstream_ref: str, push: bool) -> None:
@@ -163,6 +200,7 @@ def print_plan(
     preserved_paths: list[str],
     main_only_units: list[str],
     conflict_units: list[str],
+    protected_units: list[str],
 ) -> None:
     commits = git("rev-list", "--count", f"{base}..{upstream_ref}").strip()
 
@@ -187,24 +225,36 @@ def print_plan(
         for unit in conflict_units:
             print(f"  conflict: {unit}")
 
+    if protected_units:
+        print(f"\nProtected Nox extensions: {len(protected_units)}")
+        for unit in protected_units:
+            loc_info = effective_version_code(None, unit)
+            up_info = effective_version_code(upstream_ref, unit)
+            if not loc_info or not up_info:
+                continue
+            loc_raw, loc_base, loc_eff = loc_info
+            up_raw, up_base, up_eff = up_info
+            print(f"{unit}:")
+            print(f"  local raw: {loc_raw}")
+            print(f"  local base: {loc_base}")
+            print(f"  local effective: {loc_eff}")
+            print(f"  upstream raw: {up_raw}")
+            print(f"  upstream base: {up_base}")
+            print(f"  upstream effective: {up_eff}")
+            if up_eff >= loc_eff:
+                desired_eff = up_eff + 1
+                new_raw = desired_eff - loc_base
+                print(f"  action: bump local raw -> {new_raw}")
+            else:
+                print(f"  action: keep (local effective ahead)")
 
-def _handle_conflict_unit(unit: str, upstream_ref: str, bumped: list[str]) -> None:
-    new_ver = bump_version_code_if_needed(unit, upstream_ref)
-    if new_ver is not None:
-        git("add", "--", f"{unit}/build.gradle.kts")
-        bumped.append(f"{unit} -> versionCode={new_ver}")
-        print(f"Conflict resolved for Nox (bumped versionCode to {new_ver}): {unit}")
-    else:
-        print(f"Conflict resolved for Nox (versionCode already ahead): {unit}")
 
-
-def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str]) -> list[str]:
+def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str], protected_units: list[str]) -> list[str]:
     git("merge", "--no-ff", "--no-commit", "-s", "ours", upstream_ref)
 
-    bumped = []
+    # 1. Apply upstream units (except conflict units where Nox wins)
     for unit in units:
         if unit in conflict_units:
-            _handle_conflict_unit(unit, upstream_ref, bumped)
             continue
 
         print(f"Applying {unit}")
@@ -212,6 +262,18 @@ def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str]) -
 
         if path_exists(upstream_ref, unit):
             git("restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", unit)
+
+    # 2. Version Guard on all protected Nox units
+    bumped = []
+    for unit in protected_units:
+        res = bump_version_code_if_needed(unit, upstream_ref)
+        if res is not None:
+            loc_raw, _, _, _, _, _, new_raw = res
+            git("add", "--", f"{unit}/build.gradle.kts")
+            bumped.append(f"{unit} -> versionCode={new_raw}")
+            print(f"Version guard: bumped {unit} (versionCode {loc_raw} -> {new_raw})")
+        else:
+            print(f"Version guard: {unit} already ahead")
 
     git("diff", "--check")
 
@@ -223,12 +285,12 @@ def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str]) -
     return bumped
 
 
-def _write_step_summary(conflict_units: list[str], bumped: list[str]) -> None:
+def _write_step_summary(protected_units: list[str], bumped: list[str]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_path or not conflict_units:
+    if not summary_path or not protected_units:
         return
-    lines = ["\n## Nox-Resolved Conflicts (Modified by both upstream and Nox)\n\n"]
-    for unit in conflict_units:
+    lines = ["\n## Nox Protected Extensions\n\n"]
+    for unit in protected_units:
         tag = next((b for b in bumped if b.startswith(unit)), None)
         if tag:
             ver = tag.split("=")[1]
@@ -268,8 +330,17 @@ def main() -> None:
     conflict_set = set(conflict_units)
     main_only_units = sorted(set(main_units) - set(upstream_units))
     upstream_only_units = sorted(set(upstream_units) - conflict_set)
+    protected_units = get_protected_nox_units(base, upstream_ref)
 
-    print_plan(base, upstream_ref, upstream_only_units, preserved_paths, main_only_units, conflict_units)
+    print_plan(
+        base,
+        upstream_ref,
+        upstream_only_units,
+        preserved_paths,
+        main_only_units,
+        conflict_units,
+        protected_units,
+    )
 
     update_sync_branch(upstream_ref, push=args.push)
 
@@ -281,8 +352,8 @@ def main() -> None:
         print("Dry run only; no changes were applied")
         return
 
-    bumped = apply_units(upstream_ref, upstream_units, conflict_set)
-    _write_step_summary(conflict_units, bumped)
+    bumped = apply_units(upstream_ref, upstream_units, conflict_set, protected_units)
+    _write_step_summary(protected_units, bumped)
     git("push", "origin", "HEAD:main")
 
 
