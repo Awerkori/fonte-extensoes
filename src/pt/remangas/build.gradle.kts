@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "NixManga"
-    versionCode = 54
+    versionCode = 55
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
 
