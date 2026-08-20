@@ -32,13 +32,13 @@ abstract class LycanToons : HttpSource() {
 
     // =====================Popular=====================
 
-    override fun popularMangaRequest(page: Int): Request = metricsRequest("popular", page)
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/api/metrics/popular?limit=$PAGE_LIMIT&page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage = response.parseAs<PopularResponse>().toMangasPage()
 
     // =====================Latest=====================
 
-    override fun latestUpdatesRequest(page: Int): Request = metricsRequest("recently-updated", page)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/api/metrics/recently-updated?limit=$PAGE_LIMIT&page=$page", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage = response.parseAs<PopularResponse>().toMangasPage()
 
@@ -83,73 +83,58 @@ abstract class LycanToons : HttpSource() {
 
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
         val slug = manga.slug()
-        val chapters = mutableListOf<SChapter>()
-        var skip = 0
-        var total: Int? = null
-
-        do {
-            val page = client.newCall(chapterListRequest(slug, skip)).execute().use { response ->
+        val firstPage = client.newCall(
+            GET("$baseUrl/api/series/$slug/chapters?skip=0&take=$CHAPTER_LIMIT", headers),
+        ).execute().use { response ->
+            if (response.header("Content-Type")?.contains("json") == true) {
                 response.parseAs<ChapterListDto>()
-            }
-
-            if (total == null) {
-                total = page.total
             } else {
-                check(page.total == total) { "A quantidade de capítulos mudou durante a paginação. Tente novamente." }
+                // Not JSON – site likely returned a Cloudflare challenge page
+                // Touch the series page to refresh cookies, then retry
+                client.newCall(GET("$baseUrl/series/$slug", headers)).execute().close()
+                client.newCall(
+                    GET("$baseUrl/api/series/$slug/chapters?skip=0&take=$CHAPTER_LIMIT", headers),
+                ).execute().use { it.parseAs<ChapterListDto>() }
             }
+        }
 
-            val batch = page.chapters.map { it.toSChapter(slug) }
-            check(batch.isNotEmpty() || skip >= page.total) {
-                "A API interrompeu a lista de capítulos em $skip/${page.total}."
+        val allChapters = firstPage.chapters.toMutableList()
+        val total = firstPage.total
+
+        if (allChapters.size < total) {
+            for (skip in CHAPTER_LIMIT until total step CHAPTER_LIMIT) {
+                val page = client.newCall(
+                    GET("$baseUrl/api/series/$slug/chapters?skip=$skip&take=$CHAPTER_LIMIT", headers),
+                ).execute().use { it.parseAs<ChapterListDto>() }
+                allChapters.addAll(page.chapters)
             }
+        }
 
-            chapters += batch
-            skip += batch.size
-        } while (skip < total)
-
-        val uniqueChapters = chapters.distinctBy { it.url }
-        uniqueChapters.sortedByDescending { it.chapter_number }
+        allChapters
+            .map { it.toSChapter(slug) }
+            .sortedByDescending { it.chapter_number }
     }
-
-    private fun chapterListRequest(slug: String, skip: Int) = GET("$baseUrl/api/series/$slug/chapters?skip=$skip&take=$CHAPTER_LIMIT", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
 
     // =====================Pages========================
 
-    override fun pageListRequest(chapter: SChapter): Request = rscRequest("$baseUrl${chapter.url}")
+    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val dto = response.extractNextJs<PageList>()
-            ?: error("O site alterou o formato da página do capítulo.")
-
-        check(dto.imageUrls.isNotEmpty()) { "O site não retornou imagens para este capítulo." }
-
-        return dto.imageUrls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+        return dto?.imageUrls?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+            ?: emptyList()
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // =====================Utils=====================
 
-    private fun metricsRequest(path: String, page: Int): Request = GET("$baseUrl/api/metrics/$path?limit=$PAGE_LIMIT&page=$page", headers)
-
     private fun SManga.slug(): String = url.substringBefore("?").substringAfterLast("/")
-
-    private fun String.rscBust() = "$this?_rsc=${List(5) { BASE36.random() }.joinToString("")}"
-
-    private fun getRscHeaders(url: String) = headers.newBuilder()
-        .add("next-router-state-tree", NEXT_ROUTER)
-        .add("next-url", url.removePrefix(baseUrl))
-        .add("RSC", "1")
-        .build()
-
-    private fun rscRequest(url: String) = GET(url.substringBefore("?").rscBust(), getRscHeaders(url))
 
     companion object {
         private const val PAGE_LIMIT = 20
         private const val CHAPTER_LIMIT = 100
-        private const val BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-        private const val NEXT_ROUTER = "%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
     }
 }
