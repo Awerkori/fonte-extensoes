@@ -74,23 +74,10 @@ abstract class LycanToons : HttpSource() {
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url}"
 
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        val payload = SearchRequestBody(
-            limit = 20,
-            page = 1,
-            search = manga.title,
-            seriesType = "",
-            status = "",
-            tags = emptyList(),
-        )
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl/series/${manga.slug()}", headers)
 
-        return POST("$baseUrl/api/series?slug=${manga.slug()}", headers, payload.toJsonRequestBody())
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val slug = response.request.url.queryParameter("slug")!!
-        return response.parseAs<SearchResponse>().toSManga(slug)
-    }
+    override fun mangaDetailsParse(response: Response): SManga = response.extractNextJs<SeriesDto>()?.toSManga()
+        ?: error("O site alterou o formato da página da obra.")
 
     // =====================Chapters=====================
 
@@ -102,7 +89,7 @@ abstract class LycanToons : HttpSource() {
 
         do {
             val page = client.newCall(chapterListRequest(slug, skip)).execute().use { response ->
-                response.parseAs<ChapterResponse>()
+                response.parseAs<ChapterListDto>()
             }
 
             if (total == null) {
@@ -111,20 +98,16 @@ abstract class LycanToons : HttpSource() {
                 check(page.total == total) { "A quantidade de capítulos mudou durante a paginação. Tente novamente." }
             }
 
-            val batch = page.toSChapters(slug)
+            val batch = page.chapters.map { it.toSChapter(slug) }
             check(batch.isNotEmpty() || skip >= page.total) {
                 "A API interrompeu a lista de capítulos em $skip/${page.total}."
             }
 
             chapters += batch
-            skip += page.size
+            skip += batch.size
         } while (skip < total)
 
         val uniqueChapters = chapters.distinctBy { it.url }
-        check(uniqueChapters.size == total) {
-            "A API retornou uma lista de capítulos incompleta: ${uniqueChapters.size}/$total."
-        }
-
         uniqueChapters.sortedByDescending { it.chapter_number }
     }
 

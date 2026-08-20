@@ -20,7 +20,7 @@ import java.time.ZoneOffset
 
 const val HOSTNAME_PART = "kuromangas.com::v2"
 const val ANTIBOT = "x9_4v2_b"
-const val DEFAULT_ENC_KEY = "2i3ato8l674shksfE2oMmieshonuYTusF4jKdqEwhUEft9dsadcxzde3"
+const val DEFAULT_ENC_KEY = "2i3ato8l6sai74shksfE2oMmieshoforanuYTusF4jKdqEwhUEft9dsadcxzde3"
 const val VERIFY_COOKIE = "kuro_x"
 const val VERIFY_HEADER = "X-Kuro-Verify"
 

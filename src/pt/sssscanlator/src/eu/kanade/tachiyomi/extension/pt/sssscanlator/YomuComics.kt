@@ -38,7 +38,10 @@ abstract class YomuComics : HttpSource() {
 
     private fun decryptResponse(response: Response): String {
         val garimpoResponse = json.decodeFromString<GarimpoResponse>(response.body.string())
-        return CryptoAES.decrypt(garimpoResponse.garimpo, "yomu_trolling_scrapers_v1")
+        val cipherText = garimpoResponse.garimpo.let {
+            if (it.startsWith("YOMU_")) it.removePrefix("YOMU_").reversed() else it
+        }
+        return CryptoAES.decrypt(cipherText, "yomu_trolling_scrapers_v2")
     }
 
     override fun popularMangaRequest(page: Int): Request {

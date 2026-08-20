@@ -98,16 +98,16 @@ abstract class Bakai : HttpSource() {
         val document = response.asJsoup()
 
         // Filter out everything that is not specifically a "Hentai" post (i.e. exclude reviews/videos)
-        val mangas = document.select("ol[data-role=resultsContents] > li.ipsStreamItem")
-            .filter { it.selectFirst("span.ipsStreamItem_contentType i.fa-file-text") != null }
+        val mangas = document.select("ol[data-role=resultsContents] > li.ipsStreamItem, .ipsStreamItem, article.ipsCmsEntries__item")
+            .filter { it.selectFirst("span.ipsStreamItem_contentType i.fa-file-text, span.ipsStreamItem__contentType i.fa-file-text, div.ipsCmsEntries__thumb, header.ipsCmsEntries__header") != null }
             .map { element ->
-                val a = element.selectFirst("h2.ipsStreamItem_title a") ?: throw Exception("Title URL not found")
+                val a = element.selectFirst("h2.ipsStreamItem_title a, h2.ipsStreamItem__title a, h2.ipsTitle a, header a") ?: throw Exception("Title URL not found")
 
                 SManga.create().apply {
                     title = a.text()
                     setUrlWithoutDomain(a.attr("href"))
 
-                    val imgNode = element.selectFirst("span.ipsThumb img, img.ipsStream_image")
+                    val imgNode = element.selectFirst("span.ipsThumb img, img.ipsStream_image, img.ipsStreamItem__image, div.ipsCmsEntries__thumb img")
                     thumbnail_url = imgNode?.let {
                         val dataSrc = it.attr("abs:data-src")
                         dataSrc.ifEmpty { it.attr("abs:src") }
@@ -115,7 +115,7 @@ abstract class Bakai : HttpSource() {
                 }
             }
 
-        val hasNextPage = document.selectFirst("li.ipsPagination_next:not(.ipsPagination_inactive) > a") != null
+        val hasNextPage = document.selectFirst("li.ipsPagination_next:not(.ipsPagination_inactive) > a, li.ipsPagination__next:not(.ipsPagination__inactive) > a, a[rel=next]") != null
 
         return MangasPage(mangas, hasNextPage)
     }
@@ -181,7 +181,7 @@ abstract class Bakai : HttpSource() {
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
 
-        return document.select("div.ipsGrid.ipsGrid_collapsePhone img").mapIndexed { i, img ->
+        return document.select("div.mangaReaderImages img, img.mangaReaderImage, div.ipsGrid.ipsGrid_collapsePhone img, div.ipsPhotoFrame img, section.ipsRichText img").mapIndexed { i, img ->
             val url = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }
             Page(i, imageUrl = url)
         }

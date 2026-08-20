@@ -44,13 +44,24 @@ abstract class KuroMangas :
 
     private val decryptor = KuroMangasDecryptor(baseUrl, network.client)
 
-    override val client by lazy {
+    override val client: OkHttpClient by lazy {
 
         network.client.newBuilder()
             .apply {
                 addInterceptor { chain ->
                     if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
-                    return@addInterceptor chain.proceed(chain.request())
+
+                    val request = chain.request()
+                    val kn = client.getCookie(baseUrl, "_kn")
+                    val newRequest: Request = if (kn != null) {
+                        request.newBuilder()
+                            .header("X-Session-Nonce", kn)
+                            .build()
+                    } else {
+                        request
+                    }
+
+                    return@addInterceptor chain.proceed(newRequest)
                 }
 
                 addInterceptor(decryptor.vSecureInterceptor())

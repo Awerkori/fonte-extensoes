@@ -7,9 +7,7 @@ import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonPrimitive
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import kotlin.time.Instant
 
 @Serializable
 class PopularResponse(
@@ -30,8 +28,6 @@ class SeriesDto(
     private val genre: List<String>? = null,
     private val status: String? = null,
 ) {
-    fun hasSlug(slug: String) = this.slug == slug
-
     fun toSManga() = SManga.create().apply {
         title = this@SeriesDto.title
         url = "/series/$slug"
@@ -67,32 +63,25 @@ class SearchResponse(
     private val series: List<SeriesDto>,
 ) {
     fun toMangasPage() = MangasPage(series.map { it.toSManga() }, false)
-
-    fun toSManga(slug: String) = series.firstOrNull { it.hasSlug(slug) }?.toSManga()
-        ?: error("A obra não foi encontrada na API da Lycan Toons.")
 }
 
 @Serializable
-class ChapterResponse(
-    private val chapters: List<ChapterDto>,
-    val total: Int,
-) {
-    val size: Int
-        get() = chapters.size
-
-    fun toSChapters(slug: String) = chapters.map { it.toSChapter(slug) }
-}
+class ChapterListDto(
+    val chapters: List<ChapterDto>,
+    val total: Int = 0,
+)
 
 @Serializable
 class ChapterDto(
     private val numero: JsonElement,
     private val createdAt: String? = null,
+    private val titulo: String? = null,
 ) {
     fun toSChapter(slug: String) = SChapter.create().apply {
         val numberString = numero.jsonPrimitive.content
-        name = "Capítulo $numberString"
+        name = if (!titulo.isNullOrBlank()) "Capítulo $numberString - $titulo" else "Capítulo $numberString"
         url = "/series/$slug/$numberString"
-        date_upload = dateFormat.tryParse(createdAt)
+        date_upload = Instant.tryParse(createdAt)
         chapter_number = numberString.toFloatOrNull() ?: -1f
     }
 }
@@ -102,21 +91,10 @@ class PageList(
     val imageUrls: List<String>,
 )
 
-@Serializable
-class FetchResult(
-    val success: Boolean,
-    val result: String,
-    val contentType: String? = null,
-)
-
 private fun parseStatus(status: String?) = when (status?.lowercase()) {
     "ongoing" -> SManga.ONGOING
     "completed" -> SManga.COMPLETED
     "hiatus" -> SManga.ON_HIATUS
     "cancelled" -> SManga.CANCELLED
     else -> SManga.UNKNOWN
-}
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
 }
