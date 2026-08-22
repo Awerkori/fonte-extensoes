@@ -7,6 +7,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import java.math.BigDecimal
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -116,13 +117,19 @@ class VolumeChapterDto(
     )
 
     fun toChapterList(pathSegment: String): List<SChapter> = volumes.flatMap(ChapterListDto::chapters).map {
+        val chapterLabel = formatChapterNumber(it.number)
         SChapter.create().apply {
-            name = it.number.toString()
+            name = chapterLabel
             chapter_number = it.number
             date_upload = DATE_FORMAT.tryParse(it.createdAt)
-            url = "$pathSegment/capitulo/$chapter_number"
+            url = "$pathSegment/capitulo/$chapterLabel"
         }
     }
+
+    private fun formatChapterNumber(number: Float): String = BigDecimal(number.toString())
+        .stripTrailingZeros()
+        .toPlainString()
+
     companion object {
         private val DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
     }

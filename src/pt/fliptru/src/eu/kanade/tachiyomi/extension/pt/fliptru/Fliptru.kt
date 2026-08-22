@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.fliptru
 
+import android.util.Log
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -19,6 +20,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -161,19 +163,56 @@ abstract class Fliptru : HttpSource() {
 
     // ================================ Pages ===============================
 
+    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers).also {
+        readerDebug("request url=${it.url}")
+    }
+
     override fun pageListParse(response: Response): List<Page> = response.use { res ->
         val chapterUrl = res.request.url.toString()
-        val document = res.asJsoup()
-        val urls = document.select(".comic_page_image img[src]").map { it.absUrl("src") }
-            .ifEmpty {
-                document.select(".comic-page-image[style*=background-image]")
-                    .mapNotNull { it.attr("style").extractBackgroundUrl() }
+        val body = res.body.string()
+        readerDebug(
+            "response HTTP=${res.code} finalUrl=${res.request.url} " +
+                "contentType=${res.header("Content-Type")} bodyLength=${body.length}",
+        )
+
+        val document = Jsoup.parse(body, chapterUrl)
+        val comicPageImages = document.select(".comic-page-image")
+        val comicPageImagesLegacy = document.select(".comic_page_image")
+        val pageContainers = document.select(".comic-page-image, .comic_page_image")
+        readerDebug(
+            "selectors comicPageImage=${comicPageImages.size} " +
+                "comic_page_image=${comicPageImagesLegacy.size} imgSrc=${document.select("img[src]").size}",
+        )
+
+        pageContainers.take(DEBUG_ELEMENT_LIMIT)
+            .forEach { element ->
+                val image = element.selectFirst("img")
+                readerDebug(
+                    "element tag=${element.tagName()} classes=${element.classNames().joinToString(",")} " +
+                        "img=${if (image != null) "SIM" else "NÃO"} " +
+                        "src=${if (image?.hasAttr("src") == true) "SIM" else "NÃO"} " +
+                        "dataSrc=${if (image?.hasAttr("data-src") == true) "SIM" else "NÃO"} " +
+                        "srcset=${if (image?.hasAttr("srcset") == true) "SIM" else "NÃO"} " +
+                        "styleBackground=${if (element.attr("style").contains("background-image", true)) "SIM" else "NÃO"}",
+                )
             }
+
+        val urls = pageContainers
+            .mapNotNull { container ->
+                container.selectFirst("img[src]")?.absUrl("src")
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: container.selectFirst("img[data-src]")?.absUrl("data-src")?.takeIf { it.isNotEmpty() }
+            }
+            .distinct()
 
         val pages = urls.mapIndexed { index, url -> Page(index, chapterUrl, imageUrl = url) }
 
         pages.also {
             if (it.isEmpty()) {
+                readerDebug(
+                    "parsed=0 HTTP=${res.code} comicPageImage=${comicPageImages.size} " +
+                        "comic_page_image=${comicPageImagesLegacy.size} chapterUrl=$chapterUrl",
+                )
                 throw IOException("Nenhuma pagina encontrada para este capitulo")
             }
         }
@@ -270,6 +309,8 @@ abstract class Fliptru : HttpSource() {
         }
     }
 
+    private fun readerDebug(message: String) = Log.d(DEBUG_TAG, "FLIPTRU_DEBUG READER $message")
+
     private class ChapterPage(
         val chapters: List<SChapter>,
         val nextUrl: String?,
@@ -309,6 +350,8 @@ abstract class Fliptru : HttpSource() {
     private class TagFilter : UriPartFilter("Tag", TAGS)
 
     private companion object {
+        const val DEBUG_TAG = "Fliptru"
+        const val DEBUG_ELEMENT_LIMIT = 3
         const val POPULAR_PATH = "/home/comics/most_popular"
         const val RECENT_PATH = "/comics/all"
         const val SEARCH_PATH = "/search/"

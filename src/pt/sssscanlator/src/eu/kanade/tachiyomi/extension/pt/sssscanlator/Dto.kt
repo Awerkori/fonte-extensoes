@@ -11,7 +11,7 @@ import java.util.TimeZone
 
 @Serializable
 class GarimpoResponse(
-    val garimpo: String,
+    val garimpo: kotlinx.serialization.json.JsonElement,
 )
 
 @Serializable

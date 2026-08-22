@@ -5,20 +5,29 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
-class SearchResponse(
-    val items: List<SearchItem> = emptyList(),
+class SearchResponseDto(
+    val items: List<SearchItemDto>? = null,
 )
 
 @Serializable
-class SearchItem(
-    @SerialName("PJT_ID") private val id: Int,
-    @SerialName("PJT_NAME") private val name: String,
-    @SerialName("PJT_IMG_PR") private val imgPr: String? = null,
-    @SerialName("PJT_IMG_PR_URL") private val imgUrl: String? = null,
+class SearchItemDto(
+    @SerialName("PJT_ID")
+    val id: Long,
+    @SerialName("PJT_NAME")
+    val name: String,
+    @SerialName("PJT_IMG_PR_URL")
+    val imgUrl: String? = null,
+    @SerialName("PJT_IMG_PR")
+    val imgPath: String? = null,
 ) {
-    fun toSManga(baseUrl: String) = SManga.create().apply {
-        title = name
+    fun toSManga(baseUrl: String): SManga = SManga.create().apply {
         url = "/comics/$id"
-        thumbnail_url = imgUrl ?: ("$baseUrl/" + imgPr)
+        title = name
+        thumbnail_url = imgUrl ?: imgPath?.let { "$baseUrl/$it" }
     }
 }
+
+@Serializable
+class SearchPayloadDto(
+    val src: String,
+)

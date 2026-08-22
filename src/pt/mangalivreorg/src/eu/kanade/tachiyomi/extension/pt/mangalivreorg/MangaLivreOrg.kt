@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.mangalivreorg
 
 import android.util.Base64
+import android.util.Log
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -28,6 +29,7 @@ import okhttp3.OkHttpClient
 
 @Source
 abstract class MangaLivreOrg : KeiSource() {
+    private val apiBaseUrl = "https://api.mangalivre.org"
 
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2)
 
@@ -102,16 +104,31 @@ abstract class MangaLivreOrg : KeiSource() {
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val url = "$baseUrl/api/v1/chapters/${chapter.url}"
+        val chapterId = chapter.memo["legacyId"]?.long?.toString() ?: chapter.url
+        val url = "$apiBaseUrl/api/v1/chapters/$chapterId"
+        Log.e("MANGALIVRE_DEBUG", "stage=CHAPTER_INPUT path=${chapter.url} id=$chapterId")
 
         val response = client.get(url, nonceHeaders(), ensureSuccess = false)
+        Log.e(
+            "MANGALIVRE_DEBUG",
+            "stage=READER_RESPONSE status=${response.code} finalHost=${response.request.url.host} " +
+                "finalPath=${response.request.url.encodedPath} contentType=${response.header("Content-Type")} " +
+                "bodyLength=${response.body.contentLength()}",
+        )
         if (response.isSuccessful) {
             return response.parseAs<ChapterPagesDto>().toPageList()
         }
 
         response.close()
         cachedNonce = null
-        return client.get(url, nonceHeaders()).parseAs<ChapterPagesDto>().toPageList()
+        val retry = client.get(url, nonceHeaders(), ensureSuccess = false)
+        Log.e(
+            "MANGALIVRE_DEBUG",
+            "stage=READER_RETRY status=${retry.code} finalHost=${retry.request.url.host} " +
+                "finalPath=${retry.request.url.encodedPath} contentType=${retry.header("Content-Type")} " +
+                "bodyLength=${retry.body.contentLength()}",
+        )
+        return retry.parseAs<ChapterPagesDto>().toPageList()
     }
 
     private var cachedNonce: String? = null
@@ -124,11 +141,19 @@ abstract class MangaLivreOrg : KeiSource() {
     // The site keeps the nonce as a constant in its bundle and rotates it on every rebuild.
     private suspend fun fetchNonce(): String {
         val scriptUrl = client.get(baseUrl).asJsoup()
-            .selectFirst("script[type=module][src*=/assets/]")
+            .selectFirst("script[type=module][src*=/assets/], script[src*=\"/assets/app-\"], script[src*=\"/assets/index-\"]")
             ?.absUrl("src")
             ?: return DEFAULT_NONCE
 
         val script = client.get(scriptUrl).use { it.body.string() }
+        NONCE_CHAR_CODES_REGEX.find(script)?.groupValues?.get(1)?.let { codes ->
+            val nonce = codes.split(',')
+                .mapNotNull(String::trim)
+                .mapNotNull(String::toIntOrNull)
+                .map(Int::toChar)
+                .joinToString("")
+            if (nonce.length == 32 && nonce.all { it in '0'..'9' || it in 'a'..'f' }) return nonce
+        }
         val variable = NONCE_VARIABLE_REGEX.find(script)?.groupValues?.get(1) ?: return DEFAULT_NONCE
 
         // The minifier reuses variable names, so try every assignment until one decodes.
@@ -175,11 +200,10 @@ abstract class MangaLivreOrg : KeiSource() {
 
     companion object {
         private val MANGA_PATH_SEGMENTS = listOf("manga", "ler")
-
-        // Matches both the plain header name and the array the bundle joins it from.
         private val NONCE_VARIABLE_REGEX = Regex("""(?:X-ML-Nonce|Nonce"]\.join\("-"\))"?]\s*=\s*(\w+)""")
+        private val NONCE_CHAR_CODES_REGEX = Regex("""(?:window\.)?ML_NONCE\s*=\s*String\.fromCharCode\(([^)]+)\)""")
         private val NONCE_LITERAL_REGEX = Regex("""["'`]([0-9a-f]{32})["'`]""")
         private val NONCE_BASE64_REGEX = Regex("""atob\(\s*["']([A-Za-z0-9+/=]+)["']""")
-        private const val DEFAULT_NONCE = "9776d1e348a44d77edca1c461c2736b7"
+        private const val DEFAULT_NONCE = "3dce95d4540e54086a970da4ea44cf46"
     }
 }

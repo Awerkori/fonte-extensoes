@@ -47,7 +47,7 @@ abstract class InkScan :
     private val preferences by getPreferencesLazy()
     private val auth = InkScanAuth()
 
-    private val apiUrl = "https://delicate-hill-05c1inkscan.inkscann.workers.dev"
+    private val apiUrl = "https://api.inkscann.live"
     private val apiHost = apiUrl.toHttpUrl().host
 
     init {
@@ -301,6 +301,8 @@ abstract class InkScan :
                 val js = """
                     (function() {
                         try {
+                            var a = localStorage.getItem('sb-api-auth-token');
+                            if (a && a !== 'null') return 'api:::' + a;
                             var d = localStorage.getItem('sb-delicate-hill-05c1inkscan-auth-token');
                             if (d && d !== 'null') return 'delicate:::' + d;
                             var s = localStorage.getItem('sb-sjybfvyoznmtxmjhycoj-auth-token');
@@ -878,7 +880,9 @@ abstract class InkScan :
         private const val LEGACY_PREF_PASSWORD = "inkscan_auth_password"
         private const val KEY_DELICATE = "sb-delicate-hill-05c1inkscan-auth-token"
         private const val KEY_SJY = "sb-sjybfvyoznmtxmjhycoj-auth-token"
+        private const val KEY_API = "sb-api-auth-token"
         private val STORAGE_KEYS = listOf(
+            KEY_API,
             KEY_DELICATE,
             KEY_SJY,
         )
@@ -992,7 +996,11 @@ abstract class InkScan :
                     val value = runCatching { runBlocking { getLocalStorage(baseUrl, key) } }
                         .onFailure { debugError("LOCALSTORAGE", it) }
                         .getOrNull()
-                    val label = if (key.startsWith("sb-sjy")) "sjy" else "delicate"
+                    val label = when (key) {
+                        KEY_API -> "api"
+                        KEY_SJY -> "sjy"
+                        else -> "delicate"
+                    }
                     if (value.isNullOrBlank()) {
                         debug("localstorage key=$label found=false")
                         return@mapNotNull null
@@ -1006,7 +1014,13 @@ abstract class InkScan :
                 debug("auth selected_session=NONE")
                 return null
             }
-            debug("auth selected_session=${if (selectedKey.startsWith("sb-sjy")) "SJY" else "DELICATE"}")
+            debug(
+                "auth selected_session=${when (selectedKey) {
+                    KEY_API -> "API"
+                    KEY_SJY -> "SJY"
+                    else -> "DELICATE"
+                }}",
+            )
             return imported.second
         }
 

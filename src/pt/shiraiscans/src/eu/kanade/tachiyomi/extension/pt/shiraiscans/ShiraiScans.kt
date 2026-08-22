@@ -1,7 +1,16 @@
 package eu.kanade.tachiyomi.extension.pt.shiraiscans
 
+import android.app.Dialog
+import android.content.Context
 import android.util.Base64
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.preference.Preference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -22,11 +31,24 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 @Source
-abstract class ShiraiScans : HttpSource() {
+abstract class ShiraiScans :
+    HttpSource(),
+    ConfigurableSource {
 
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
+        .addInterceptor { chain ->
+            CookieManager.getInstance().flush()
+            val cookie = CookieManager.getInstance().getCookie(baseUrl)
+            val request = if (cookie.isNullOrBlank()) {
+                chain.request()
+            } else {
+                chain.request().newBuilder().header("Cookie", cookie).build()
+            }
+            val response = chain.proceed(request)
+            response
+        }
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -82,6 +104,122 @@ abstract class ShiraiScans : HttpSource() {
             response
         }
         .build()
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val preferences = screen.context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        lateinit var action: Preference
+        lateinit var status: Preference
+        lateinit var logout: Preference
+
+        fun updateUi() {
+            val connected = preferences.getBoolean(PREF_CONNECTED, false)
+            action.title = if (connected) "Abrir Shirai Scans" else "Entrar na conta"
+            action.summary = if (connected) "Abrir o site da Shirai Scans." else "Abrir o login oficial da Shirai Scans."
+            status.summary = if (connected) "Conectado" else "Não conectado"
+            setVisible(logout, connected)
+        }
+
+        action = newPreference(screen.context).apply {
+            setOnPreferenceClickListener {
+                showLoginWebView(screen.context) { updateUi() }
+                true
+            }
+        }
+        screen.addPreference(action)
+
+        status = newPreference(screen.context).apply {
+            title = "Sessão da Shirai Scans"
+            setSelectable(this, false)
+        }
+        screen.addPreference(status)
+
+        logout = newPreference(screen.context).apply {
+            title = "Sair da conta"
+            summary = "Remover a sessão da Shirai Scans neste aplicativo."
+            setOnPreferenceClickListener {
+                clearSession(screen.context)
+                updateUi()
+                true
+            }
+        }
+        screen.addPreference(logout)
+
+        updateUi()
+    }
+
+    private fun newPreference(context: android.content.Context): Preference = runCatching {
+        Preference::class.java.getConstructor(android.content.Context::class.java).newInstance(context)
+    }.getOrElse { Preference() }
+
+    private fun clearSession(context: Context) {
+        CookieManager.getInstance().getCookie(baseUrl).orEmpty().split(';')
+            .mapNotNull { it.trim().substringBefore('=').takeIf(String::isNotBlank) }
+            .distinct().forEach { name ->
+                CookieManager.getInstance().setCookie(baseUrl, "$name=; Max-Age=0; Path=/")
+                CookieManager.getInstance().setCookie(baseUrl, "$name=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/")
+            }
+        CookieManager.getInstance().flush()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putBoolean(PREF_CONNECTED, false)
+            .apply()
+    }
+
+    private fun setVisible(preference: Preference, visible: Boolean) {
+        runCatching {
+            preference::class.java.methods.firstOrNull { it.name == "setVisible" }
+                ?.invoke(preference, visible)
+        }
+    }
+
+    private fun setSelectable(preference: Preference, selectable: Boolean) {
+        runCatching {
+            preference::class.java.methods.firstOrNull { it.name == "setSelectable" }
+                ?.invoke(preference, selectable)
+        }
+    }
+
+    private fun showLoginWebView(context: android.content.Context, onConnected: () -> Unit) {
+        val dialog = Dialog(context)
+        val webView = WebView(context)
+        var firstPage = true
+        with(webView.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+        }
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                CookieManager.getInstance().flush()
+                if (firstPage) {
+                    firstPage = false
+                    view?.evaluateJavascript("if (typeof toggleLoginPopup === 'function') { toggleLoginPopup(); }", null)
+                }
+                view?.evaluateJavascript(
+                    "Boolean(document.querySelector(\"[href*='logout'], .btn-logout, .profile-trigger, .profile-menu\"))",
+                ) { result ->
+                    if (result == "true") {
+                        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                            .putBoolean(PREF_CONNECTED, true)
+                            .apply()
+                        onConnected()
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
+        dialog.setContentView(webView)
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.setOnShowListener {
+            dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        dialog.setOnDismissListener {
+            webView.destroy()
+        }
+        dialog.show()
+        webView.loadUrl(baseUrl)
+    }
 
     private val dateFormat by lazy {
         SimpleDateFormat("dd/MM/yyyy", Locale("pt", "BR"))
@@ -191,17 +329,28 @@ abstract class ShiraiScans : HttpSource() {
     // =============================== Pages ===============================
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val script = document.selectFirst("script:containsData(pagesData)")?.data()
-            ?: throw Exception("Script com dados das páginas não encontrado")
-
-        val jsonString = script.substringAfter("const pagesData = ").substringBefore(";")
-        val pages = jsonString.parseAs<List<Dto>>()
+        val body = response.body.string()
+        val document = org.jsoup.Jsoup.parse(body)
+        val script = document.selectFirst("script:containsData(const pagesData =)")?.data()
+        if (script == null) {
+            if (body.contains("Login necessário", true) || body.contains("Conteúdo Protegido", true)) {
+                throw Exception("Login necessário")
+            }
+            throw Exception("pagesData não encontrado")
+        }
+        val pages = parsePagesData(script)
+            .sortedWith(compareBy({ it.page ?: Int.MAX_VALUE }, { it.index ?: Int.MAX_VALUE }))
+        if (pages.isEmpty()) throw Exception("pagesData vazio")
 
         return pages.mapIndexed { i, page ->
-            Page(i, imageUrl = page.urlBase + IMAGE_SUFFIX)
+            Page(i, imageUrl = page.url.replace("&amp;", "&"))
         }
     }
+
+    private fun parsePagesData(script: String): List<Dto> = runCatching {
+        val jsonString = script.substringAfter("const pagesData = ").substringBefore(";")
+        jsonString.parseAs<List<Dto>>()
+    }.getOrDefault(emptyList())
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
@@ -212,6 +361,8 @@ abstract class ShiraiScans : HttpSource() {
     )
 
     companion object {
+        private const val PREFS_NAME = "shiraiscans_ui"
+        private const val PREF_CONNECTED = "connected"
         private const val IMAGE_SUFFIX = ".shirai"
         private val EXTENSIONS_FALLBACK = listOf(".webp", ".jpg", ".png")
         private val B64_REGEX = """var\s+b64\s*=\s*['"]([A-Za-z0-9+/=\s]+)['"]""".toRegex()

@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "HentaiHand"
-    versionCode = 6
+    versionCode = 7
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
     theme = "hentaihand"
@@ -14,7 +14,7 @@ keiyoushi {
     val languages = listOf(
         "all", "ja", "en", "zh", "bg", "ceb", "other", "tl", "ar", "el", "sr",
         "jv", "uk", "tr", "fi", "la", "mn", "eo", "sk", "cs", "ko", "ru", "it",
-        "es", "pt-BR", "th", "fr", "id", "vi", "de", "pl", "hu", "nl", "hi",
+        "es", "th", "fr", "id", "vi", "de", "pl", "hu", "nl", "hi",
     )
 
     languages.forEach { language ->
@@ -25,7 +25,6 @@ keiyoushi {
             when (language) {
                 "all" -> id = 1235047015955289468L
                 "other" -> id = 7302549142935671434L
-                "pt-BR" -> id = 2516244587139644000L
             }
         }
     }

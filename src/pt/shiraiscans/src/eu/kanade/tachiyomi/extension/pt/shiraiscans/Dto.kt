@@ -5,5 +5,9 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 class Dto(
-    @SerialName("url_base") val urlBase: String,
+    val index: Int? = null,
+    val page: Int? = null,
+    @SerialName("img_id") val imgId: String? = null,
+    @SerialName("wrapper_id") val wrapperId: String? = null,
+    val url: String,
 )

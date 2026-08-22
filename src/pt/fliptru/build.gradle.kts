@@ -11,7 +11,7 @@ keiyoushi {
         baseUrl = "https://fliptru.com.br"
     }
     name = "Fliptru"
-    versionCode = 3
+    versionCode = 4
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
 }

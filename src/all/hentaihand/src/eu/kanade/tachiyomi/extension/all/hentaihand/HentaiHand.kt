@@ -3,9 +3,31 @@ package eu.kanade.tachiyomi.extension.all.hentaihand
 import eu.kanade.tachiyomi.multisrc.hentaihand.HentaiHand
 import keiyoushi.annotation.Source
 import okhttp3.OkHttpClient
+import okhttp3.Request
 
 @Source
 abstract class HentaiHand : HentaiHand() {
+
+    override fun popularMangaRequest(page: Int): Request {
+        val request = super.popularMangaRequest(page)
+        return request.newBuilder().url(request.url.newBuilder().setQueryParameter("duration", "day").build()).build()
+    }
+
+    override fun latestUpdatesRequest(page: Int): Request {
+        val request = super.latestUpdatesRequest(page)
+        return request.newBuilder().url(request.url.newBuilder().removeAllQueryParameters("duration").build()).build()
+    }
+
+    override fun searchMangaRequest(page: Int, query: String, filters: eu.kanade.tachiyomi.source.model.FilterList): Request {
+        val request = super.searchMangaRequest(page, query, filters)
+        return request.newBuilder().url(
+            request.url.newBuilder()
+                .setQueryParameter("sort", "uploaded_at")
+                .setQueryParameter("order", "desc")
+                .removeAllQueryParameters("duration")
+                .build(),
+        ).build()
+    }
 
     override val chapters = false
 
@@ -34,7 +56,6 @@ abstract class HentaiHand : HentaiHand() {
         "ru" -> listOf(31)
         "it" -> listOf(32)
         "es" -> listOf(33, 37)
-        "pt-BR" -> listOf(34)
         "th" -> listOf(35, 40)
         "fr" -> listOf(36)
         "id" -> listOf(38)

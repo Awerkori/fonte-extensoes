@@ -36,14 +36,6 @@ abstract class YomuComics : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    private fun decryptResponse(response: Response): String {
-        val garimpoResponse = json.decodeFromString<GarimpoResponse>(response.body.string())
-        val cipherText = garimpoResponse.garimpo.let {
-            if (it.startsWith("YOMU_")) it.removePrefix("YOMU_").reversed() else it
-        }
-        return CryptoAES.decrypt(cipherText, "yomu_trolling_scrapers_v2")
-    }
-
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/library".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
@@ -101,8 +93,19 @@ abstract class YomuComics : HttpSource() {
     override fun searchMangaParse(response: Response): MangasPage = parseLibraryResponse(response)
 
     private fun parseLibraryResponse(response: Response): MangasPage {
-        val decryptedStr = decryptResponse(response)
-        val mangas = json.decodeFromString<List<SearchMangaDto>>(decryptedStr)
+        val garimpoResponse = json.decodeFromString<GarimpoResponse>(response.body.string())
+        val mangas = if (garimpoResponse.garimpo is kotlinx.serialization.json.JsonArray) {
+            json.decodeFromJsonElement(
+                kotlinx.serialization.serializer<List<SearchMangaDto>>(),
+                garimpoResponse.garimpo,
+            )
+        } else {
+            val cipherText = garimpoResponse.garimpo.toString().trim('"').let {
+                if (it.startsWith("YOMU_")) it.removePrefix("YOMU_").reversed() else it
+            }
+            val decryptedStr = CryptoAES.decrypt(cipherText, "yomu_trolling_scrapers_v3")
+            json.decodeFromString<List<SearchMangaDto>>(decryptedStr)
+        }
         val hasNextPage = mangas.size == PAGE_SIZE
         return MangasPage(mangas.map { it.toSManga() }, hasNextPage)
     }
