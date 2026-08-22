@@ -113,12 +113,13 @@ abstract class AnimeXNovel : HttpSource() {
 
     override fun mangaDetailsParse(response: Response) = SManga.create().apply {
         val document = response.asJsoup()
-        title = document.selectFirst("meta[itemprop=name]")!!.attr("content")
+        title = document.selectFirst("h1")!!.text()
         thumbnail_url = document.selectFirst("meta[itemprop=image]")?.absUrl("content")
         author = document.selectFirst("li:contains(Autor:)")?.text()?.substringAfter(":")?.trim()
         artist = document.selectFirst("li:contains(Arte:)")?.text()?.substringAfter(":")?.trim()
         genre = document.selectFirst("meta[itemprop=genre]")?.attr("content")
-        description = document.selectFirst("meta[itemprop=description]")?.attr("content")
+        description = extractDescription(document)
+            ?: document.selectFirst("meta[itemprop=description]")?.attr("content")
         document.selectFirst("meta[itemprop=creativeWorkStatus]")?.attr("content")?.let {
             status = when (it.lowercase()) {
                 "ongoing" -> SManga.ONGOING
@@ -133,34 +134,30 @@ abstract class AnimeXNovel : HttpSource() {
     // ========================== Chapters ==================================
 
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        val document = client.newCall(mangaDetailsRequest(manga))
-            .execute().asJsoup()
-
-        val category = document.selectFirst(".axn-chapters-container")
+        val document = client.newCall(mangaDetailsRequest(manga)).execute().asJsoup()
+        val category = document.selectFirst("[id^=axn-list-][data-categoria]")
             ?.attr("data-categoria")
             ?: return@fromCallable emptyList()
-
         val url = "$baseUrl/wp-json/wp/v2/posts".toHttpUrl().newBuilder()
             .addQueryParameter("categories", category)
             .addQueryParameter("orderby", "date")
             .addQueryParameter("order", "desc")
             .addQueryParameter("per_page", "100")
-
-        val chapterList = mutableListOf<SChapter>()
+        val chapters = mutableListOf<SChapter>()
         var page = 1
         while (true) {
             url.setQueryParameter("page", page.toString())
             val response = client.newCall(GET(url.build(), headers)).execute()
-            if (!response.isSuccessful) {
-                break
-            }
-            chapterList += chapterListParse(response)
+            if (!response.isSuccessful) break
+            chapters += chapterListParse(response)
             page++
         }
-        chapterList
+        chapters
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> = response.parseAs<List<ChapterDto>>().map(ChapterDto::toSChapter)
+    override fun chapterListParse(response: Response): List<SChapter> = response.parseAs<List<ChapterDto>>()
+        .map(ChapterDto::toSChapter)
+        .onEach { chapter -> chapter.setUrlWithoutDomain(chapter.url) }
         .filter { it.url.contains("capitulo") }
 
     // ========================== Pages =====================================
@@ -168,8 +165,10 @@ abstract class AnimeXNovel : HttpSource() {
     private val pageContainerSelector = ".spice-block-img-gallery, .wp-block-gallery, .spnc-entry-content"
 
     override fun pageListParse(response: Response): List<Page> {
-        val container = response.asJsoup().selectFirst(pageContainerSelector)!!
-        return container.select("img").mapIndexed { index, element ->
+        val document = response.asJsoup()
+        val images = document.selectFirst(pageContainerSelector)?.select("img")
+            ?: document.select("article .entry-content img[src*=/wp-content/uploads/]")
+        return images.mapIndexed { index, element ->
             Page(index, imageUrl = element.absUrl("src"))
         }
     }
@@ -243,6 +242,25 @@ abstract class AnimeXNovel : HttpSource() {
     }
 
     // =========================== Utils ====================================
+
+    private fun extractDescription(document: Document): String? {
+        val synopsisHeading = document.select("h1, h2, h3, h4, h5, h6")
+            .firstOrNull { it.text().trim().equals("Ler Sinopse", true) }
+            ?: return null
+        val paragraphs = synopsisHeading.parents()
+            .asSequence()
+            .mapNotNull { ancestor ->
+                ancestor.select(".eb-accordion-content p.wp-block-paragraph")
+                    .takeIf { it.isNotEmpty() }
+                    ?: ancestor.select(".wp-block-accordion-panel p.wp-block-paragraph")
+                        .takeIf { it.isNotEmpty() }
+            }
+            .firstOrNull()
+            ?.map { it.text().trim() }
+            ?.filter(String::isNotBlank)
+            .orEmpty()
+        return paragraphs.joinToString("\n\n").takeIf(String::isNotBlank)
+    }
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         title = element.selectFirst("h2, h3, .search-content")!!.text()

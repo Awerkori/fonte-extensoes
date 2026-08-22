@@ -12,13 +12,14 @@ class ChapterDto(
     private val title: Title,
     private val date: String,
     private val slug: String,
+    private val link: String,
 ) {
 
     fun toSChapter() = SChapter.create().apply {
         name = title.value.substringAfter(";")
             .takeIf(String::isNotBlank) ?: title.value
         date_upload = DATE_FORMAT.tryParse(date)
-        url = "/manga/$slug"
+        url = link
     }
 
     companion object {
