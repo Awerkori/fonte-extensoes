@@ -103,6 +103,7 @@ def path_exists(ref: str, path: str) -> bool:
 
 _VERSION_CODE_RE = re.compile(r"(versionCode\s*=\s*)(\d+)")
 _THEME_RE = re.compile(r"""theme\s*=\s*["']([^"']+)["']""")
+_LIB_VERSION_RE = re.compile(r"""libVersion\s*=\s*["']([^"']+)["']""")
 _BASE_VERSION_CODE_RE = re.compile(r"baseVersionCode\s*=\s*(\d+)")
 
 
@@ -173,6 +174,117 @@ def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int,
     local_file.write_text(new_text)
 
     return loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw
+
+
+def structural_metadata(ref: str | None, unit: str) -> tuple[str | None, str | None] | None:
+    """Read the multisrc selectors whose compatibility is independent of source code."""
+    content = _read_file_text(ref, f"{unit}/build.gradle.kts")
+    if content is None:
+        return None
+    theme = _THEME_RE.search(content)
+    lib_version = _LIB_VERSION_RE.search(content)
+    return (
+        theme.group(1) if theme else None,
+        lib_version.group(1) if lib_version else None,
+    )
+
+
+def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
+    """Adopt upstream theme/libVersion while leaving all Nox source and version fields intact."""
+    local_path = Path(f"{unit}/build.gradle.kts")
+    upstream = structural_metadata(upstream_ref, unit)
+    if not local_path.exists() or upstream is None:
+        return False
+
+    upstream_theme, upstream_lib = upstream
+    text = local_path.read_text()
+    original = text
+
+    def replace_or_insert(
+        value: str | None,
+        pattern: re.Pattern[str],
+        key: str,
+    ) -> None:
+        nonlocal text
+        if value is None:
+            text = pattern.sub("", text)
+            return
+        replacement = f'{key} = "{value}"'
+        if pattern.search(text):
+            text = pattern.sub(replacement, text, count=1)
+        else:
+            marker = re.search(r"(?m)^(\s*)source\s*\{", text)
+            if marker:
+                indent = marker.group(1) + "    "
+                text = text[:marker.start()] + f"{indent}{replacement}\n" + text[marker.start():]
+
+    replace_or_insert(upstream_lib, _LIB_VERSION_RE, "libVersion")
+    replace_or_insert(upstream_theme, _THEME_RE, "theme")
+    if text == original:
+        return False
+
+    local_path.write_text(text)
+    print(f"Structural metadata: {unit} -> theme={upstream_theme or 'none'}, libVersion={upstream_lib or 'none'}")
+    return True
+
+
+def bump_after_structural_change(unit: str, previous_info: tuple[int, int, int] | None) -> bool:
+    """Keep a structural migration strictly newer than the pre-migration effective version."""
+    if previous_info is None:
+        return False
+    current_info = effective_version_code(None, unit)
+    if current_info is None or current_info[2] > previous_info[2]:
+        return False
+
+    raw_vc, base_vc, _ = current_info
+    new_raw = previous_info[2] + 1 - base_vc
+    if new_raw <= raw_vc:
+        return False
+    gradle_path = Path(f"{unit}/build.gradle.kts")
+    text = gradle_path.read_text()
+    gradle_path.write_text(_VERSION_CODE_RE.sub(lambda m: f"{m.group(1)}{new_raw}", text, count=1))
+    print(f"Structural version guard: {unit} (versionCode {raw_vc} -> {new_raw})")
+    return True
+
+
+def validate_multisrc_compatibility() -> list[str]:
+    """Return extension units whose selected multisrc and libVersion cannot build."""
+    errors = []
+    for gradle_path in sorted(Path("src").glob("*/*/build.gradle.kts")):
+        unit = "/".join(gradle_path.parts[:3])
+        content = gradle_path.read_text()
+        theme_match = _THEME_RE.search(content)
+        lib_match = _LIB_VERSION_RE.search(content)
+        if not theme_match or not lib_match:
+            continue
+
+        theme = theme_match.group(1)
+        extension_lib = lib_match.group(1)
+        multisrc_path = Path(f"lib-multisrc/{theme}/build.gradle.kts")
+        if not multisrc_path.exists():
+            errors.append(f"{unit}: multisrc '{theme}' não existe")
+            continue
+        multisrc_match = _LIB_VERSION_RE.search(multisrc_path.read_text())
+        multisrc_lib = multisrc_match.group(1) if multisrc_match else None
+        if multisrc_lib != extension_lib:
+            errors.append(
+                f"{unit}: extensão libVersion {extension_lib} != multisrc {theme} {multisrc_lib or 'ausente'}",
+            )
+    return errors
+
+
+def validate_affected_builds(units: list[str]) -> None:
+    """Run the cheap source-info task for units whose structural metadata changed."""
+    gradlew = Path("gradlew")
+    if not units or not gradlew.exists():
+        return
+    tasks = [f":{unit.replace('/', ':')}:generateSourceInfo" for unit in units if unit.startswith("src/")]
+    if not tasks:
+        return
+    print(f"Validating affected extensions: {', '.join(units)}")
+    result = subprocess.run([f"./{gradlew.name}", *tasks], text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Build validation failed for affected extensions")
 
 
 def get_protected_nox_units(base: str, upstream_ref: str) -> list[str]:
@@ -249,12 +361,34 @@ def print_plan(
                 print(f"  action: keep (local effective ahead)")
 
 
-def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str], protected_units: list[str]) -> list[str]:
+def structural_conflicts(conflict_units: list[str], upstream_ref: str) -> list[str]:
+    units = []
+    for unit in conflict_units:
+        local = structural_metadata(None, unit)
+        upstream = structural_metadata(upstream_ref, unit)
+        if local is not None and upstream is not None and local != upstream:
+            units.append(unit)
+    return units
+
+
+def apply_units(
+    upstream_ref: str,
+    units: list[str],
+    conflict_units: set[str],
+    protected_units: list[str],
+    structural_units: list[str],
+) -> list[str]:
     git("merge", "--no-ff", "--no-commit", "-s", "ours", upstream_ref)
 
     # 1. Apply upstream units (except conflict units where Nox wins)
     for unit in units:
         if unit in conflict_units:
+            if unit in structural_units:
+                previous_info = effective_version_code(None, unit)
+                changed = merge_structural_metadata(unit, upstream_ref)
+                version_changed = bump_after_structural_change(unit, previous_info) if changed else False
+                if changed or version_changed:
+                    git("add", "--", f"{unit}/build.gradle.kts")
             continue
 
         print(f"Applying {unit}")
@@ -265,17 +399,34 @@ def apply_units(upstream_ref: str, units: list[str], conflict_units: set[str], p
 
     # 2. Version Guard on all protected Nox units
     bumped = []
+    validation_units = set(structural_units)
     for unit in protected_units:
         res = bump_version_code_if_needed(unit, upstream_ref)
         if res is not None:
             loc_raw, _, _, _, _, _, new_raw = res
             git("add", "--", f"{unit}/build.gradle.kts")
             bumped.append(f"{unit} -> versionCode={new_raw}")
+            validation_units.add(unit)
             print(f"Version guard: bumped {unit} (versionCode {loc_raw} -> {new_raw})")
         else:
             print(f"Version guard: {unit} already ahead")
 
     git("diff", "--check")
+
+    errors = validate_multisrc_compatibility()
+    if errors:
+        print("Structural compatibility validation failed:")
+        for error in errors:
+            print(f"  - {error}")
+        git("merge", "--abort", check=False)
+        sys.exit(1)
+
+    try:
+        validate_affected_builds(sorted(validation_units))
+    except RuntimeError as error:
+        print(str(error))
+        git("merge", "--abort", check=False)
+        sys.exit(1)
 
     commit_msg = "Sync upstream"
     if bumped:
@@ -331,6 +482,7 @@ def main() -> None:
     main_only_units = sorted(set(main_units) - set(upstream_units))
     upstream_only_units = sorted(set(upstream_units) - conflict_set)
     protected_units = get_protected_nox_units(base, upstream_ref)
+    structural_units = structural_conflicts(conflict_units, upstream_ref)
 
     print_plan(
         base,
@@ -341,8 +493,10 @@ def main() -> None:
         conflict_units,
         protected_units,
     )
-
-    update_sync_branch(upstream_ref, push=args.push)
+    if structural_units:
+        print(f"Structural conflicts (metadata from upstream, Nox code preserved): {len(structural_units)}")
+        for unit in structural_units:
+            print(f"  structural: {unit}")
 
     if not upstream_units:
         print("No upstream changes to apply")
@@ -352,9 +506,10 @@ def main() -> None:
         print("Dry run only; no changes were applied")
         return
 
-    bumped = apply_units(upstream_ref, upstream_units, conflict_set, protected_units)
+    bumped = apply_units(upstream_ref, upstream_units, conflict_set, protected_units, structural_units)
     _write_step_summary(protected_units, bumped)
     git("push", "origin", "HEAD:main")
+    update_sync_branch(upstream_ref, push=True)
 
 
 if __name__ == "__main__":

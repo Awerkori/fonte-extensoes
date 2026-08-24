@@ -6,10 +6,10 @@ plugins {
 
 keiyoushi {
     name = "Tia Manhwa"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
-    theme = "madara"
+    theme = "madaralegacy"
 
     source {
         lang = "pt-BR"
