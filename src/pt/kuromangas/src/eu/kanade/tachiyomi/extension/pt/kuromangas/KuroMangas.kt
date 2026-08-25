@@ -42,7 +42,7 @@ abstract class KuroMangas :
 
     private val cdnUrl = "https://cdn.kuromangas.com"
 
-    private val decryptor = KuroMangasDecryptor(baseUrl, network.client)
+    private val decryptor by lazy { KuroMangasDecryptor(baseUrl, network.client, headers, ::relogin) }
 
     override val client: OkHttpClient by lazy {
 
@@ -50,18 +50,7 @@ abstract class KuroMangas :
             .apply {
                 addInterceptor { chain ->
                     if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
-
-                    val request = chain.request()
-                    val kn = client.getCookie(baseUrl, "_kn")
-                    val newRequest: Request = if (kn != null) {
-                        request.newBuilder()
-                            .header("X-Session-Nonce", kn)
-                            .build()
-                    } else {
-                        request
-                    }
-
-                    return@addInterceptor chain.proceed(newRequest)
+                    return@addInterceptor chain.proceed(chain.request())
                 }
 
                 addInterceptor(decryptor.vSecureInterceptor())
@@ -217,8 +206,11 @@ abstract class KuroMangas :
     // ============================= Auth ===================================
 
     private fun checkLogin(): Boolean {
-        if (client.getCookie(baseUrl, SESSION_COOKIE) != null) return true
+        if (hasSession()) return true
+        return relogin()
+    }
 
+    private fun relogin(): Boolean {
         val email = preferences.getString(PREF_EMAIL, "") ?: ""
         val password = preferences.getString(PREF_PASSWORD, "") ?: ""
         if (email.isEmpty() || password.isEmpty()) {
@@ -226,10 +218,12 @@ abstract class KuroMangas :
         }
         login(email, password)
 
-        return client.getCookie(baseUrl, SESSION_COOKIE) != null
+        return hasSession()
     }
 
-    // Implicit set-cookie: kuro_session + kuro_x
+    private fun hasSession(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null
+
+    // Implicit set-cookie: kuro_session
     private fun login(email: String, password: String) {
         val payload = buildJsonObject {
             put("email", email)
