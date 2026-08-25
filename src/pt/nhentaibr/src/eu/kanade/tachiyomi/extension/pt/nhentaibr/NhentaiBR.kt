@@ -32,6 +32,9 @@ abstract class NhentaiBR : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
+        .set("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
 
     override fun popularMangaRequest(page: Int): Request = GET(pageUrl("$baseUrl/popular/", page), headers)
 
@@ -143,7 +146,10 @@ abstract class NhentaiBR : HttpSource() {
 
     private fun Element.imageUrl(): String = absUrl("data-src").ifEmpty { absUrl("src") }
 
-    private fun pageUrl(url: String, page: Int) = if (page > 1) "$url/page/$page/" else url
+    // Bare paginated paths self-redirect on the site (301 Location: same
+    // URL), exhausting OkHttp's follow-up limit. The page query preserves the
+    // real pagination while making the server return the page directly.
+    private fun pageUrl(url: String, page: Int) = if (page > 1) "$url/page/$page/?page=$page" else url
 
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
