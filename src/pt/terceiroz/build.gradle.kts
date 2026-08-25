@@ -5,13 +5,13 @@ plugins {
 }
 
 keiyoushi {
-    name = "NHentai.net.br"
-    versionCode = 2
+    name = "Terceiro Z"
+    versionCode = 1
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://nhentai.net.br"
+        baseUrl = "https://terceiroz.com"
     }
 }
