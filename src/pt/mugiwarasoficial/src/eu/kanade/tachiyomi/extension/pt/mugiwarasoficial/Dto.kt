@@ -26,30 +26,23 @@ class PersonDto(
 )
 
 @Serializable
-class GateTokenRequest(
-    private val returnTo: String,
+class PageApiResponseDto(
+    val data: PageApiDataDto,
 )
 
 @Serializable
-class GateTokenResponseDto(
-    val data: GateTokenDataDto,
+class PageApiDataDto(
+    val pages: List<PageApiItemDto>,
 )
 
 @Serializable
-class GateTokenDataDto(
-    val token: String,
-    val gateUrl: String? = null,
-    val minWaitSeconds: Long? = null,
+class PageApiItemDto(
+    val imageUrl: String,
 )
 
 @Serializable
-class PageListDto(
-    val pages: List<PageDto>,
-)
-
-@Serializable
-class PageDto(
-    val url: String,
+class AtfieldKeyDto(
+    val k: String,
 )
 
 @Serializable

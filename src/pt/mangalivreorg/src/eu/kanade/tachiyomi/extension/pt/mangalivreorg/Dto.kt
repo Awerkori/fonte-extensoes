@@ -5,8 +5,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
+import kotlinx.serialization.json.JsonElement
 import kotlin.time.Instant
 
 @Serializable
@@ -41,6 +40,7 @@ class SearchItemDto(
     private val label: String,
     private val link: String,
     private val cover: String? = null,
+    @SerialName("id_serie") val idSerie: JsonElement? = null,
 ) {
     fun toSManga() = SManga.create().apply {
         url = link.substringAfterLast('/')
@@ -48,6 +48,82 @@ class SearchItemDto(
         thumbnail_url = cover?.takeIf(String::isNotBlank)
     }
 }
+
+@Serializable
+class HomeMostReadDto(
+    @SerialName("most_read") val series: List<HomeSeriesDto> = emptyList(),
+)
+
+@Serializable
+class HomeReleasesDto(
+    val releases: List<HomeReleaseDto> = emptyList(),
+)
+
+@Serializable
+class HomeSeriesDtoContainer(
+    @SerialName("new_series") val series: List<HomeSeriesDto> = emptyList(),
+)
+
+@Serializable
+class HomeSeriesDto(
+    @SerialName("serie_name") val serieName: String? = null,
+    val name: String? = null,
+    val title: String? = null,
+    val link: String,
+    val cover: String? = null,
+    val image: String? = null,
+    @SerialName("series_image") val seriesImage: String? = null,
+    val id: String? = null,
+) {
+    val displayName get() = serieName ?: name ?: title ?: link.substringAfterLast('/')
+    val thumbnail get() = cover ?: image ?: seriesImage
+}
+
+@Serializable
+class HomeReleaseDto(
+    val name: String,
+    val link: String,
+    val image: String? = null,
+    val chapters: List<HomeReleaseChapterDto> = emptyList(),
+)
+
+@Serializable
+class HomeReleaseChapterDto(
+    val number: Float = 0f,
+    val url: String,
+    @SerialName("date_created") val dateCreated: String? = null,
+)
+
+@Serializable
+class LegacyChapterListDto(
+    val chapters: List<LegacyChapterDto> = emptyList(),
+)
+
+@Serializable
+class LegacyChapterDto(
+    @SerialName("id_chapter") val idChapter: String? = null,
+    val number: Float = 0f,
+    val date: String? = null,
+    val releases: Map<String, LegacyReleaseDto> = emptyMap(),
+    @SerialName("scan_name") val scanName: String? = null,
+)
+
+@Serializable
+class LegacyReleaseDto(
+    @SerialName("id_release") val idRelease: String? = null,
+    val link: String? = null,
+    val scanlators: List<ScanlatorDto> = emptyList(),
+)
+
+@Serializable
+class ScanlatorDto(
+    val name: String = "",
+)
+
+@Serializable
+class LegacyPagesDto(
+    val images: List<String> = emptyList(),
+)
 
 @Serializable
 class MangaDetailsDto(
@@ -115,11 +191,7 @@ class ChapterDto(
         chapter_number = number
         date_upload = publishedAt?.let(Instant::parseOrNull)?.toEpochMilliseconds() ?: 0L
         scanlator = scan?.name?.takeIf(String::isNotBlank)
-        memo = buildJsonObject {
-            put("slug", mangaSlug)
-            put("legacyId", legacyId)
-            put("number", formattedNumber)
-        }
+        url = id
     }
 
     private fun Float.formatted(): String = if (this % 1 == 0f) toInt().toString() else toString()

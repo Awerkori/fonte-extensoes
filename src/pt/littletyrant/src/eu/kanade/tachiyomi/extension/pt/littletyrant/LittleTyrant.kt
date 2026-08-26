@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.littletyrant
 
+import android.util.Base64
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -94,8 +95,16 @@ abstract class LittleTyrant : Madara() {
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-        val script = document.selectFirst("script:containsData(_proxyUrls)")?.data()
+        val script = document.select("script").firstOrNull {
+            PAGES_REGEX.containsMatchIn(it.data()) || CURRENT_PAGES_REGEX.containsMatchIn(it.data())
+        }?.data()
             ?: return emptyList()
+
+        CURRENT_PAGES_REGEX.find(script)?.groupValues?.last()?.let { pagesJson ->
+            return pagesJson.parseAs<List<String>>().mapIndexed { index, encodedUrl ->
+                Page(index, imageUrl = decodePageUrl(encodedUrl))
+            }
+        }
 
         val pages = PAGES_REGEX.find(script)?.groupValues?.last() ?: return emptyList()
         val tokenBaseUrl = BASE_URL_PAGE_REGEX.find(script)?.groupValues?.last()?.toHttpUrlOrNull() ?: return emptyList()
@@ -116,6 +125,12 @@ abstract class LittleTyrant : Madara() {
                 Page(index, imageUrl = imageUrl)
             }
     }
+
+    private fun decodePageUrl(value: String): String {
+        if (value.startsWith("http://") || value.startsWith("https://")) return value
+        return String(Base64.decode(value, Base64.DEFAULT), StandardCharsets.UTF_8)
+    }
+
     private fun pageTokenRequest(pageBaseUrl: HttpUrl): Request {
         val pageHeaders = headers.newBuilder()
             .set("X-Reader-Sec", "tiraninha-web")
@@ -136,6 +151,7 @@ abstract class LittleTyrant : Madara() {
 
     companion object {
         private val PAGES_REGEX = """_proxyUrls\s+=\s+(\[[^]]+])""".toRegex(RegexOption.IGNORE_CASE)
+        private val CURRENT_PAGES_REGEX = """(?:var\s+)?pages\s*=\s*(\[[^]]+])""".toRegex(RegexOption.IGNORE_CASE)
         private val BASE_URL_PAGE_REGEX = """_themePath\s+=\s+"([^"]+)""".toRegex(RegexOption.IGNORE_CASE)
     }
 }

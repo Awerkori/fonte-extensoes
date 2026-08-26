@@ -7,13 +7,18 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.readIntBigEndian
 import keiyoushi.utils.readIntLittleEndian
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.brotli.Brotli
+import okhttp3.zstd.Zstd
+import okio.Buffer
+import okio.buffer
 import java.io.IOException
 import java.security.MessageDigest
 import java.time.LocalDate
@@ -27,10 +32,14 @@ const val DEFAULT_ENC_KEY = "i67ato8l6sai74jyIHfE2oMmieshoforanuYTusF4jKdqEwhUEf
 const val NONCE_HEADER = "X-Client-Token"
 const val NONCE_PATH = "/api/auth/check"
 private const val HMAC_ALGORITHM = "HmacSHA256"
-private const val BODY_PEEK_BYTES = 512L
 private const val LOGIN_EXPIRED_MESSAGE = "Sessão recusada pelo site. Refaça o login no WebView ou revise email e senha nas configurações."
 
 private val encKeyRegex = Regex("""ENCRYPTION_KEY\s*[:=]\s*["']([^"']+)["']""")
+
+private data class BodyInfo(
+    val bodyClass: String,
+    val hasVSecure: Boolean,
+)
 
 class KuroMangasDecryptor(
     val baseUrl: String,
@@ -58,30 +67,93 @@ class KuroMangasDecryptor(
             val response = chain.proceed(request)
 
             if (response.code == 401 || response.code == 403) {
-                val reason = runCatching { response.peekBody(BODY_PEEK_BYTES).string() }.getOrDefault("")
                 response.close()
-                if (retried) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
+                if (retried) throw IOException(LOGIN_EXPIRED_MESSAGE)
                 reloadCredentials()
                 return execute(newRequest(), true)
             }
 
-            val dataKey = response.headers["x-kuro-datakey"] ?: return response
+            if (isDirectBinaryResponse(request, response)) {
+                return response
+            }
 
-            val decrypted = runCatching {
-                val dto = response.parseAs<SecureDto>()
-                decrypt(dto.vSecure, dataKey)
-            }.getOrNull()
-
-            if (decrypted == null) {
-                response.close()
-                if (retried) throw IOException("Failed to decrypt")
+            fun retryAfterDecryptFailure(cause: Throwable): Response {
+                if (retried) throw IOException("Failed to decrypt", cause)
                 reloadCredentials()
                 return execute(newRequest(), true)
             }
 
-            return response.newBuilder()
-                .body(decrypted.toResponseBody(response.body.contentType()))
-                .build()
+            val responseBuilder = response.newBuilder()
+            val contentType = response.body.contentType()
+            val bodyBytes = try {
+                response.body.bytes()
+            } catch (e: Exception) {
+                response.close()
+                throw IOException("Failed to read response", e)
+            }
+            response.close()
+
+            val rawBodyInfo = classifyBody(bodyBytes)
+            val contentEncoding = response.header("Content-Encoding").orEmpty()
+            val canDecompress = rawBodyInfo.bodyClass !in setOf(
+                "EMPTY",
+                "JSON_ARRAY",
+                "JSON_OBJECT_PLAIN",
+                "JSON_OBJECT_V_SECURE",
+                "HTML",
+            )
+            val compression = when {
+                canDecompress && contentEncoding.contains("br", ignoreCase = true) -> "br"
+                canDecompress && contentEncoding.contains("zstd", ignoreCase = true) -> "zstd"
+                else -> ""
+            }
+            val processedBytes = if (compression.isNotEmpty()) {
+                try {
+                    when (compression) {
+                        "br" -> decompressBrotli(bodyBytes)
+                        else -> decompressZstd(bodyBytes)
+                    }
+                } catch (e: Exception) {
+                    throw IOException("Failed to decompress response", e)
+                }
+            } else {
+                bodyBytes
+            }
+            val bodyInfo = classifyBody(processedBytes)
+            val dataKey = response.headers["x-kuro-datakey"]
+
+            if (bodyInfo.bodyClass == "JSON_ARRAY" || bodyInfo.bodyClass == "JSON_OBJECT_PLAIN") {
+                return rebuildResponse(responseBuilder, processedBytes, contentType, contentEncoding.isNotEmpty())
+            }
+
+            if (dataKey == null) {
+                return rebuildResponse(responseBuilder, processedBytes, contentType, contentEncoding.isNotEmpty())
+            }
+
+            if (bodyInfo.bodyClass != "JSON_OBJECT_V_SECURE") {
+                return retryAfterDecryptFailure(IllegalStateException("unexpected response format"))
+            }
+
+            val wrapper = try {
+                processedBytes.toString(Charsets.UTF_8).parseAs<JsonElement>()
+            } catch (e: Exception) {
+                return retryAfterDecryptFailure(e)
+            }
+            val secureElement = (wrapper as? JsonObject)?.get("_v_secure")
+                ?: return retryAfterDecryptFailure(IllegalStateException("missing_v_secure"))
+
+            val vSecure = (secureElement as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.content
+                ?: return retryAfterDecryptFailure(IllegalStateException("invalid secure response"))
+
+            val decrypted = try {
+                decrypt(vSecure, dataKey)
+            } catch (e: Exception) {
+                return retryAfterDecryptFailure(e)
+            }
+
+            return rebuildResponse(responseBuilder, decrypted.toByteArray(), contentType, contentEncoding.isNotEmpty())
         }
 
         execute(newRequest(), false)
@@ -119,28 +191,76 @@ class KuroMangasDecryptor(
     }
 
     // index-*.js: Ik2() + Hk2()
-    fun decrypt(vSecure: String, dataKey: String): String? {
+    fun decrypt(vSecure: String, dataKey: String): String {
         val password = derivePassword()
         val encrypted = Base64.decode(vSecure, Base64.DEFAULT)
+        if (encrypted.size < 16) {
+            throw IllegalArgumentException("encrypted payload too short")
+        }
         val salt = encrypted.copyOfRange(8, 16)
         val ciphertext = encrypted.copyOfRange(16, encrypted.size)
 
         val (key, iv) = evpBytesToKey(password.toByteArray(), salt)
-        val rabbit = Rabbit()
-        rabbit.setup(key, iv)
         val plaintext = ciphertext.copyOf()
-        rabbit.crypt(plaintext)
+        Rabbit().apply {
+            setup(key, iv)
+            crypt(plaintext)
+        }
 
         val jsonStr = String(plaintext, Charsets.UTF_8)
 
-        val wrapper = try {
-            jsonStr.parseAs<JsonElement>()
-        } catch (e: Exception) {
-            return null
-        }
-        val inner = wrapper.jsonObject[dataKey] ?: wrapper
+        val wrapper = jsonStr.parseAs<JsonElement>()
+        val inner = (wrapper as? JsonObject)?.get(dataKey) ?: wrapper
         return inner.toString()
     }
+
+    private fun classifyBody(body: ByteArray): BodyInfo {
+        if (body.isEmpty()) return BodyInfo("EMPTY", false)
+
+        val text = body.toString(Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t')
+        val json = runCatching { text.parseAs<JsonElement>() }.getOrNull()
+        if (json is JsonObject) {
+            val hasVSecure = "_v_secure" in json
+            return BodyInfo(if (hasVSecure) "JSON_OBJECT_V_SECURE" else "JSON_OBJECT_PLAIN", hasVSecure)
+        }
+        if (json != null && text.startsWith("[")) {
+            return BodyInfo("JSON_ARRAY", false)
+        }
+        if (text.startsWith("<")) return BodyInfo("HTML", false)
+        if (body.any { it == 0.toByte() }) return BodyInfo("BINARY", false)
+        return BodyInfo("UNKNOWN", false)
+    }
+
+    private fun decompressBrotli(body: ByteArray): ByteArray {
+        val source = Brotli.decompress(Buffer().write(body)).buffer()
+        return source.use { it.readByteArray() }
+    }
+
+    private fun decompressZstd(body: ByteArray): ByteArray {
+        val source = Zstd.decompress(Buffer().write(body)).buffer()
+        return source.use { it.readByteArray() }
+    }
+
+    private fun isDirectBinaryResponse(request: Request, response: Response): Boolean {
+        if (response.headers["x-kuro-datakey"] != null) return false
+
+        val contentType = response.body.contentType()?.toString()?.lowercase().orEmpty()
+        val path = request.url.encodedPath.lowercase()
+        val isCover = "/covers/" in path
+        return contentType.startsWith("image/") ||
+            (isCover && contentType == "application/octet-stream")
+    }
+
+    private fun rebuildResponse(
+        builder: Response.Builder,
+        body: ByteArray,
+        contentType: okhttp3.MediaType?,
+        removeContentEncoding: Boolean,
+    ): Response = builder
+        .removeHeader("Content-Length")
+        .apply { if (removeContentEncoding) removeHeader("Content-Encoding") }
+        .body(body.toResponseBody(contentType))
+        .build()
 
     fun derivePassword(date: String = LocalDate.now(ZoneOffset.UTC).toString()): String {
         val toHash = "$date$HOSTNAME_PART$ANTIBOT"

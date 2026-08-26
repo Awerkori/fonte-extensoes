@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.mugiwarasoficial
 
+import android.util.Base64
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -8,29 +9,28 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
-import keiyoushi.lib.cookieinterceptor.CookieInterceptor
 import keiyoushi.network.get
-import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonRequestBody
-import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import org.jsoup.nodes.Document
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 @Source
 abstract class MugiwarasOficial : KeiSource() {
 
     override fun OkHttpClient.Builder.configureClient() = apply {
+        protocols(listOf(Protocol.HTTP_1_1))
+        addInterceptor(WebViewInterceptor(baseUrl, headers["User-Agent"]))
         rateLimit(2)
-        val host = baseUrl.toHttpUrl().host
-        addNetworkInterceptor(CookieInterceptor(host, "mnx_adulto" to "1"))
     }
 
     // ============================== Popular ==============================
@@ -203,49 +203,51 @@ abstract class MugiwarasOficial : KeiSource() {
     // ============================== Pages ================================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val chapterPath = if (chapter.url.startsWith("/")) chapter.url else "/${chapter.url}"
-
-        // Direct pages load first
-        val initialDoc = client.get("$baseUrl$chapterPath").asJsoup()
-        val directPages = initialDoc.extractNextJs<PageListDto>()?.pages
-        if (!directPages.isNullOrEmpty()) {
-            return directPages.mapIndexed { index, page ->
-                Page(index, imageUrl = page.url)
-            }
-        }
-
-        // Gate resolution
-        val requestBody = GateTokenRequest(returnTo = chapterPath).toJsonRequestBody()
-        val tokenResponse = client.post(GATE_TOKEN_URL, headers, requestBody).parseAs<GateTokenResponseDto>()
-        val token = tokenResponse.data.token
-        val gateUrl = tokenResponse.data.gateUrl
-        val minWait = tokenResponse.data.minWaitSeconds ?: 0
-
-        if (!gateUrl.isNullOrBlank()) {
-            runCatching { client.get(gateUrl) }
-        }
-
-        val waitMs = maxOf(minWait * 1000L, 4000L)
-        delay(waitMs)
-
-        var callbackDoc = client.get("$baseUrl/gate/callback?token=$token").asJsoup()
-        var pages = callbackDoc.extractNextJs<PageListDto>()?.pages
-
-        if (pages.isNullOrEmpty()) {
-            delay(3000L)
-            callbackDoc = client.get("$baseUrl/gate/callback?token=$token").asJsoup()
-            pages = callbackDoc.extractNextJs<PageListDto>()?.pages
-        }
-
-        if (pages.isNullOrEmpty()) {
-            val chapterDoc = client.get("$baseUrl$chapterPath").asJsoup()
-            pages = chapterDoc.extractNextJs<PageListDto>()?.pages
-        }
-
-        return pages?.mapIndexed { index, page ->
-            Page(index, imageUrl = page.url)
-        } ?: emptyList()
+        val parts = chapter.url.trim('/').split('/')
+        val slug = parts.getOrNull(parts.lastIndex - 1) ?: return emptyList()
+        val chapterId = parts.lastOrNull() ?: return emptyList()
+        val response = client.get("$PAGE_API_BASE_URL/$slug/chapters/$chapterId/pages")
+            .parseAs<PageApiResponseDto>()
+        val imageUrls = response.data.pages.map { it.imageUrl }
+        val direct = imageUrls.filter { it.startsWith("http://") || it.startsWith("https://") }
+        val decrypted = decryptImages(imageUrls.filter { it.startsWith("AQAA") })
+        return (direct + decrypted).filterNot { it.contains("/cover/") }.distinct()
+            .mapIndexed { index, url -> Page(index, imageUrl = url) }
     }
+
+    private suspend fun decryptImages(values: List<String>): List<String> {
+        val first = values.firstOrNull()?.decodeOpaque() ?: return emptyList()
+        if (first.size < 13) return emptyList()
+        val version = first[0].toInt()
+        val counter = ((first[1].toInt() and 0xFF) shl 24) or ((first[2].toInt() and 0xFF) shl 16) or
+            ((first[3].toInt() and 0xFF) shl 8) or (first[4].toInt() and 0xFF)
+        val key = client.get("$baseUrl/api/atfield/key?v=$version&e=$counter").parseAs<AtfieldKeyDto>()
+        val secret = Base64.decode(key.k, Base64.DEFAULT)
+        val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(secret, "HmacSHA256")) }
+        return values.mapNotNull { value ->
+            val bytes = value.decodeOpaque() ?: return@mapNotNull null
+            if (bytes.size < 14) return@mapNotNull null
+            val nonce = bytes.copyOfRange(5, 13)
+            val encrypted = bytes.copyOfRange(13, bytes.size)
+            val output = ByteArray(encrypted.size)
+            var offset = 0
+            var block = 0
+            while (offset < encrypted.size) {
+                val digest = mac.doFinal(nonce + byteArrayOf((block++).toByte()))
+                val count = minOf(digest.size, encrypted.size - offset)
+                digest.copyInto(output, offset, 0, count)
+                offset += count
+            }
+            encrypted.indices.map { (encrypted[it].toInt() xor output[it].toInt()).toByte() }.toByteArray()
+                .toString(Charsets.UTF_8).takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        }
+    }
+
+    private fun String.decodeOpaque(): ByteArray? = runCatching {
+        var value = replace('-', '+').replace('_', '/')
+        value += "=".repeat((4 - value.length % 4) % 4)
+        Base64.decode(value, Base64.DEFAULT)
+    }.getOrNull()
 
     // ============================== Filters ==============================
 
@@ -256,7 +258,7 @@ abstract class MugiwarasOficial : KeiSource() {
     )
 
     companion object {
-        private const val GATE_TOKEN_URL = "https://app.mugiwarasoficial.com/v1/www/gate-token"
+        private const val PAGE_API_BASE_URL = "https://app.mugiwarasoficial.com/v1/www/works"
         private val VALID_TYPES = setOf("manga", "manhwa", "manhua")
     }
 }

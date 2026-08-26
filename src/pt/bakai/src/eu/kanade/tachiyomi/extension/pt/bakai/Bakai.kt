@@ -28,7 +28,7 @@ abstract class Bakai : HttpSource() {
 
     override val client = network.client.newBuilder()
         .addInterceptor(BakaiCloudflareInterceptor(headers["User-Agent"]))
-        .rateLimit(1)
+        .rateLimit(1) { it.host != "img.bakai.org" }
         .build()
 
     override fun headersBuilder() = super.headersBuilder()
@@ -93,16 +93,15 @@ abstract class Bakai : HttpSource() {
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
 
-        val items = document.select("ul.ipsGrid > li.ipsGrid_span4")
+        val items = document.select(
+            "section.ipsCmsEntries.ipsCmsEntries--image.ipsCmsEntries--3 > article.ipsCmsEntries__item",
+        )
         val mangas = items.mapNotNull { element ->
-            val a = element.selectFirst("h2.ipsType_pageTitle a") ?: return@mapNotNull null
-            extractManga(a, element)
+            val a = element.selectFirst("h2.ipsTitle a") ?: return@mapNotNull null
+            extractManga(a, element)?.apply {
+                title = a.text().trim().ifBlank { title }
+            }
         }.toMutableList()
-
-        // Fallback: collect from hentai links when grid is empty
-        if (mangas.isEmpty()) {
-            mangas.addAll(extractMangasFromHentaiLinks(document))
-        }
 
         val hasNextPage = document.selectFirst(
             "li.ipsPagination_next:not(.ipsPagination_inactive) > a, a[rel=next]",
