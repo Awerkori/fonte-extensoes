@@ -39,9 +39,35 @@ abstract class XXXYaoi : Madara() {
 
     override val mangaSubString = "bl"
 
-    override val mangaDetailsSelectorAuthor = mangaDetailsSelectorArtist
+    // The site uses a fully custom layout — no standard Madara selectors apply here.
+    override val mangaDetailsSelectorTitle = "h1.xyaoi-main-title"
+    override val mangaDetailsSelectorAuthor = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(AUTOR)) .xyaoi-prop-value a"
+    override val mangaDetailsSelectorArtist = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(ARTISTA)) .xyaoi-prop-value a"
+    override val mangaDetailsSelectorStatus = "span.xyaoi-prop-value[class*=status-value-]"
+    override val mangaDetailsSelectorDescription = "div.xyaoi-synopsis-content"
+    override val mangaDetailsSelectorGenre = "div.xyaoi-genres-list a.xyaoi-genre-pill"
+    override val mangaDetailsSelectorTag = "[data-xxxyaoi-no-tags]"
+    override val altNameSelector = "[data-xxxyaoi-no-alt-name]"
+    override val altName get() = intl["alt_names_heading"]
 
-    override val mangaDetailsSelectorStatus = "div.post-content_item:contains(Status) > div.summary-content"
+    override fun chapterFromElement(element: org.jsoup.nodes.Element): eu.kanade.tachiyomi.source.model.SChapter {
+        val chapter = eu.kanade.tachiyomi.source.model.SChapter.create()
+
+        with(element) {
+            selectFirst(chapterUrlSelector)!!.let { urlElement ->
+                chapter.url = urlElement.attr("abs:href").let {
+                    it.substringBefore("?style=paged") + if (!it.endsWith(chapterUrlSuffix)) chapterUrlSuffix else ""
+                }
+                chapter.name = selectFirst(".xyaoi-chapter-name")?.text() ?: urlElement.text()
+            }
+            chapter.date_upload = selectFirst(".xyaoi-chapter-date-line span")?.text()?.let(::parseChapterDate)
+                ?: selectFirst("img:not(.thumb)")?.attr("alt")?.let { parseRelativeDate(it) }
+                ?: selectFirst("span a")?.attr("title")?.let { parseRelativeDate(it) }
+                ?: parseChapterDate(selectFirst(chapterDateSelector())?.text())
+        }
+
+        return chapter
+    }
 
     override val statusFilterOptions: Map<String, String> =
         mapOf(
