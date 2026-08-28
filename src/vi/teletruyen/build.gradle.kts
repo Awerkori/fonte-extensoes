@@ -5,16 +5,19 @@ plugins {
 }
 
 keiyoushi {
-    name = "Jmanga"
-    versionCode = 5
+    name = "TeleTruyen"
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
-    theme = "mangareader"
+    libVersion = "1.6"
 
     source {
-        lang = "ja"
+        lang = "vi"
         baseUrl {
-            custom("https://jmanga.help")
+            custom("https://teletruyen.com")
         }
+    }
+
+    deeplink {
+        path("/.*")
     }
 }
