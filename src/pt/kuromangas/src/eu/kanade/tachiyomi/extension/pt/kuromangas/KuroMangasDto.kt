@@ -24,8 +24,10 @@ class SecureDto(
 )
 
 @Serializable
-class NonceDto(
-    val secret: String,
+class LoginRequestDto(
+    val email: String,
+    val password: String,
+    val rememberMe: Boolean,
 )
 
 @Serializable

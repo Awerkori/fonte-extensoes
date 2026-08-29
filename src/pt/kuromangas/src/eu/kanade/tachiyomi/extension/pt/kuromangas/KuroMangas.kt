@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.kuromangas
 
+import android.util.Log
+import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -15,14 +17,14 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
+import keiyoushi.utils.toJsonRequestBody
+import kotlinx.serialization.json.JsonObject
+import okhttp3.Cookie
+import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -42,15 +44,28 @@ abstract class KuroMangas :
 
     private val cdnUrl = "https://cdn.kuromangas.com"
 
-    private val decryptor by lazy { KuroMangasDecryptor(baseUrl, network.client, headers, ::relogin) }
+    private val authLock = Any()
+
+    @Volatile
+    private var authSession: AuthSession? = null
+
+    private val authClient by lazy {
+        network.client.newBuilder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .build()
+    }
+
+    private val decryptor by lazy {
+        KuroMangasDecryptor(baseUrl, authClient, ::authenticateRequest, ::relogin)
+    }
 
     override val client: OkHttpClient by lazy {
 
-        network.client.newBuilder()
+        authClient.newBuilder()
             .apply {
                 addInterceptor { chain ->
-                    if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
-                    return@addInterceptor chain.proceed(chain.request())
+                    val session = getValidSession() ?: throw IOException(LOGIN_REQUIRED_MESSAGE)
+                    return@addInterceptor chain.proceed(chain.request().withAuth(session))
                 }
 
                 addInterceptor(decryptor.vSecureInterceptor())
@@ -205,34 +220,127 @@ abstract class KuroMangas :
 
     // ============================= Auth ===================================
 
-    private fun checkLogin(): Boolean {
-        if (hasSession()) return true
-        return relogin()
+    private fun getValidSession(): AuthSession? = synchronized(authLock) {
+        val webViewSession = getWebViewSession()
+        if (webViewSession != null) {
+            if (validateSession(webViewSession)) {
+                authSession = webViewSession
+                Log.d(LOG_TAG, "KURO_AUTH_SOURCE=webview")
+                return@synchronized webViewSession
+            }
+            removeWebViewSession()
+            authSession = null
+        }
+
+        loginWithPreferences()?.also {
+            authSession = it
+            Log.d(LOG_TAG, "KURO_AUTH_SOURCE=password")
+            return@synchronized it
+        }
+
+        Log.d(LOG_TAG, "KURO_AUTH_SOURCE=none")
+        null
     }
 
-    private fun relogin(): Boolean {
+    private fun relogin(): Boolean = synchronized(authLock) {
+        authSession = null
+        getValidSession() != null
+    }
+
+    private fun validateSession(session: AuthSession): Boolean {
+        val request = GET("$apiUrl/users/me/profile", headers).withAuth(session)
+        return authClient.newCall(request).execute().use { response ->
+            Log.d(LOG_TAG, "KURO_AUTH_CHECK_STATUS=${response.code}")
+            when {
+                response.isSuccessful -> runCatching {
+                    val body = response.parseAs<JsonObject>()
+                    "_v_secure" in body || "profile" in body
+                }.getOrDefault(false)
+                response.code == 401 || response.code == 403 -> false
+                else -> throw IOException("Falha ao validar a sessão da KuroMangas (${response.code}).")
+            }
+        }
+    }
+
+    private fun getWebViewSession(): AuthSession? {
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.flush()
+
+        val cookieHeaders = listOf("https://kuromangas.com", baseUrl)
+            .distinct()
+            .asSequence()
+            .mapNotNull(cookieManager::getCookie)
+        val sessionCookie = cookieHeaders.mapNotNull { extractCookie(it, SESSION_COOKIE) }.firstOrNull()
+        val clientToken = cookieHeaders.mapNotNull { extractCookie(it, CLIENT_TOKEN_COOKIE) }.firstOrNull()
+        val session = if (sessionCookie != null && clientToken != null) {
+            AuthSession(sessionCookie, clientToken)
+        } else {
+            null
+        }
+        Log.d(LOG_TAG, "KURO_WEBVIEW_COOKIE_FOUND=${session != null}")
+        return session
+    }
+
+    private fun extractCookie(cookieHeader: String, name: String): String? = cookieHeader
+        .split(';')
+        .asSequence()
+        .map(String::trim)
+        .firstOrNull { it.substringBefore('=') == name }
+        ?.substringAfter('=', "")
+        ?.takeIf(String::isNotEmpty)
+
+    // Implicit set-cookie: kuro_session + _kn
+    private fun loginWithPreferences(): AuthSession? {
         val email = preferences.getString(PREF_EMAIL, "") ?: ""
         val password = preferences.getString(PREF_PASSWORD, "") ?: ""
-        if (email.isEmpty() || password.isEmpty()) {
-            return false
-        }
-        login(email, password)
+        if (email.isEmpty() || password.isEmpty()) return null
 
-        return hasSession()
-    }
-
-    private fun hasSession(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null
-
-    // Implicit set-cookie: kuro_session
-    private fun login(email: String, password: String) {
-        val payload = buildJsonObject {
-            put("email", email)
-            put("password", password)
-        }.toString()
-        val requestBody = payload.toRequestBody(JSON_MEDIA_TYPE)
+        val requestBody = LoginRequestDto(email, password, rememberMe = true).toJsonRequestBody()
         val request = POST("$apiUrl/auth/login", headers, requestBody)
-        network.client.newCall(request).execute().close()
+        val newSession = runCatching {
+            authClient.newCall(request).execute().use { response ->
+                val responseCookies = response.headers("Set-Cookie")
+                    .mapNotNull { Cookie.parse(response.request.url, it) }
+                val sessionCookie = responseCookies.firstOrNull { it.name == SESSION_COOKIE && it.value.isNotEmpty() }?.value
+                val clientToken = responseCookies.firstOrNull { it.name == CLIENT_TOKEN_COOKIE && it.value.isNotEmpty() }?.value
+                val hasJsonBody = runCatching {
+                    response.parseAs<JsonObject>()
+                    true
+                }.getOrDefault(false)
+                if (
+                    response.isSuccessful &&
+                    hasJsonBody &&
+                    sessionCookie != null &&
+                    clientToken != null
+                ) {
+                    AuthSession(sessionCookie, clientToken)
+                } else {
+                    null
+                }
+            }
+        }.getOrNull() ?: return null
+
+        if (!validateSession(newSession)) return null
+
+        CookieManager.getInstance().apply {
+            setCookie(baseUrl, "$SESSION_COOKIE=${newSession.sessionCookie}; Path=/; Secure; HttpOnly")
+            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=${newSession.clientToken}; Path=/; Secure")
+            flush()
+        }
+        return newSession
     }
+
+    private fun removeWebViewSession() {
+        CookieManager.getInstance().apply {
+            setCookie(baseUrl, "$SESSION_COOKIE=; Max-Age=0; Path=/; Secure")
+            setCookie(baseUrl, "$SESSION_COOKIE=; Max-Age=0; Domain=${baseUrl.toHttpUrl().host}; Path=/; Secure")
+            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=; Max-Age=0; Path=/; Secure")
+            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=; Max-Age=0; Domain=${baseUrl.toHttpUrl().host}; Path=/; Secure")
+            flush()
+        }
+    }
+
+    private fun authenticateRequest(request: Request): Request = authSession?.let(request::withAuth) ?: request
 
     // ============================= Preferences ============================
 
@@ -271,11 +379,29 @@ abstract class KuroMangas :
         private const val PREF_EMAIL = "kuromangas_email"
         private const val PREF_PASSWORD = "kuromangas_password"
         private const val SESSION_COOKIE = "kuro_session"
+        private const val CLIENT_TOKEN_COOKIE = "_kn"
+        private const val LOG_TAG = "KuroMangas"
         private const val LOGIN_REQUIRED_MESSAGE = "Faça login no WebView ou insira email e senha nas configurações e tente novamente."
-        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }
 }
 
-fun OkHttpClient.getCookies(baseUrl: String) = cookieJar.loadForRequest(baseUrl.toHttpUrl())
+private class AuthSession(
+    val sessionCookie: String,
+    val clientToken: String,
+)
 
-fun OkHttpClient.getCookie(baseUrl: String, cookie: String): String? = getCookies(baseUrl).firstOrNull { it.name == cookie }?.value?.takeUnless { it.isEmpty() }
+private fun Request.withAuth(session: AuthSession): Request {
+    val cookies = header("Cookie").orEmpty()
+        .split(';')
+        .map(String::trim)
+        .filter {
+            it.isNotEmpty() && it.substringBefore('=') !in setOf("kuro_session", "_kn")
+        }
+        .plus("kuro_session=${session.sessionCookie}")
+        .plus("_kn=${session.clientToken}")
+        .joinToString("; ")
+    return newBuilder()
+        .header("Cookie", cookies)
+        .header("X-Client-Token", session.clientToken)
+        .build()
+}
