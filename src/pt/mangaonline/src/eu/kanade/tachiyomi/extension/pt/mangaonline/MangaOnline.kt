@@ -25,50 +25,56 @@ abstract class MangaOnline : HttpSource() {
 
     // ============================== Popular (Navegar) ==============================
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/populares?page=$page", headers)
+    override fun popularMangaRequest(page: Int): Request = GET(
+        if (page == 1) "$baseUrl/manga/?ordem=popular" else "$baseUrl/manga/page/$page/?ordem=popular",
+        headers,
+    )
 
     override fun popularMangaParse(response: Response): MangasPage {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
-        val mangas = doc.select(".manga-card.popular-card").map { el ->
+        val mangas = doc.select(".manga-archive-grid article.home-manga-card").map { el ->
             SManga.create().apply {
-                val a = el.selectFirst("a")!!
+                val a = el.selectFirst("a.home-manga-cover")!!
                 setUrlWithoutDomain(a.attr("href"))
-                title = el.selectFirst("img")?.attr("alt")
-                    ?: el.selectFirst(".card-title, h3, h2")?.text()
+                title = el.selectFirst(".home-card-body h3 a")?.text()
+                    ?: el.selectFirst("img")?.attr("alt")
                     ?: a.attr("href").substringAfterLast("/")
                 thumbnail_url = el.selectFirst("img")?.let { buildImgUrl(it.attr("src"), response) }
             }
         }
-        val hasNext = doc.selectFirst("a.public-page-link:last-child") != null
+        val hasNext = doc.selectFirst(".manga-archive-pagination a.next") != null
         return MangasPage(mangas, hasNext)
     }
 
     // ============================== Latest (Recentes) ==============================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/atualizacoes?page=$page", headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET(if (page == 1) baseUrl else "$baseUrl/?atualizacoes=$page", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
         val seen = mutableSetOf<String>()
-        val mangas = doc.select(".latest-manga-card").mapNotNull { el ->
-            val a = el.selectFirst("a.latest-cover-link") ?: return@mapNotNull null
+        val mangas = doc.select("section.home-latest .home-latest-grid article.home-manga-card").mapNotNull { el ->
+            val a = el.selectFirst("a.home-manga-cover") ?: return@mapNotNull null
             val url = a.attr("href")
             if (!seen.add(url)) return@mapNotNull null
             SManga.create().apply {
                 setUrlWithoutDomain(url)
-                title = el.selectFirst(".latest-card-title")?.text()
+                title = el.selectFirst(".home-card-body h3 a")?.text()
                     ?: el.selectFirst("img")?.attr("alt")
                     ?: url.substringAfterLast("/")
                 thumbnail_url = el.selectFirst("img")?.let { buildImgUrl(it.attr("src"), response) }
             }
         }
-        val hasNext = doc.selectFirst("a.public-page-link:last-child") != null
+        val hasNext = doc.selectFirst("section.home-latest .home-latest-pagination a") != null
         return MangasPage(mangas, hasNext)
     }
 
     // ============================== Search ==============================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/buscar?q=${java.net.URLEncoder.encode(query.trim(), "UTF-8")}&page=$page", headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET(
+        "$baseUrl/?s=${java.net.URLEncoder.encode(query.trim(), "UTF-8")}&paged=$page",
+        headers,
+    )
 
     override fun searchMangaParse(response: Response): MangasPage {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
@@ -82,7 +88,7 @@ abstract class MangaOnline : HttpSource() {
                 thumbnail_url = el.selectFirst("img")?.let { buildImgUrl(it.attr("src"), response) }
             }
         }
-        val hasNext = doc.selectFirst("a.public-page-link:last-child") != null
+        val hasNext = doc.selectFirst(".pagination a.next") != null
         return MangasPage(mangas, hasNext)
     }
 
@@ -95,7 +101,7 @@ abstract class MangaOnline : HttpSource() {
     override fun mangaDetailsParse(response: Response): SManga {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
         return SManga.create().apply {
-            title = doc.selectFirst("h1")?.text().orEmpty()
+            title = doc.selectFirst("h1.manga-title")?.text()?.trim().orEmpty()
             thumbnail_url = doc.selectFirst(".manga-cover img, .series-cover img, img[src*='/uploads/covers/']")
                 ?.let { buildImgUrl(it.attr("src"), response) }
             description = doc.selectFirst(".manga-synopsis, .synopsis, .description")?.text()
@@ -114,11 +120,14 @@ abstract class MangaOnline : HttpSource() {
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
-        return doc.select(".chapter-list a[href*='/chapter/']").mapNotNull { el ->
+        return doc.select(".chapters-list .chapter-item a.chapter-link").mapNotNull { el ->
             val href = el.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             SChapter.create().apply {
                 setUrlWithoutDomain(href)
-                name = el.text().takeIf { it.isNotBlank() } ?: href.substringAfterLast("/")
+                name = el.selectFirst(".chapter-number")?.text()?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: el.text().trim().takeIf { it.isNotBlank() }
+                    ?: href.substringAfterLast("/")
                 chapter_number = href.substringAfterLast("/").toFloatOrNull() ?: -1f
             }
         }.distinctBy { it.url }
@@ -130,7 +139,7 @@ abstract class MangaOnline : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val doc = Jsoup.parse(response.body.string(), response.request.url.toString())
-        return doc.select("#readerContent img[src*='/uploads/chapters/']").mapIndexed { i, el ->
+        return doc.select(".chapter-images img.chapter-image").mapIndexed { i, el ->
             Page(i, "", buildImgUrl(el.attr("src"), response))
         }
     }

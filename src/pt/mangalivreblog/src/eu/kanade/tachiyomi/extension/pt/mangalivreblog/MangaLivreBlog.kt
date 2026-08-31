@@ -82,17 +82,20 @@ abstract class MangaLivreBlog : HttpSource() {
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val section = document.selectFirst("section.latest-section")
+        val section = document.selectFirst("section.home-latest")
 
-        val mangas = section?.select(".manga-card-modern")?.map { el ->
+        val mangas = section?.select(".home-latest-grid article.home-manga-card")?.mapNotNull { el ->
+            val titleLink = el.selectFirst(".home-card-body h3 a") ?: return@mapNotNull null
+            val coverLink = el.selectFirst("a.home-manga-cover") ?: return@mapNotNull null
             SManga.create().apply {
-                title = el.selectFirst("h3.manga-title-modern a")!!.text()
-                setUrlWithoutDomain(el.selectFirst("a.manga-cover-link")!!.attr("abs:href"))
+                title = titleLink.text()
+                setUrlWithoutDomain(coverLink.attr("abs:href"))
                 thumbnail_url = el.selectFirst("img")?.attr("abs:src")?.let(::cleanThumbnailUrl)
             }
         } ?: emptyList()
 
-        val hasNextPage = document.selectFirst("a.next.page-numbers") != null
+        val hasNextPage = section?.selectFirst(".home-latest-pagination a:not(.home-page-arrow)") != null ||
+            document.selectFirst("a.next.page-numbers") != null
 
         return MangasPage(mangas, hasNextPage)
     }

@@ -4,14 +4,67 @@ import eu.kanade.tachiyomi.multisrc.zeistmanga.Genre
 import eu.kanade.tachiyomi.multisrc.zeistmanga.Status
 import eu.kanade.tachiyomi.multisrc.zeistmanga.Type
 import eu.kanade.tachiyomi.multisrc.zeistmanga.ZeistManga
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.model.MangasPage
+import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Request
+import okhttp3.Response
 
 @Source
 abstract class YaoiFanClub : ZeistManga() {
 
-    override val popularMangaSelector = "#PopularPosts3 article"
+    private val bloggerBaseUrl = "https://yaoifanclube.blogspot.com"
+
+    override fun popularMangaRequest(page: Int): Request = GET(bloggerBaseUrl, headers)
+
+    override fun latestUpdatesRequest(page: Int): Request {
+        val startIndex = 10 * (page - 1) + 1
+        return GET(
+            "$bloggerBaseUrl/feeds/posts/default/-/Series?alt=json&orderby=published&max-results=11&start-index=$startIndex",
+            headers,
+        )
+    }
+
+    override val popularMangaSelector = "#PopularPosts4 article"
     override val popularMangaSelectorTitle = ".post-title a"
     override val popularMangaSelectorUrl = popularMangaSelectorTitle
+
+    private fun bloggerPath(url: String): String {
+        val value = url.trim()
+        if (value.startsWith("//")) return bloggerPath("https:$value")
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            val parsed = value.toHttpUrl()
+            return buildString {
+                append(parsed.encodedPath)
+                if (parsed.encodedQuery != null) append('?').append(parsed.encodedQuery)
+                if (parsed.encodedFragment != null) append('#').append(parsed.encodedFragment)
+            }
+        }
+        return if (value.startsWith('/')) value else "/$value"
+    }
+
+    private fun normalize(manga: SManga): SManga = manga.apply { url = bloggerPath(url) }
+
+    override fun popularMangaParse(response: Response): MangasPage = super.popularMangaParse(response).also { it.mangas.forEach(::normalize) }
+
+    override fun latestUpdatesParse(response: Response): MangasPage = super.latestUpdatesParse(response).also { it.mangas.forEach(::normalize) }
+
+    override fun searchMangaParse(response: Response): MangasPage = super.searchMangaParse(response).also { it.mangas.forEach(::normalize) }
+
+    override fun chapterListParse(response: Response): List<SChapter> = super.chapterListParse(response).also { it.forEach { chapter -> chapter.url = bloggerPath(chapter.url) } }
+
+    override fun mangaDetailsRequest(manga: SManga): Request = GET(bloggerBaseUrl + bloggerPath(manga.url), headers)
+
+    override fun chapterListRequest(manga: SManga): Request = GET(bloggerBaseUrl + bloggerPath(manga.url), headers)
+
+    override fun pageListRequest(chapter: SChapter): Request = GET(bloggerBaseUrl + bloggerPath(chapter.url), headers)
+
+    override fun apiUrl(feed: String): okhttp3.HttpUrl.Builder = "$bloggerBaseUrl/feeds/posts/default/-/".toHttpUrl().newBuilder()
+        .addPathSegment(feed)
+        .addQueryParameter("alt", "json")
 
     override val useNewChapterFeed = true
     override val chapterCategory = "Chapter"

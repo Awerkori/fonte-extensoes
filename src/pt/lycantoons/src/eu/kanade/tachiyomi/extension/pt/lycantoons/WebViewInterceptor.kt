@@ -1,11 +1,10 @@
 package eu.kanade.tachiyomi.extension.pt.lycantoons
 
-import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
-import android.util.Log
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import keiyoushi.utils.applicationContext
@@ -22,46 +21,27 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-private const val TAG = "LycanToons"
-private const val REUSE_TIMEOUT_MS = 60 * 1000L
-private const val API_BRIDGE_NAME = "Lycan_Api_Bridge"
-private const val IMG_BRIDGE_NAME = "Lycan_Img_Bridge"
+const val REUSE_TIMEOUT_MS = 30 * 1000L // 30s
 
-class WebViewInterceptor(
-    val baseUrl: String,
-    private val userAgent: String?,
-) : Interceptor {
+// proxy Request through WebView since OkHttp gets 403 and fails Cloudflare TLS signature checks
+class WebViewInterceptor(val baseUrl: String, private val userAgent: String?) : Interceptor {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var destroyWv: Runnable? = null
+    private var latch: CountDownLatch? = null
+    private var result: FetchResult? = null
+    private var errorMessage: Throwable? = null
+    private var sawCloudflareChallenge = false
 
-    private var cachedApiWebView: WebView? = null
-    private var destroyApiWvTask: Runnable? = null
-    private var isApiPageReady = false
-
-    private var cachedImgWebView: WebView? = null
-    private var destroyImgWvTask: Runnable? = null
-    private var isImgPageReady = false
-
-    private val apiLock = Any()
-    private val imgLock = Any()
-
-    private var apiLatch: CountDownLatch? = null
-    private var apiResult: FetchResult? = null
-    private var apiError: Throwable? = null
-
-    private var imgLatch: CountDownLatch? = null
-    private var imgResult: FetchResult? = null
-    private var imgError: Throwable? = null
+    var hasErrored = false
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val req = chain.request()
         val url = req.url.toString()
-        val isImage = url.contains("cdn.") || url.contains("/covers/") || url.contains("/capitulos/") ||
-            url.endsWith(".webp") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg")
-
-        Log.d(TAG, "==> [Interceptor] ${req.method} $url (isImage=$isImage)")
-
-        val requestBody = if (req.method == "POST" && req.body != null) {
+        if (url.contains("cdn.lycantoons.com")) {
+            return chain.proceed(req)
+        }
+        val requestBody = if (req.method == "POST") {
             val buffer = Buffer()
             req.body!!.writeTo(buffer)
             buffer.readUtf8()
@@ -69,292 +49,207 @@ class WebViewInterceptor(
             null
         }
 
-        val resultData = if (isImage) {
-            fetchImageViaWebView(url)
-        } else {
-            fetchApiViaWebView(url, req.method, req.headers, requestBody)
+        var resultData = fetchViaJs(url, req.method, req.headers, requestBody)
+        var challengeDetected = resultData.result.hasCloudflareChallenge()
+
+        if (resultData.result == "HTTP 403" || challengeDetected) {
+            hasErrored = true
+            resultData = fetchViaJs(url, req.method, req.headers, requestBody)
+            challengeDetected = challengeDetected || resultData.result.hasCloudflareChallenge()
+        }
+
+        if (resultData.success) {
+            hasErrored = false
         }
 
         if (!resultData.success) {
-            Log.e(TAG, "<== [Interceptor] Fetch failed for $url: ${resultData.result}")
-            throw IOException(resultData.result)
+            if (challengeDetected) throw CloudflareBlockedException()
+            throw IOException("[WebView]: " + resultData.result)
         }
 
-        val contentType = resultData.contentType ?: if (isImage) "image/jpeg" else "text/html; charset=UTF-8"
-        Log.d(TAG, "<== [Interceptor] Fetch success for $url ($contentType, size=${resultData.result.length})")
-
-        return if (isImage) {
-            Base64.decode(resultData.result, Base64.DEFAULT).toResponse(req, contentType)
-        } else {
-            resultData.result.toResponse(req, contentType)
-        }
+        val resultConentType = resultData.contentType ?: "text/html"
+        return resultData.result.toResponse(req, resultConentType)
     }
 
-    private fun fetchApiViaWebView(
+    private val bridgeName = "Lycan_Bridge"
+    private var cachedWv: WebView? = null
+
+    private val globalWebView: WebView
+        get() {
+            destroyWv?.let { mainHandler.removeCallbacks(it) }
+
+            if (cachedWv == null) {
+                cachedWv = WebView(applicationContext).apply {
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = userAgent
+                        loadsImagesAutomatically = true
+                        blockNetworkImage = false
+                    }
+
+                    addJavascriptInterface(
+                        object {
+                            @JavascriptInterface
+                            fun passResult(data: String, contentType: String?) {
+                                result = FetchResult(true, data, contentType)
+                                latch?.countDown()
+                            }
+
+                            @JavascriptInterface
+                            fun passError(error: String) {
+                                result = FetchResult(false, error)
+                                latch?.countDown()
+                            }
+
+                            @JavascriptInterface
+                            fun passChallenge() {
+                                sawCloudflareChallenge = true
+                            }
+                        },
+                        bridgeName,
+                    )
+                }
+            }
+
+            destroyWv = Runnable {
+                cachedWv?.destroy()
+                cachedWv = null
+                destroyWv = null
+            }.also {
+                mainHandler.postDelayed(it, REUSE_TIMEOUT_MS)
+            }
+
+            return cachedWv!!
+        }
+
+    @Synchronized
+    private fun fetchViaJs(
         url: String,
         method: String,
         headers: Headers,
         requestBody: String?,
-    ): FetchResult = synchronized(apiLock) {
-        apiLatch = CountDownLatch(1)
-        apiResult = null
-        apiError = null
+    ): FetchResult {
+        latch = CountDownLatch(1)
+        result = null
+        errorMessage = null
+        sawCloudflareChallenge = false
 
-        val isPageNavigation = method == "GET" && !url.contains("/api/")
+        val isRsc = "/series/" in url
 
         mainHandler.post {
             try {
-                val webView = getOrCreateApiWebView()
+                val webView = globalWebView
+                webView.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView,
+                        request: WebResourceRequest,
+                    ): WebResourceResponse? = if (!isRsc || "/series/" in request.url.toString()) {
+                        null
+                    } else {
+                        WebResourceResponse(null, null, null)
+                    }
 
-                if (isPageNavigation) {
-                    Log.d(TAG, "[ApiWebView] Direct page navigation for $url...")
-                    webView.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView, pageUrl: String?) {
-                            Log.d(TAG, "[ApiWebView] onPageFinished: $pageUrl, extracting HTML...")
-                            isApiPageReady = true
+                    override fun onReceivedHttpError(
+                        view: WebView,
+                        request: WebResourceRequest,
+                        errorResponse: WebResourceResponse,
+                    ) {
+                        if (request.isForMainFrame && errorResponse.statusCode != 403) {
+                            result = FetchResult(false, "HTTP ${errorResponse.statusCode}")
+                            latch?.countDown()
+                        }
+                    }
+
+                    override fun onPageFinished(view: WebView, pageUrl: String?) {
+                        if (isRsc) {
+                            if (result != null) return
                             view.evaluateJavascript(
                                 """
-                                (function() {
-                                    window.$API_BRIDGE_NAME.passResult(document.documentElement.outerHTML, 'text/html; charset=UTF-8');
-                                })();
+                            (function() {
+                                const isCloudflare = document.title === 'Just a moment...' || document.querySelector('span#challenge-error-text') != null || document.querySelector('div#cf-please-wait') != null || document.querySelector('div#challenge-spinner') != null;
+                                if (isCloudflare) {
+                                    window.$bridgeName.passChallenge();
+                                    return;
+                                }
+                                window.$bridgeName.passResult(document.documentElement.outerHTML, document.contentType);
+                            })();
                                 """.trimIndent(),
                                 null,
                             )
+                            return
                         }
+
+                        val jsScript = run {
+                            val jsHeaders = buildMap {
+                                headers.names().forEach { name ->
+                                    put(name, headers[name])
+                                }
+                            }.toJsonString()
+
+                            val jsRequestBody = if (requestBody != null) "body: `$requestBody`," else ""
+                            """
+                            (function() {
+                                const isCloudflare = document.title === 'Just a moment...' || document.querySelector('span#challenge-error-text') != null || document.querySelector('div#cf-please-wait') != null || document.querySelector('div#challenge-spinner') != null;
+                                if (isCloudflare) {
+                                    window.$bridgeName.passChallenge();
+                                    return;
+                                }
+
+                                let contentType;
+
+                                fetch('$url', {
+                                    method: '$method',
+                                    credentials: 'include',
+                                    headers: $jsHeaders,
+                                    $jsRequestBody
+                                })
+                                .then(async res => {
+                                    contentType = res.headers.get('content-type');
+                                    const text = await res.text();
+                                    if (!res.ok) {
+                                        const challengeStatus = res.status === 403 || res.status === 429 || res.status === 503;
+                                        const challengeBody = /Just a moment|cf-chl|challenge-platform|cf-turnstile|__cf_chl|Checking your browser|Verify you are human/i.test(text);
+                                        throw new Error(challengeStatus && challengeBody ? 'CLOUDFLARE_CHALLENGE' : 'HTTP ' + res.status);
+                                    }
+                                    return text;
+                                })
+                            .then(text => window.$bridgeName.passResult(text, contentType))
+                                .catch(err => window.$bridgeName.passError(err.message));
+                            })();
+                            """.trimIndent()
+                        }
+
+                        view.evaluateJavascript(jsScript, null)
                     }
-                    webView.loadUrl(url)
+                }
+
+                if (isRsc) {
+                    val cleanUrl = url.substringBefore("&_rsc=").substringBefore("?_rsc=")
+                    webView.loadUrl(cleanUrl)
                     return@post
                 }
 
-                val jsHeaders = headers.toSanitizedMap().toJsonString()
-                val jsBody = if (requestBody != null) "body: ${requestBody.toJsonString()}," else ""
-
-                val jsScript = """
-                    (function() {
-                        console.log('[LycanApi] Starting fetch: $url');
-                        fetch('$url', {
-                            method: '$method',
-                            headers: $jsHeaders,
-                            $jsBody
-                        })
-                        .then(async function(res) {
-                            var ct = res.headers.get('content-type') || '';
-                            var text = await res.text();
-                            window.$API_BRIDGE_NAME.passResult(text, ct);
-                        })
-                        .catch(function(err) {
-                            window.$API_BRIDGE_NAME.passError(err.message || 'Fetch error');
-                        });
-                    })();
-                """.trimIndent()
-
-                if (isApiPageReady) {
-                    Log.d(TAG, "[ApiWebView] Reusing page context, evaluating JS fetch for $url...")
-                    webView.evaluateJavascript(jsScript, null)
-                } else {
-                    Log.d(TAG, "[ApiWebView] Initializing with loadUrl($baseUrl)...")
-                    webView.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView, pageUrl: String?) {
-                            Log.d(TAG, "[ApiWebView] onPageFinished: $pageUrl, evaluating JS fetch for $url...")
-                            isApiPageReady = true
-                            view.evaluateJavascript(jsScript, null)
-                        }
-                    }
+                if (hasErrored) {
                     webView.loadUrl(baseUrl)
+                    return@post
                 }
+
+                val pageHtml = " "
+                webView.loadDataWithBaseURL(baseUrl, pageHtml, "text/html", "utf-8", null)
             } catch (e: Throwable) {
-                Log.e(TAG, "[ApiWebView] Exception during fetch setup: ${e.message}", e)
-                apiError = e
-                apiLatch?.countDown()
+                errorMessage = e
+                latch?.countDown()
             }
         }
 
-        val completed = apiLatch?.await(15, TimeUnit.SECONDS) == true
-        if (!completed) {
-            Log.e(TAG, "[ApiWebView] Timeout waiting for fetch: $url")
-            return FetchResult(false, "Timeout ao carregar dados pela WebView: $url")
+        latch?.await(15, TimeUnit.SECONDS)
+
+        return result ?: if (sawCloudflareChallenge) {
+            FetchResult(false, "CLOUDFLARE_CHALLENGE")
+        } else {
+            FetchResult(false, (errorMessage ?: "Timed out").toString())
         }
-
-        return apiResult ?: FetchResult(false, (apiError?.message ?: "Erro desconhecido na WebView"))
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun getOrCreateApiWebView(): WebView {
-        destroyApiWvTask?.let { mainHandler.removeCallbacks(it) }
-
-        if (cachedApiWebView == null) {
-            Log.d(TAG, "[ApiWebView] Creating new instance...")
-            cachedApiWebView = WebView(applicationContext).apply {
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    if (!userAgent.isNullOrBlank()) {
-                        userAgentString = userAgent
-                    }
-                }
-
-                addJavascriptInterface(
-                    object {
-                        @JavascriptInterface
-                        fun passResult(data: String, contentType: String?) {
-                            Log.d(TAG, "[ApiBridge] passResult: contentType=$contentType, size=${data.length}, preview=${data.take(150)}")
-                            apiResult = FetchResult(true, data, contentType)
-                            apiLatch?.countDown()
-                        }
-
-                        @JavascriptInterface
-                        fun passError(error: String) {
-                            Log.e(TAG, "[ApiBridge] passError: $error")
-                            apiResult = FetchResult(false, error)
-                            apiLatch?.countDown()
-                        }
-                    },
-                    API_BRIDGE_NAME,
-                )
-            }
-            isApiPageReady = false
-        }
-
-        destroyApiWvTask = Runnable {
-            Log.d(TAG, "[ApiWebView] Destroying idle instance.")
-            cachedApiWebView?.destroy()
-            cachedApiWebView = null
-            destroyApiWvTask = null
-            isApiPageReady = false
-        }.also {
-            mainHandler.postDelayed(it, REUSE_TIMEOUT_MS)
-        }
-
-        return cachedApiWebView!!
-    }
-
-    private fun fetchImageViaWebView(url: String): FetchResult = synchronized(imgLock) {
-        imgLatch = CountDownLatch(1)
-        imgResult = null
-        imgError = null
-
-        val cdnBaseUrl = "https://cdn.lycantoons.com"
-
-        mainHandler.post {
-            try {
-                val webView = getOrCreateImgWebView()
-
-                val jsScript = """
-                    (function() {
-                        var img = new Image();
-                        img.onload = function() {
-                            try {
-                                var canvas = document.createElement('canvas');
-                                canvas.width = img.naturalWidth;
-                                canvas.height = img.naturalHeight;
-                                var ctx = canvas.getContext('2d');
-                                ctx.drawImage(img, 0, 0);
-                                var dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-                                var base64 = (dataUrl || '').split(',')[1] || '';
-                                window.$IMG_BRIDGE_NAME.passResult(base64, 'image/jpeg');
-                            } catch(e) {
-                                window.$IMG_BRIDGE_NAME.passError('Canvas error: ' + e.message);
-                            }
-                        };
-                        img.onerror = function() {
-                            window.$IMG_BRIDGE_NAME.passError('Image element failed to load');
-                        };
-                        img.src = '$url';
-                    })();
-                """.trimIndent()
-
-                if (isImgPageReady) {
-                    Log.d(TAG, "[ImgWebView] Reusing context, loading image in DOM for $url...")
-                    webView.evaluateJavascript(jsScript, null)
-                } else {
-                    Log.d(TAG, "[ImgWebView] Initializing with loadDataWithBaseURL($cdnBaseUrl)...")
-                    webView.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView, pageUrl: String?) {
-                            Log.d(TAG, "[ImgWebView] onPageFinished: $pageUrl, loading image $url...")
-                            isImgPageReady = true
-                            view.evaluateJavascript(jsScript, null)
-                        }
-                    }
-                    webView.loadDataWithBaseURL(cdnBaseUrl, "<html><body></body></html>", "text/html", "utf-8", null)
-                }
-            } catch (e: Throwable) {
-                Log.e(TAG, "[ImgWebView] Exception: ${e.message}", e)
-                imgError = e
-                imgLatch?.countDown()
-            }
-        }
-
-        val completed = imgLatch?.await(15, TimeUnit.SECONDS) == true
-        if (!completed) {
-            Log.e(TAG, "[ImgWebView] Timeout waiting for image fetch: $url")
-            return FetchResult(false, "Timeout ao carregar imagem pela WebView: $url")
-        }
-
-        return imgResult ?: FetchResult(false, (imgError?.message ?: "Erro desconhecido na WebView"))
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun getOrCreateImgWebView(): WebView {
-        destroyImgWvTask?.let { mainHandler.removeCallbacks(it) }
-
-        if (cachedImgWebView == null) {
-            Log.d(TAG, "[ImgWebView] Creating new instance...")
-            cachedImgWebView = WebView(applicationContext).apply {
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    allowFileAccess = true
-                    allowContentAccess = true
-                    if (!userAgent.isNullOrBlank()) {
-                        userAgentString = userAgent
-                    }
-                }
-
-                addJavascriptInterface(
-                    object {
-                        @JavascriptInterface
-                        fun passResult(data: String, contentType: String?) {
-                            Log.d(TAG, "[ImgBridge] passResult: contentType=$contentType, base64Length=${data.length}")
-                            imgResult = FetchResult(true, data, contentType)
-                            imgLatch?.countDown()
-                        }
-
-                        @JavascriptInterface
-                        fun passError(error: String) {
-                            Log.e(TAG, "[ImgBridge] passError: $error")
-                            imgResult = FetchResult(false, error)
-                            imgLatch?.countDown()
-                        }
-                    },
-                    IMG_BRIDGE_NAME,
-                )
-            }
-            isImgPageReady = false
-        }
-
-        destroyImgWvTask = Runnable {
-            Log.d(TAG, "[ImgWebView] Destroying idle instance.")
-            cachedImgWebView?.destroy()
-            cachedImgWebView = null
-            destroyImgWvTask = null
-            isImgPageReady = false
-        }.also {
-            mainHandler.postDelayed(it, REUSE_TIMEOUT_MS)
-        }
-
-        return cachedImgWebView!!
-    }
-
-    private fun Headers.toSanitizedMap(): Map<String, String> {
-        val map = mutableMapOf<String, String>()
-        for (i in 0 until size) {
-            val name = name(i)
-            val value = value(i)
-            if (name.lowercase() !in FORBIDDEN_FETCH_HEADERS) {
-                map[name] = value
-            }
-        }
-        return map
     }
 
     private fun String.toResponse(request: Request, contentType: String): Response = this.toByteArray(Charsets.UTF_8).toResponse(request, contentType)
@@ -367,19 +262,33 @@ class WebViewInterceptor(
         .header("Content-Type", contentType)
         .body(this.toResponseBody(contentType.toMediaTypeOrNull()))
         .build()
-
-    companion object {
-        private val FORBIDDEN_FETCH_HEADERS = setOf(
-            "user-agent", "referer", "host", "connection", "content-length",
-            "origin", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-            "sec-fetch-user", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-            "cookie", "accept-encoding", "keep-alive", "cache-control",
-        )
-    }
 }
 
 class FetchResult(
     val success: Boolean,
     val result: String,
     val contentType: String? = null,
+)
+
+internal const val CLOUDFLARE_MESSAGE =
+    "Cloudflare bloqueou o acesso.\n\n" +
+        "Abra esta obra pela WebView (ícone do globo), conclua a verificação do Cloudflare e depois tente novamente."
+
+internal class CloudflareBlockedException(cause: Throwable? = null) : IOException(CLOUDFLARE_MESSAGE, cause)
+
+internal fun String.hasCloudflareChallenge(): Boolean = CLOUDFLARE_MARKERS.any { contains(it, ignoreCase = true) }
+
+internal fun Throwable.isCloudflareFailure(): Boolean = generateSequence(this) { it.cause }
+    .mapNotNull(Throwable::message)
+    .any(String::hasCloudflareChallenge)
+
+private val CLOUDFLARE_MARKERS = listOf(
+    "CLOUDFLARE_CHALLENGE",
+    "Just a moment",
+    "cf-chl",
+    "challenge-platform",
+    "cf-turnstile",
+    "__cf_chl",
+    "Checking your browser",
+    "Verify you are human",
 )

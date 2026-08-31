@@ -9,7 +9,7 @@ class MangaListDto(
     private val items: List<MangaItemDto> = emptyList(),
     private val pagination: PaginationDto? = null,
 ) {
-    val mangas get() = items.map { it.toSManga() }
+    fun mangas(baseUrl: String) = items.map { it.toSManga(baseUrl) }
     val hasNext get() = pagination?.hasNext ?: false
 }
 
@@ -20,11 +20,18 @@ class MangaItemDto(
     private val nome: String,
     private val capa: String,
 ) {
-    fun toSManga() = SManga.create().apply {
+    fun toSManga(baseUrl: String) = SManga.create().apply {
         title = nome
         url = "/manga/$id-$slug"
-        thumbnail_url = capa
+        thumbnail_url = capa.normalizeCoverUrl(baseUrl)
     }
+}
+
+internal fun String.normalizeCoverUrl(baseUrl: String): String = when {
+    startsWith("http://") || startsWith("https://") -> this
+    startsWith("../images/covers/") -> "$baseUrl/static/images/covers/${substringAfter("../images/covers/")}"
+    startsWith("/") -> baseUrl + this
+    else -> "$baseUrl/$this"
 }
 
 @Serializable

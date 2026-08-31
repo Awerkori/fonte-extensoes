@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.pt.inkscan
 import android.app.Dialog
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -27,6 +28,8 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -35,6 +38,8 @@ import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
 import java.io.IOException
+import java.text.Normalizer
+import java.util.Locale
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -301,12 +306,12 @@ abstract class InkScan :
                 val js = """
                     (function() {
                         try {
+                            var s = localStorage.getItem('sb-sjybfvyoznmtxmjhycoj-auth-token');
+                            if (s && s !== 'null') return 'sjy:::' + s;
                             var a = localStorage.getItem('sb-api-auth-token');
                             if (a && a !== 'null') return 'api:::' + a;
                             var d = localStorage.getItem('sb-delicate-hill-05c1inkscan-auth-token');
                             if (d && d !== 'null') return 'delicate:::' + d;
-                            var s = localStorage.getItem('sb-sjybfvyoznmtxmjhycoj-auth-token');
-                            if (s && s !== 'null') return 'sjy:::' + s;
                         } catch (e) {}
                         return null;
                     })()
@@ -479,7 +484,6 @@ abstract class InkScan :
                 if (!response.isSuccessful) throw IOException("Falha na busca: HTTP ${response.code}")
                 response.parseAs<List<SearchResultDto>>().also {
                     debug("response operation=SEARCH http=${response.code} items=${it.size}")
-                    if (it.isEmpty() && !auth.hasSession()) throw IOException(loginMessage())
                 }.map { it.id() }
             }
 
@@ -487,13 +491,18 @@ abstract class InkScan :
                 return@fromCallable MangasPage(emptyList(), false)
             }
 
-            val works = client.newCall(worksByIdsRequest(ids, filters)).execute().use { response ->
-                if (response.code == 401) throw IOException(loginMessage())
-                if (!response.isSuccessful) throw IOException("Falha ao carregar resultados: HTTP ${response.code}")
-                response.parseAs<List<WorkDto>>().also { debug("response operation=SEARCH results_items=${it.size}") }
+            val works = ids.chunked(SEARCH_HYDRATION_BATCH_SIZE).flatMap { batch ->
+                client.newCall(worksByIdsRequest(batch, filters)).execute().use { response ->
+                    if (response.code == 401) throw IOException(loginMessage())
+                    if (!response.isSuccessful) throw IOException("Falha ao carregar resultados: HTTP ${response.code}")
+                    response.parseAs<List<WorkDto>>().also {
+                        debug("response operation=SEARCH results_items=${it.size}")
+                    }
+                }
             }
 
-            val orderedWorks = ids.mapNotNull { id -> works.firstOrNull { it.id() == id } }
+            val worksById = works.distinctBy { it.id() }.associateBy { it.id() }
+            val orderedWorks = ids.distinct().mapNotNull(worksById::get)
             val offset = (page - 1) * PAGE_SIZE
             val pageItems = orderedWorks.drop(offset).take(PAGE_SIZE)
 
@@ -695,9 +704,10 @@ abstract class InkScan :
 
     private fun worksByIdsRequest(ids: List<String>, filters: FilterList): Request {
         auth.ensureSession()
+        val idFilter = "in.(${ids.joinToString(separator = ",")})"
         val url = "$apiUrl/rest/v1/obras".toHttpUrl().newBuilder()
             .addQueryParameter("select", CATALOG_SELECT)
-            .addQueryParameter("id", "in.(${ids.joinToString()})")
+            .addQueryParameter("id", idFilter)
             .addQueryParameter("or", "(is_acervo_b.is.null,is_acervo_b.eq.false)")
 
         url.applyFilters(filters)
@@ -707,13 +717,29 @@ abstract class InkScan :
 
     private fun searchIdsRequest(query: String): Request {
         auth.ensureSession()
+        val normalizedQuery = normalizeSearchQuery(query)
         val payload = SearchRequestDto(
-            searchTerm = query.trim(),
+            searchTerm = normalizedQuery,
             maxResults = SEARCH_LIMIT,
             archiveBOnly = false,
         ).toJsonRequestBody()
 
         return POST("$apiUrl/rest/v1/rpc/fuzzy_search_obras", rpcHeaders, payload)
+    }
+
+    private fun normalizeSearchQuery(query: String): String {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return ""
+
+        val normalized = Normalizer.normalize(trimmed, Normalizer.Form.NFD)
+            .replace(SEARCH_MARKS_REGEX, "")
+            .lowercase(Locale.ROOT)
+            .split(SEARCH_WHITESPACE_REGEX)
+            .filter { it.length >= 2 && it !in SEARCH_STOP_WORDS }
+            .joinToString(" ")
+            .trim()
+
+        return normalized.ifEmpty { trimmed }
     }
 
     private fun folderRequest(workId: String): Request {
@@ -777,6 +803,10 @@ abstract class InkScan :
     }
 
     private fun debug(message: String) = Log.d(DEBUG_TAG, "INKSCAN_DEBUG $message")
+
+    private fun sessionDebug(message: String) = Log.d(SESSION_DEBUG_TAG, message)
+
+    private data class TokenValidation(val isJwt: Boolean, val projectMatch: Boolean)
 
     private fun loginDebug(message: String) = Log.d(LOGIN_DEBUG_TAG, "INKSCAN_LOGIN_DEBUG $message")
 
@@ -859,6 +889,15 @@ abstract class InkScan :
         private const val LATEST_WINDOW_SECONDS = 54 * 60 * 60L
         private const val TOKEN_REFRESH_MARGIN = 60_000L
         private const val SEARCH_LIMIT = 120
+        private const val SEARCH_HYDRATION_BATCH_SIZE = 40
+        private const val CURRENT_PROJECT_REF = "sjybfvyoznmtxmjhycoj"
+        private val SEARCH_MARKS_REGEX = Regex("\\p{M}+")
+        private val SEARCH_WHITESPACE_REGEX = Regex("\\s+")
+        private val SEARCH_STOP_WORDS = setOf(
+            "o", "a", "os", "as", "de", "do", "da", "dos", "das", "e", "em", "no", "na", "nos", "nas",
+            "um", "uma", "uns", "umas", "ao", "aos", "à", "às", "pelo", "pela", "pelos", "pelas", "por",
+            "com", "sem", "que",
+        )
         private const val POPULAR_SORT = "total_views.desc"
         private const val LATEST_SORT = "created_at.desc"
         private const val CLIENT_INFO = "supabase-js-web/2.99.3"
@@ -881,13 +920,10 @@ abstract class InkScan :
         private const val KEY_DELICATE = "sb-delicate-hill-05c1inkscan-auth-token"
         private const val KEY_SJY = "sb-sjybfvyoznmtxmjhycoj-auth-token"
         private const val KEY_API = "sb-api-auth-token"
-        private val STORAGE_KEYS = listOf(
-            KEY_API,
-            KEY_DELICATE,
-            KEY_SJY,
-        )
+        private val STORAGE_KEYS = listOf(KEY_SJY, KEY_API, KEY_DELICATE)
         private const val LOG_TAG = "InkScanAuth"
         private const val DEBUG_TAG = "InkScanDebug"
+        private const val SESSION_DEBUG_TAG = "INK_SESSION_DEBUG"
         private const val LOGIN_DEBUG_TAG = "InkScanLoginDebug"
         private const val PREF_DEBUG_TAG = "InkScanPrefDebug"
         private const val LOGIN_REQUIRED_URL = "__inkscan_login_required__"
@@ -937,11 +973,19 @@ abstract class InkScan :
             val access = session?.accessToken
             val expiresAt = session?.expiresAt?.times(1000L)
                 ?: (now + (session?.expiresIn ?: 3600L) * 1000L)
-            val usable = !access.isNullOrBlank() && expiresAt > now
+            val validation = validateAccessToken(access)
+            val expired = expiresAt <= now
+            val usable = !access.isNullOrBlank() && validation.isJwt && validation.projectMatch && !expired
             debug("localstorage key=$keyLabel parsed=${session != null}")
             debug("localstorage key=$keyLabel access_present=${!access.isNullOrBlank()}")
             debug("localstorage key=$keyLabel refresh_present=${!session?.refreshToken.isNullOrBlank()}")
             debug("localstorage key=$keyLabel expired=${expiresAt <= now}")
+            sessionDebug("STORAGE_KEY_LABEL=$keyLabel TOKEN_PRESENT=${!access.isNullOrBlank()}")
+            sessionDebug("TOKEN_SEGMENT_COUNT=${access?.count { it == '.' }?.plus(1) ?: 0}")
+            sessionDebug("TOKEN_IS_JWT=${if (access.isNullOrBlank()) "NÃO" else validation.isJwt}")
+            sessionDebug("TOKEN_EXPIRED=${if (access.isNullOrBlank()) "NÃO" else expired}")
+            sessionDebug("TOKEN_PROJECT_MATCH=${if (access.isNullOrBlank()) "NÃO" else validation.projectMatch}")
+            if (!usable && !access.isNullOrBlank()) sessionDebug("PERSISTED_TOKEN_DISCARDED=SIM")
             if (!usable) return null
             preferences.edit()
                 .putString(PREF_ACCESS_TOKEN, access)
@@ -965,10 +1009,21 @@ abstract class InkScan :
             val access = preferences.getString(PREF_ACCESS_TOKEN, null)
             val expires = preferences.getLong(PREF_TOKEN_EXPIRES, 0L)
             val present = !access.isNullOrBlank()
-            val valid = present && expires > System.currentTimeMillis() + TOKEN_REFRESH_MARGIN
+            val validation = validateAccessToken(access)
+            val structurallyValid = present && validation.isJwt && validation.projectMatch
+            val valid = structurallyValid && expires > System.currentTimeMillis() + TOKEN_REFRESH_MARGIN
             debug("auth persisted_access_token=$present")
             debug("auth persisted_refresh_token=${!preferences.getString(PREF_REFRESH_TOKEN, null).isNullOrBlank()}")
             debug("auth persisted_expiry=${expires > 0L}")
+            sessionDebug("PERSISTED_TOKEN_ACCEPTED=${if (valid) "SIM" else "NÃO"}")
+            sessionDebug("TOKEN_SEGMENT_COUNT=${access?.count { it == '.' }?.plus(1) ?: 0}")
+            sessionDebug("TOKEN_IS_JWT=${if (!present) "NÃO" else validation.isJwt}")
+            sessionDebug("TOKEN_PROJECT_MATCH=${if (!present) "NÃO" else validation.projectMatch}")
+            if (present && !structurallyValid) {
+                sessionDebug("PERSISTED_TOKEN_DISCARDED=SIM")
+                clearStoredSession()
+                return importWebViewSession()
+            }
             debug("auth persistent_session_valid=$valid")
             if (valid) {
                 debug("auth selected_session=PERSISTED")
@@ -991,6 +1046,7 @@ abstract class InkScan :
         private fun importWebViewSession(): String? {
             debug("localstorage import_start")
             debug("localstorage origin=https://inkscann.live")
+            sessionDebug("SESSION_IMPORT_START")
             val imported = STORAGE_KEYS.asSequence()
                 .mapNotNull { key ->
                     val value = runCatching { runBlocking { getLocalStorage(baseUrl, key) } }
@@ -1003,9 +1059,11 @@ abstract class InkScan :
                     }
                     if (value.isNullOrBlank()) {
                         debug("localstorage key=$label found=false")
+                        sessionDebug("STORAGE_KEY_${label.uppercase(Locale.ROOT)}_FOUND=NÃO")
                         return@mapNotNull null
                     }
                     debug("localstorage key=$label found=true")
+                    sessionDebug("STORAGE_KEY_${label.uppercase(Locale.ROOT)}_FOUND=SIM")
                     val access = saveStorageSession(value, label)
                     if (access != null) key to access else null
                 }
@@ -1022,6 +1080,20 @@ abstract class InkScan :
                 }}",
             )
             return imported.second
+        }
+
+        private fun validateAccessToken(access: String?): TokenValidation {
+            if (access.isNullOrBlank()) return TokenValidation(false, false)
+            val parts = access.split('.')
+            if (parts.size != 3) return TokenValidation(false, false)
+            val payload = runCatching {
+                val bytes = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                Json.parseToJsonElement(String(bytes, Charsets.UTF_8)).jsonObject
+            }.getOrNull() ?: return TokenValidation(true, false)
+            val issuer = payload["iss"]?.toString()?.trim('"')
+            val reference = payload["ref"]?.toString()?.trim('"')
+            val projectMatch = reference == CURRENT_PROJECT_REF || issuer?.contains(CURRENT_PROJECT_REF) == true
+            return TokenValidation(true, projectMatch)
         }
 
         private fun refreshStoredToken(): String? {

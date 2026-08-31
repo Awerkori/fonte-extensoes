@@ -216,13 +216,30 @@ abstract class MangaDash :
 
     override fun popularMangaParse(response: Response): MangasPage {
         val dto = response.parseAs<MangaListDto>()
-        return MangasPage(dto.mangas, dto.hasNext)
+        return MangasPage(dto.mangas(baseUrl), dto.hasNext)
     }
 
     // ============================== Latest ===============================
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/api/mangas/list?page=$page&q=&sort=recentes&categoria=&status=&ano=&plus18=", headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/capitulos?page=$page", headers)
 
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
+    override fun latestUpdatesParse(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val mangas = document.select(".chapters-grid .card-new").mapNotNull { card ->
+            val mangaLink = card.selectFirst(".card-content .card-title a") ?: return@mapNotNull null
+            val path = mangaLink.attr("href").takeIf { it.startsWith("/manga/") } ?: return@mapNotNull null
+            val title = mangaLink.text().trim().takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val cover = card.selectFirst(".card-poster img")?.attr("src")?.trim()
+                ?.takeIf(String::isNotBlank)
+                ?.let { it.normalizeCoverUrl(baseUrl) }
+            SManga.create().apply {
+                this.title = title
+                url = path
+                thumbnail_url = cover
+            }
+        }.distinctBy(SManga::url)
+        val hasNext = document.selectFirst("a.page-link.next") != null
+        return MangasPage(mangas, hasNext)
+    }
 
     // ============================== Search ===============================
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -245,13 +262,18 @@ abstract class MangaDash :
         return GET(url, headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
+    override fun searchMangaParse(response: Response): MangasPage {
+        val dto = response.parseAs<MangaListDto>()
+        return MangasPage(dto.mangas(baseUrl), dto.hasNext)
+    }
 
     // ============================== Details ==============================
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
+        if (document.isLoginPage()) throw IOException(ADULT_ACCESS_MESSAGE)
         return SManga.create().apply {
-            title = document.selectFirst(".neon-title")?.text()!!
+            title = document.selectFirst(".neon-title")?.text()
+                ?: throw IOException("Detalhes da obra não encontrados.")
             author = document.selectFirst(".tag-author")?.text()
             genre = document.select(".manga-tags a.tag:not(.tag-author)").joinToString { it.text() }
             description = document.selectFirst(".manga-description")?.text()
@@ -269,10 +291,15 @@ abstract class MangaDash :
     // ============================= Chapters ==============================
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
+        if (document.isLoginPage() || document.selectFirst(".adult-content-blocked") != null) {
+            throw IOException(ADULT_ACCESS_MESSAGE)
+        }
         val chapters = document.select(".chapters-scroll-container .chapter-row").map { element ->
             SChapter.create().apply {
                 url = element.attr("href")
-                name = element.selectFirst(".chapter-title-group h4")?.text()!!
+                name = element.selectFirst(".chapter-title-group h4")?.text()
+                    ?.takeIf(String::isNotBlank)
+                    ?: "Capítulo"
                 val dateStr = element.selectFirst(".chapter-meta-info:has(.fa-calendar)")?.text()
                 date_upload = dateStr?.let { dateFormat.tryParse(it) } ?: 0L
 
@@ -290,6 +317,9 @@ abstract class MangaDash :
     // =============================== Pages ===============================
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
+        if (document.selectFirst(".adult-content-blocked") != null) {
+            throw IOException(ADULT_ACCESS_MESSAGE)
+        }
         val dataElement = document.selectFirst("script#chapterViewerData")
             ?: throw Exception("Dados do capítulo não encontrados")
 
@@ -371,9 +401,14 @@ abstract class MangaDash :
     companion object {
         private const val PREF_USERNAME = "pref_username"
         private const val PREF_PASSWORD = "pref_password"
+        private const val ADULT_ACCESS_MESSAGE =
+            "Conteúdo +18 bloqueado pelo site. Faça login e habilite conteúdo adulto nas configurações da sua conta."
 
         private val dateFormat by lazy {
             SimpleDateFormat("dd/MM/yyyy", Locale("pt", "BR"))
         }
     }
 }
+
+private fun org.jsoup.nodes.Document.isLoginPage(): Boolean = location().contains("/auth/login") ||
+    (selectFirst(".neon-title") == null && select("form").any { it.attr("action").substringBefore("?") == "/auth/login" })

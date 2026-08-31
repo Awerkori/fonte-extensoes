@@ -5,13 +5,13 @@ plugins {
 }
 
 keiyoushi {
-    name = "Manga Online"
-    versionCode = 58
-    contentWarning = ContentWarning.SAFE
+    name = "Manga Online RED"
+    versionCode = 59
+    contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://mangaonline.blue"
+        baseUrl = "https://mangaonline.red"
     }
 }
