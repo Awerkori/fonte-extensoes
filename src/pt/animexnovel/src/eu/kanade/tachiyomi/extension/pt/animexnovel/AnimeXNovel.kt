@@ -1,21 +1,22 @@
 package eu.kanade.tachiyomi.extension.pt.animexnovel
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.parseAs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonElement
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -23,22 +24,20 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
 import kotlin.collections.map
 import kotlin.collections.plusAssign
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 @Source
-abstract class AnimeXNovel : HttpSource() {
+abstract class AnimeXNovel : KeiSource() {
 
     override val supportsLatest: Boolean = true
 
-    override val client: OkHttpClient = network.client.newBuilder()
+    override fun OkHttpClient.Builder.configureClient() = this
         .readTimeout(1.minutes)
         .callTimeout(1.minutes)
         .rateLimit(3, 1.seconds)
-        .build()
 
     // ========================== Popular ===================================
 
@@ -50,16 +49,12 @@ abstract class AnimeXNovel : HttpSource() {
         ),
     )
 
-    override fun popularMangaRequest(page: Int): Request = searchMangaRequest(page, "", popularFilter)
-
-    override fun popularMangaParse(response: Response): MangasPage = searchMangaParse(response)
+    override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", popularFilter)
 
     // ========================== Latest ====================================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl)
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val mangas = response.asJsoup()
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val mangas = client.get(baseUrl).asJsoup()
             .select("div:contains(Últimos Mangás) + .axn-piz-container .axn-piz-card")
             .map(::mangaFromElement)
         return MangasPage(mangas, hasNextPage = false)
@@ -67,7 +62,7 @@ abstract class AnimeXNovel : HttpSource() {
 
     // ========================== Search ====================================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val form = FormBody.Builder()
             .add("action", "axn_filter_obras")
             .add("posts_per_page", "21")
@@ -88,13 +83,13 @@ abstract class AnimeXNovel : HttpSource() {
                     .forEach { filter -> add("terms[]", filter.id) }
             }
             .build()
-        return POST("$baseUrl/wp-admin/admin-ajax.php", headers, form)
+        return client.post("$baseUrl/wp-admin/admin-ajax.php", form).asJsoup().let(::searchMangaParse)
     }
 
     private var lastManga: SManga? = null
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val mangas = response.asJsoup().select("a.axn-card").map(::mangaFromElement).toMutableList()
+    private fun searchMangaParse(document: Document): MangasPage {
+        val mangas = document.select("a.axn-card").map(::mangaFromElement).toMutableList()
         val hasNextPage = mangas.isNotEmpty() && mangas.size > 1
 
         when {
@@ -111,8 +106,9 @@ abstract class AnimeXNovel : HttpSource() {
 
     // ========================== Details ===================================
 
-    override fun mangaDetailsParse(response: Response) = SManga.create().apply {
-        val document = response.asJsoup()
+    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga = parseMangaDetails(client.get(url).asJsoup(), url.toString())
+
+    private fun parseMangaDetails(document: Document, url: String) = SManga.create().apply {
         title = document.selectFirst("h1")!!.text()
         thumbnail_url = document.selectFirst("meta[itemprop=image]")?.absUrl("content")
         author = document.selectFirst("li:contains(Autor:)")?.text()?.substringAfter(":")?.trim()
@@ -128,16 +124,21 @@ abstract class AnimeXNovel : HttpSource() {
             }
         }
 
-        setUrlWithoutDomain(document.location())
+        setUrlWithoutDomain(url)
     }
 
     // ========================== Chapters ==================================
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        val document = client.newCall(mangaDetailsRequest(manga)).execute().asJsoup()
+    override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { document ->
+        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+            if (fetchDetails) parseMangaDetails(document, getMangaUrl(manga)) else manga,
+            if (fetchChapters) fetchChapterList(document) else chapters,
+        )
+    }
+
+    private suspend fun fetchChapterList(document: Document): List<SChapter> {
         val category = document.selectFirst("[id^=axn-list-][data-categoria]")
-            ?.attr("data-categoria")
-            ?: return@fromCallable emptyList()
+            ?.attr("data-categoria") ?: return emptyList()
         val url = "$baseUrl/wp-json/wp/v2/posts".toHttpUrl().newBuilder()
             .addQueryParameter("categories", category)
             .addQueryParameter("orderby", "date")
@@ -147,15 +148,15 @@ abstract class AnimeXNovel : HttpSource() {
         var page = 1
         while (true) {
             url.setQueryParameter("page", page.toString())
-            val response = client.newCall(GET(url.build(), headers)).execute()
+            val response = client.get(url.build(), ensureSuccess = false)
             if (!response.isSuccessful) break
             chapters += chapterListParse(response)
             page++
         }
-        chapters
+        return chapters
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> = response.parseAs<List<ChapterDto>>()
+    private fun chapterListParse(response: okhttp3.Response): List<SChapter> = response.parseAs<List<ChapterDto>>()
         .map(ChapterDto::toSChapter)
         .onEach { chapter -> chapter.setUrlWithoutDomain(chapter.url) }
         .filter { it.url.contains("capitulo") }
@@ -164,16 +165,14 @@ abstract class AnimeXNovel : HttpSource() {
 
     private val pageContainerSelector = ".spice-block-img-gallery, .wp-block-gallery, .spnc-entry-content"
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter)).asJsoup()
         val images = document.selectFirst(pageContainerSelector)?.select("img")
             ?: document.select("article .entry-content img[src*=/wp-content/uploads/]")
         return images.mapIndexed { index, element ->
             Page(index, imageUrl = element.absUrl("src"))
         }
     }
-
-    override fun imageUrlParse(response: Response): String = ""
 
     // =========================== Filters ==================================
 
@@ -201,7 +200,7 @@ abstract class AnimeXNovel : HttpSource() {
         }
     }
 
-    private fun filterRequest(): Request = GET("$baseUrl/pesquisar", headers)
+    private fun filterRequest(): Request = Request.Builder().url("$baseUrl/pesquisar").headers(headers).get().build()
 
     private fun parseOptions(document: Document): List<Pair<String, List<BoxValue>>> {
         val filtersSelectors = setOf(
@@ -220,7 +219,7 @@ abstract class AnimeXNovel : HttpSource() {
         }
     }
 
-    override fun getFilterList(): FilterList {
+    override fun getFilterList(data: JsonElement?): FilterList {
         scope.launch { fetchFilters() }
 
         val filters: MutableList<Filter<out Any>> = mutableListOf()

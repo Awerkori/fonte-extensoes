@@ -1,70 +1,59 @@
 package eu.kanade.tachiyomi.extension.pt.nhentaibr
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.OkHttpClient
 import org.jsoup.nodes.Element
-import rx.Observable
 import java.time.Instant
 import kotlin.time.Duration.Companion.seconds
 
 @Source
-abstract class NhentaiBR : HttpSource() {
+abstract class NhentaiBR : KeiSource() {
 
     override val supportsLatest = true
 
-    override val client = network.client.newBuilder()
+    override fun OkHttpClient.Builder.configureClient() = this
         .rateLimit(1, 1.seconds) { !it.encodedPath.startsWith("/wp-content/uploads/") }
-        .build()
 
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
+    override fun okhttp3.Headers.Builder.configureHeaders() = this
         .set("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
 
-    override fun popularMangaRequest(page: Int): Request = GET(pageUrl("$baseUrl/popular/", page), headers)
+    override suspend fun getPopularManga(page: Int): MangasPage = client.get(pageUrl("$baseUrl/popular/", page)).asJsoup().let(::parseMangas)
+    override suspend fun getLatestUpdates(page: Int): MangasPage = client.get(pageUrl("$baseUrl/ultimos/", page)).asJsoup().let(::parseMangas)
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = client
+        .get("$baseUrl/page/$page/".toHttpUrl().newBuilder().addQueryParameter("s", query).build())
+        .asJsoup().let(::parseMangas)
 
-    override fun popularMangaParse(response: Response): MangasPage = parseMangas(response.asJsoup())
-
-    override fun latestUpdatesRequest(page: Int): Request = GET(pageUrl("$baseUrl/ultimos/", page), headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = parseMangas(response.asJsoup())
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/page/$page/".toHttpUrl().newBuilder().addQueryParameter("s", query).build(), headers)
-
-    override fun searchMangaParse(response: Response): MangasPage = parseMangas(response.asJsoup())
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        val url = query.toHttpUrlOrNull()
-        if (url != null) {
-            if (url.host != baseUrl.toHttpUrl().host) return Observable.error(Exception("Unsupported url"))
-            val slug = url.pathSegments.firstOrNull().orEmpty()
-            return client.newCall(GET("$baseUrl/$slug", headers)).asObservableSuccess()
-                .map { MangasPage(listOf(mangaDetailsParse(it)), false) }
-        }
-        return super.fetchSearchManga(page, query, filters)
+    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        return parseMangaDetails(client.get(url).asJsoup(), url.encodedPath)
     }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
+    override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { document ->
+        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+            if (fetchDetails) parseMangaDetails(document, manga.url) else manga,
+            if (fetchChapters) parseChapterList(document, manga.url) else chapters,
+        )
+    }
+
+    private fun parseMangaDetails(document: org.jsoup.nodes.Document, path: String): SManga {
         val box = document.selectFirst("div.container > div.post-box") ?: error("Required value was null.")
         val hasChapters = document.select("div.galeriaTabItem").isNotEmpty()
         return SManga.create().apply {
-            setUrlWithoutDomain(response.request.url.encodedPath)
+            setUrlWithoutDomain(path)
             title = box.selectFirst("h1.post-titulo")!!.text()
             thumbnail_url = box.selectFirst("div.post-capa > img.wp-post-image")?.imageUrl()?.replace(IMAGE_SIZE, "")
             author = metadata(box, "Artista")
@@ -83,38 +72,36 @@ abstract class NhentaiBR : HttpSource() {
         }
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        return document.select("div.galeriaTabItem").mapIndexed { index, element ->
-            val gallery = element.selectFirst("div.galeriaConteudo[id~=^galeria-\\d+$]")
-            val chapter = gallery?.selectFirst(".galeriaTabCapitulo")?.text().orEmpty()
-            val title = gallery?.selectFirst(".galeriaTabTitulo")?.text().orEmpty()
-            SChapter.create().apply {
-                url = gallery?.id()?.let { "${response.request.url.encodedPath}#$it" } ?: response.request.url.encodedPath
-                name = when {
-                    chapter.isEmpty() && title.isEmpty() -> "Capítulo"
-                    chapter.isEmpty() -> title
-                    title.isEmpty() -> chapter
-                    else -> "$chapter: $title"
-                }
-                chapter_number = NUMBER.find(chapter)?.groupValues?.get(1)?.toFloatOrNull() ?: index + 1f
-                date_upload = document.selectFirst("meta[property=\"article:published_time\"]")
-                    ?.attr("content")?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
+    private fun parseChapterList(document: org.jsoup.nodes.Document, path: String): List<SChapter> = document.select("div.galeriaTabItem").mapIndexed { index, element ->
+        val gallery = element.selectFirst("div.galeriaConteudo[id~=^galeria-\\d+$]")
+        val chapter = gallery?.selectFirst(".galeriaTabCapitulo")?.text().orEmpty()
+        val title = gallery?.selectFirst(".galeriaTabTitulo")?.text().orEmpty()
+        SChapter.create().apply {
+            url = gallery?.id()?.let { "$path#$it" } ?: path
+            name = when {
+                chapter.isEmpty() && title.isEmpty() -> "Capítulo"
+                chapter.isEmpty() -> title
+                title.isEmpty() -> chapter
+                else -> "$chapter: $title"
             }
-        }.ifEmpty {
-            listOf(
-                SChapter.create().apply {
-                    url = response.request.url.encodedPath
-                    name = "Capítulo único"
-                    chapter_number = 1f
-                },
-            )
+            chapter_number = NUMBER.find(chapter)?.groupValues?.get(1)?.toFloatOrNull() ?: index + 1f
+            date_upload = document.selectFirst("meta[property=\"article:published_time\"]")
+                ?.attr("content")?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
         }
+    }.ifEmpty {
+        listOf(
+            SChapter.create().apply {
+                url = path
+                name = "Capítulo único"
+                chapter_number = 1f
+            },
+        )
     }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val fragment = response.request.url.fragment
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val url = getChapterUrl(chapter).toHttpUrl()
+        val document = client.get(url).asJsoup()
+        val fragment = url.fragment
         val selector = if (fragment.isNullOrEmpty()) {
             "div.post-box.listaImagens ul.post-fotos > li > a > img"
         } else {
@@ -153,7 +140,7 @@ abstract class NhentaiBR : HttpSource() {
 
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
-    override fun imageUrlParse(response: Response): String = response.request.url.toString()
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList()
 
     private companion object {
         val IMAGE_SIZE = Regex("-\\d+x\\d+(?=\\.(?:jpe?g|png|webp|avif)$)")

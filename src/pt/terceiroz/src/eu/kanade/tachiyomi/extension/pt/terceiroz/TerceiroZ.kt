@@ -1,56 +1,61 @@
 package eu.kanade.tachiyomi.extension.pt.terceiroz
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
-import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
 
 @Source
-abstract class TerceiroZ : HttpSource() {
+abstract class TerceiroZ : KeiSource() {
     override val supportsLatest = true
 
-    override fun headersBuilder() = super.headersBuilder()
+    override fun okhttp3.Headers.Builder.configureHeaders() = this
         .set("Referer", "$baseUrl/")
         .set("Accept", "text/html,application/xhtml+xml")
 
-    override fun popularMangaRequest(page: Int): Request = GET(
+    override fun getMangaUrl(manga: SManga): String = manga.url
+
+    override fun getChapterUrl(chapter: SChapter): String = chapter.url
+
+    override suspend fun getPopularManga(page: Int): MangasPage = client.get(
         catalogUrl(page).newBuilder()
             .addQueryParameter("orderby", "meta_value_num")
             .addQueryParameter("meta_key", "views")
             .build(),
-        headers,
-    )
+    ).asJsoup().toMangasPage(sortByViews = true)
 
-    override fun popularMangaParse(response: Response) = response.asJsoup().toMangasPage(sortByViews = true)
+    override suspend fun getLatestUpdates(page: Int): MangasPage = client.get(catalogUrl(page)).asJsoup().toMangasPage()
 
-    override fun latestUpdatesRequest(page: Int): Request = GET(catalogUrl(page), headers)
-    override fun latestUpdatesParse(response: Response) = response.asJsoup().toMangasPage()
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val url = baseUrl.toHttpUrl().newBuilder()
             .addQueryParameter("s", query)
             .addQueryParameter("paged", page.toString())
         filters.filterIsInstance<CategoryFilter>().firstOrNull()?.value()?.let { url.addQueryParameter("category_name", it) }
-        return GET(url.build(), headers)
+        return client.get(url.build()).asJsoup().toMangasPage()
     }
 
-    override fun searchMangaParse(response: Response) = response.asJsoup().toMangasPage()
+    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga = parseMangaDetails(client.get(url).asJsoup(), url.toString())
 
-    override fun mangaDetailsRequest(manga: SManga) = GET(manga.url.toHttpUrl(), headers)
-    override fun mangaDetailsParse(response: Response): SManga {
-        val doc = response.asJsoup()
+    override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { doc ->
+        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+            if (fetchDetails) parseMangaDetails(doc, getMangaUrl(manga)) else manga,
+            if (fetchChapters) listOf(chapterFromUrl(getMangaUrl(manga))) else chapters,
+        )
+    }
+
+    private fun parseMangaDetails(doc: Document, url: String): SManga {
         val title = doc.selectFirst(".post-conteudo > h1, .post-texto > h1")?.text()?.trim()
             ?: doc.selectFirst("h1")?.text().orEmpty()
         val cover = doc.selectFirst(".post-texto img[src*='/wp-content/uploads/']")?.absUrl("src")
@@ -64,26 +69,25 @@ abstract class TerceiroZ : HttpSource() {
             genre = doc.select(".post-tags a").joinToString { it.text().trim() }.ifBlank { null }
             status = SManga.COMPLETED
             initialized = true
+            setUrlWithoutDomain(url)
         }
     }
 
-    override fun chapterListRequest(manga: SManga) = mangaDetailsRequest(manga)
-    override fun chapterListParse(response: Response) = listOf(
-        SChapter.create().apply {
-            url = response.request.url.toString()
-            name = "Leitura completa"
-            chapter_number = 1f
-        },
-    )
+    private fun chapterFromUrl(url: String) = SChapter.create().apply {
+        this.url = url
+        name = "Leitura completa"
+        chapter_number = 1f
+    }
 
-    override fun pageListRequest(chapter: SChapter) = GET(chapter.url.toHttpUrl(), headers)
-    override fun pageListParse(response: Response): List<Page> {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val url = getChapterUrl(chapter)
+        val response = client.get(url)
         val doc = response.asJsoup()
         val images = doc.select(".post-info img").mapNotNull { image ->
             val source = sequenceOf("data-src", "data-lazy-src", "data-original", "src")
                 .map { image.attr(it) }.firstOrNull { it.isNotBlank() && !it.startsWith("data:image") }
                 ?: image.attr("srcset").substringBefore(',').substringBefore(' ').takeIf { it.isNotBlank() }
-            val url = source?.let { raw ->
+            val imageUrl = source?.let { raw ->
                 raw.replace("&amp;", "&").let {
                     when {
                         it.startsWith("//") -> "https:$it"
@@ -92,25 +96,22 @@ abstract class TerceiroZ : HttpSource() {
                     }
                 }
             } ?: return@mapNotNull null
-            if (!url.contains("/wp-content/uploads/")) return@mapNotNull null
+            if (!imageUrl.contains("/wp-content/uploads/")) return@mapNotNull null
             val alt = image.attr("alt")
-            val file = url.substringAfterLast('/').lowercase(Locale.ROOT)
+            val file = imageUrl.substringAfterLast('/').lowercase(Locale.ROOT)
             val isPage = alt.contains("página", true) || alt.contains("pagina", true) ||
                 file.matches(Regex("(?:^|[-_])\\d{1,3}(?:[-_.]|$).+"))
             val isPromo = file in PROMO_FILES || file.contains("banner") || file.contains("veja-completo") || file.contains("verfilme")
-            if (!isPage || isPromo) null else url
+            if (!isPage || isPromo) null else imageUrl
         }
         if (images.isEmpty()) throw IllegalStateException("Nenhuma página da HQ foi encontrada.")
-        return images.mapIndexed { index, image -> Page(index, response.request.url.toString(), image) }
+        return images.mapIndexed { index, image -> Page(index, url, image) }
     }
 
-    override fun imageRequest(page: Page): Request = GET(
-        page.imageUrl!!,
-        headers.newBuilder().set("Referer", page.url).build(),
-    )
+    override fun imageRequest(page: Page): Request = Request.Builder()
+        .url(page.imageUrl!!).headers(headers.newBuilder().set("Referer", page.url).build()).get().build()
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-    override fun getFilterList(): FilterList = FilterList(
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
         CategoryFilter(
             listOf(
                 "Todas" to "",

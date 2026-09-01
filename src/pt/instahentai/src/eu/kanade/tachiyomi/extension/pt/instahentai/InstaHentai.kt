@@ -1,45 +1,45 @@
 package eu.kanade.tachiyomi.extension.pt.instahentai
 
 import android.util.Log
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
-import okhttp3.Response
 import org.jsoup.nodes.Document
 
 @Source
-abstract class InstaHentai : HttpSource() {
+abstract class InstaHentai : KeiSource() {
 
     override val supportsLatest = true
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/melhores/page/$page/", headers)
+    override suspend fun getPopularManga(page: Int): MangasPage = client.get("$baseUrl/melhores/page/$page/").asJsoup().toMangasPage()
 
-    override fun popularMangaParse(response: Response): MangasPage = response.asJsoup().toMangasPage()
+    override suspend fun getLatestUpdates(page: Int): MangasPage = client.get(if (page == 1) baseUrl else "$baseUrl/page/$page/").asJsoup().toMangasPage()
 
-    override fun latestUpdatesRequest(page: Int): Request = if (page == 1) {
-        GET(baseUrl, headers)
-    } else {
-        GET("$baseUrl/page/$page/", headers)
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = client
+        .get("$baseUrl/page/$page/?s=${java.net.URLEncoder.encode(query, Charsets.UTF_8.name())}")
+        .asJsoup().toMangasPage()
+
+    override suspend fun getMangaByUrl(url: okhttp3.HttpUrl): SManga = parseMangaDetails(client.get(url).asJsoup()).apply {
+        setUrlWithoutDomain(url.toString())
     }
 
-    override fun latestUpdatesParse(response: Response): MangasPage = response.asJsoup().toMangasPage()
+    override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean) = client.get(getMangaUrl(manga)).asJsoup().let { document ->
+        eu.kanade.tachiyomi.source.model.SMangaUpdate(
+            if (fetchDetails) parseMangaDetails(document).apply { url = manga.url } else manga,
+            if (fetchChapters) parseChapterList(document) else chapters,
+        )
+    }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/page/$page/?s=${java.net.URLEncoder.encode(query, Charsets.UTF_8.name())}", headers)
-
-    override fun searchMangaParse(response: Response): MangasPage = response.asJsoup().toMangasPage()
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
+    private fun parseMangaDetails(document: Document): SManga {
         val manga = SManga.create()
         manga.title = document.selectFirst("h1")?.text()?.trim().orEmpty()
         manga.thumbnail_url = document.selectFirst("img[itemprop=image]")?.absUrl("src")
@@ -54,9 +54,7 @@ abstract class InstaHentai : HttpSource() {
         return manga
     }
 
-    override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
-
-    override fun chapterListParse(response: Response): List<SChapter> = response.asJsoup()
+    private fun parseChapterList(document: Document): List<SChapter> = document
         .select("a[href*=/ler/ler-]")
         .map { link ->
             SChapter.create().apply {
@@ -69,17 +67,14 @@ abstract class InstaHentai : HttpSource() {
         .distinctBy { it.url }
         .sortedWith(compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload })
 
-    override fun pageListRequest(chapter: SChapter): Request {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val echoUrl = getChapterUrl(chapter).toHttpUrl().newBuilder()
             .setQueryParameter("echo", "true")
             .build()
-        return GET(echoUrl, headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val echoUrl = response.request.url.toString()
+        val response = client.get(echoUrl)
         Log.d(DEBUG_TAG, "stage=ECHO_RESPONSE status=${response.code} contentType=${response.header("Content-Type")}")
         val document = response.asJsoup()
+        val echoUrlString = echoUrl.toString()
         val images = document.select(".cap img[src*=/static/], .cap img[data-src*=/static/]")
             .map { it.attr("data-src").ifBlank { it.attr("src") }.absoluteUrl(baseUrl) }
             .filter { it.contains("cdn.instahentai.com/static/") }
@@ -90,17 +85,13 @@ abstract class InstaHentai : HttpSource() {
             val url = image.toHttpUrl()
             Log.d(DEBUG_TAG, "stage=PAGE index=$index host=${url.host} path=${url.encodedPath}")
         }
-        return images.mapIndexed { index, image -> Page(index, url = echoUrl, imageUrl = image) }
+        return images.mapIndexed { index, image -> Page(index, url = echoUrlString, imageUrl = image) }
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    override fun imageRequest(page: Page): Request = Request.Builder()
+        .url(page.imageUrl!!).headers(headers.newBuilder().set("Referer", page.url).build()).get().build()
 
-    override fun imageRequest(page: Page): Request = GET(
-        page.imageUrl!!,
-        headers.newBuilder().set("Referer", page.url).build(),
-    )
-
-    override fun getFilterList(): FilterList = FilterList()
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList()
 
     override fun getMangaUrl(manga: SManga): String = baseUrl + manga.url
 
