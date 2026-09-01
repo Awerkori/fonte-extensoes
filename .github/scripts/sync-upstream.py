@@ -199,6 +199,8 @@ def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
     upstream_theme, upstream_lib = upstream
     text = local_path.read_text()
     original = text
+    local_lib = _LIB_VERSION_RE.search(text)
+    effective_lib = local_lib.group(1) if local_lib else upstream_lib
 
     def replace_or_insert(
         value: str | None,
@@ -218,7 +220,9 @@ def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
                 indent = marker.group(1) + "    "
                 text = text[:marker.start()] + f"{indent}{replacement}\n" + text[marker.start():]
 
-    replace_or_insert(upstream_lib, _LIB_VERSION_RE, "libVersion")
+    # libVersion selects the API surface used by the preserved Nox source.
+    # An explicit local value therefore has priority over upstream metadata.
+    replace_or_insert(effective_lib, _LIB_VERSION_RE, "libVersion")
     replace_or_insert(upstream_theme, _THEME_RE, "theme")
     if text == original:
         return False

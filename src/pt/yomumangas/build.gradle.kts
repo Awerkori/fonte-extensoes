@@ -8,7 +8,7 @@ keiyoushi {
     name = "Yomu Mangás"
     versionCode = 7
     contentWarning = ContentWarning.NSFW // or MIXED, please confirm
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "pt-BR"

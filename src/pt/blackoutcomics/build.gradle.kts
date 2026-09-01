@@ -8,7 +8,7 @@ keiyoushi {
     name = "Blackout Comics"
     versionCode = 12
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "pt-BR"
