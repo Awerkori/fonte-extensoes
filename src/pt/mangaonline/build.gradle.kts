@@ -8,7 +8,7 @@ keiyoushi {
     name = "Manga Online RED"
     versionCode = 60
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.6"
+    libVersion = "1.4"
 
     source {
         lang = "pt-BR"
