@@ -6,16 +6,14 @@ plugins {
 
 keiyoushi {
     name = "Mangas Brasuka"
-    versionCode = 58
+    versionCode = 57
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
+    theme = "aurora"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://mangasbrasuka.com.br"
+        baseUrl = "https://mangasbrasuka.org"
+        versionId = 2
     }
-}
-
-dependencies {
-    implementation(project(":lib:cookieinterceptor"))
 }

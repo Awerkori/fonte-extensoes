@@ -6,16 +6,14 @@ plugins {
 
 keiyoushi {
     name = "Leitor de Mangas"
-    versionCode = 55
+    versionCode = 54
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
+    theme = "aurora"
 
     source {
         lang = "pt-BR"
         baseUrl = "https://leitordemangas.com"
+        versionId = 2
     }
-}
-
-dependencies {
-    implementation(project(":lib:cookieinterceptor"))
 }
