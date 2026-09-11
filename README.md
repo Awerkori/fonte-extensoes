@@ -18,10 +18,10 @@ O projeto acompanha o ecossistema do **Keiyoushi**, mantendo suas atualizações
   https://github.com/Awerkori/extensoes
 
 - **Discord:**  
-  https://discord.gg/QpyjwsWENq
+[https://discord.com/invite/qNAMYUEmGj](https://discord.com/invite/qNAMYUEmGj)
 
 - **Fluxer:**  
-  https://fluxer.gg/q456UCVt
+[ [https://fluxer.gg/q456UCVt](https://web.canary.fluxer.app/invite/q456UCVt)](https://web.canary.fluxer.app/invite/q456UCVt)
 
 > Para adicionar o **Project Nox** ao Mihon ou forks compatíveis, copie o link do `index.pb` acima e adicione-o como repositório de extensões.
 
