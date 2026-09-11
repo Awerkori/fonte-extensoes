@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -312,6 +313,38 @@ def preflight_multisrc(
     return report, blocked
 
 
+def apply_structural_metadata_to_path(
+    gradle_path: Path,
+    theme: str | None,
+    lib_version: str | None,
+) -> bool:
+    if not gradle_path.exists():
+        return False
+    text = gradle_path.read_text()
+    original = text
+
+    def replace_or_insert(value: str | None, pattern: re.Pattern[str], key: str) -> None:
+        nonlocal text
+        if value is None:
+            text = pattern.sub("", text)
+            return
+        replacement = f'{key} = "{value}"'
+        if pattern.search(text):
+            text = pattern.sub(replacement, text, count=1)
+        else:
+            marker = re.search(r"(?m)^(\s*)source\s*\{", text)
+            if marker:
+                indent = marker.group(1)
+                text = text[:marker.start()] + f"{indent}{replacement}\n" + text[marker.start():]
+
+    replace_or_insert(lib_version, _LIB_VERSION_RE, "libVersion")
+    replace_or_insert(theme, _THEME_RE, "theme")
+    if text == original:
+        return False
+    gradle_path.write_text(text)
+    return True
+
+
 def verify_migration_plan(
     report: dict[str, list[dict[str, object]]],
     upstream_ref: str,
@@ -330,10 +363,13 @@ def verify_migration_plan(
         return set()
     blocked: set[str] = set()
     root = Path.cwd()
+    base = git("merge-base", "HEAD", upstream_ref).strip()
     with tempfile.TemporaryDirectory(prefix="nox-sync-preflight-") as directory:
         sandbox = Path(directory) / "repo"
         git("worktree", "add", "--detach", str(sandbox), "HEAD")
         try:
+            if Path("local.properties").exists():
+                shutil.copy("local.properties", sandbox / "local.properties")
             for theme, units in candidates.items():
                 result = subprocess.run(
                     ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", f"lib-multisrc/{theme}"],
@@ -352,10 +388,16 @@ def verify_migration_plan(
                     if target is None:
                         blocked.add(theme)
                         break
-                    text = local.read_text()
-                    text = _LIB_VERSION_RE.sub(f'libVersion = "{target[1]}"', text, count=1)
-                    text = _THEME_RE.sub(f'theme = "{target[0]}"', text, count=1)
-                    local.write_text(text)
+                    apply_structural_metadata_to_path(local, target[0], target[1])
+                    # Structural file removals: delete files in unit that upstream removed vs base
+                    deleted = subprocess.run(
+                        ["git", "diff", "--name-only", "--diff-filter=D", base, upstream_ref, "--", unit],
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    for df in deleted:
+                        if df.strip():
+                            (sandbox / df.strip()).unlink(missing_ok=True)
                 if theme in blocked:
                     continue
                 # Metadata generation does not compile the protected source and
@@ -391,38 +433,10 @@ def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
         return False
 
     upstream_theme, upstream_lib = upstream
-    text = local_path.read_text()
-    original = text
-
-    def replace_or_insert(
-        value: str | None,
-        pattern: re.Pattern[str],
-        key: str,
-    ) -> None:
-        nonlocal text
-        if value is None:
-            text = pattern.sub("", text)
-            return
-        replacement = f'{key} = "{value}"'
-        if pattern.search(text):
-            text = pattern.sub(replacement, text, count=1)
-        else:
-            marker = re.search(r"(?m)^(\s*)source\s*\{", text)
-            if marker:
-                indent = marker.group(1) + "    "
-                text = text[:marker.start()] + f"{indent}{replacement}\n" + text[marker.start():]
-
-    # A caller reaches this function only after pre-flight proved this migration
-    # builds in an isolated worktree.  Keeping an old local selector here would
-    # create the forbidden old-source/old-lib/new-multisrc hybrid.
-    replace_or_insert(upstream_lib, _LIB_VERSION_RE, "libVersion")
-    replace_or_insert(upstream_theme, _THEME_RE, "theme")
-    if text == original:
-        return False
-
-    local_path.write_text(text)
-    print(f"Structural metadata: {unit} -> theme={upstream_theme or 'none'}, libVersion={upstream_lib or 'none'}")
-    return True
+    changed = apply_structural_metadata_to_path(local_path, upstream_theme, upstream_lib)
+    if changed:
+        print(f"Structural metadata: {unit} -> theme={upstream_theme or 'none'}, libVersion={upstream_lib or 'none'}")
+    return changed
 
 
 def bump_after_structural_change(unit: str, previous_info: tuple[int, int, int] | None) -> bool:
@@ -579,16 +593,36 @@ def apply_units(
 ) -> list[str]:
     git("merge", "--no-ff", "--no-commit", "-s", "ours", upstream_ref)
 
-    # 1. Apply upstream units (except conflict units where Nox wins)
+    local_deps = dependency_map(None)
+    upstream_deps = dependency_map(upstream_ref)
+    blocked_theme_extensions = {
+        ext
+        for theme in blocked_themes
+        for ext in (local_deps.get(theme, []) + upstream_deps.get(theme, []))
+    }
+    base = git("merge-base", "HEAD", upstream_ref).strip()
+
+    # 1. Apply upstream units (except conflict units where Nox wins, and deferred themes/extensions)
     for unit in units:
         if unit.startswith("lib-multisrc/") and unit.split("/", 1)[1] in blocked_themes:
             print(f"Deferred structural migration: {unit}")
+            continue
+        if unit in blocked_theme_extensions:
+            print(f"Deferred structural migration (atomic with theme): {unit}")
             continue
         if unit in conflict_units and not unit.startswith("lib-multisrc/"):
             if unit in structural_units:
                 previous_info = effective_version_code(None, unit)
                 changed = merge_structural_metadata(unit, upstream_ref)
                 version_changed = bump_after_structural_change(unit, previous_info) if changed else False
+                deleted = subprocess.run(
+                    ["git", "diff", "--name-only", "--diff-filter=D", base, upstream_ref, "--", unit],
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                for df in deleted:
+                    if df.strip() and Path(df.strip()).exists():
+                        git("rm", "--quiet", "--", df.strip())
                 if changed or version_changed:
                     git("add", "--", f"{unit}/build.gradle.kts")
             continue
@@ -607,6 +641,14 @@ def apply_units(
         previous_info = effective_version_code(None, unit)
         changed = merge_structural_metadata(unit, upstream_ref)
         version_changed = bump_after_structural_change(unit, previous_info) if changed else False
+        deleted = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=D", base, upstream_ref, "--", unit],
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        for df in deleted:
+            if df.strip() and Path(df.strip()).exists():
+                git("rm", "--quiet", "--", df.strip())
         if changed or version_changed:
             git("add", "--", f"{unit}/build.gradle.kts")
 

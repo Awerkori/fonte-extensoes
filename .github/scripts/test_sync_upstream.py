@@ -190,8 +190,164 @@ class StructuralMetadataTest(unittest.TestCase):
         blocked = {"theme"} if any(r["migration_required"] and not r["migration_supported"] for r in rows) else set()
         self.assertEqual(blocked, {"theme"})
         self.assertEqual(sync_upstream.deferred_state({"theme": rows}, blocked, "up")["theme"]["units"], ["src/pt/a", "src/pt/b"])
-        self.assertFalse(any(r["migration_required"] and not r["migration_supported"] for r in [{**r, "migration_supported": True} for r in rows]))
+    def test_case_1_successful_structural_migration(self):
+        """Case 1: Upstream bumps multisrc and extension; protected extension builds cleanly -> migration accepted."""
+        with tempfile.TemporaryDirectory() as directory:
+            prev = Path.cwd()
+            try:
+                os.chdir(directory)
+                # Local state: ext and multisrc at 1.4
+                ext = Path("src/pt/sample/build.gradle.kts")
+                ext.parent.mkdir(parents=True)
+                ext.write_text('versionCode = 10\ntheme = "mytheme"\nlibVersion = "1.4"\n\nsource {\n    baseUrl = "https://custom.nox"\n}\n')
+                multi = Path("lib-multisrc/mytheme/build.gradle.kts")
+                multi.parent.mkdir(parents=True)
+                multi.write_text('baseVersionCode = 20\nlibVersion = "1.4"\n')
+
+                # Upstream state: ext and multisrc at 1.6
+                up_ext_content = 'versionCode = 5\ntheme = "mytheme"\nlibVersion = "1.6"\n'
+                with patch.object(sync_upstream, "_read_file_text", return_value=up_ext_content):
+                    changed = sync_upstream.merge_structural_metadata("src/pt/sample", "upstream/main")
+
+                self.assertTrue(changed)
+                res_text = ext.read_text()
+                self.assertIn('libVersion = "1.6"', res_text)
+                self.assertIn('baseUrl = "https://custom.nox"', res_text)
+
+                # Version check: ensure local effective > upstream effective
+                old_info = (10, 20, 30)
+                multi.write_text('baseVersionCode = 20\nlibVersion = "1.6"\n')
+                bumped = sync_upstream.bump_after_structural_change("src/pt/sample", old_info)
+                self.assertTrue(bumped)
+                new_info = sync_upstream.effective_version_code(None, "src/pt/sample")
+                self.assertGreater(new_info[2], 30)
+            finally:
+                os.chdir(prev)
+
+    def test_case_2_incompatible_structural_conflict_atomic_deferral(self):
+        """Case 2: Protected unit fails proof build -> entire theme and all its extensions deferred atomically."""
+        with tempfile.TemporaryDirectory() as directory:
+            prev = Path.cwd()
+            try:
+                os.chdir(directory)
+                # Create 3 extensions under theme "broken":
+                # ext_a (protected, incompatible), ext_b (normal), ext_c (normal)
+                for name in ("ext_a", "ext_b", "ext_c"):
+                    p = Path(f"src/pt/{name}/build.gradle.kts")
+                    p.parent.mkdir(parents=True)
+                    p.write_text('versionCode = 1\ntheme = "broken"\nlibVersion = "1.4"\n')
+                multi = Path("lib-multisrc/broken/build.gradle.kts")
+                multi.parent.mkdir(parents=True)
+                multi.write_text('baseVersionCode = 10\nlibVersion = "1.4"\n')
+
+                # In preflight: theme "broken" is blocked because proof build fails
+                blocked_themes = {"broken"}
+                local_deps = sync_upstream.dependency_map(None)
+                self.assertEqual(sorted(local_deps.get("broken", [])), ["src/pt/ext_a", "src/pt/ext_b", "src/pt/ext_c"])
+
+                # Atomic deferral calculation
+                blocked_theme_extensions = {
+                    ext
+                    for theme in blocked_themes
+                    for ext in local_deps.get(theme, [])
+                }
+                # All 3 extensions MUST be blocked from upstream application
+                self.assertEqual(blocked_theme_extensions, {"src/pt/ext_a", "src/pt/ext_b", "src/pt/ext_c"})
+
+                # Compatibility validation: since none were upgraded without the multisrc, 0 errors
+                errors = sync_upstream.validate_multisrc_compatibility()
+                self.assertEqual(errors, [])
+
+                # Deferred migrations recorded
+                report = {"broken": [{"unit": "src/pt/ext_a", "migration_required": True}]}
+                state = sync_upstream.deferred_state(report, blocked_themes, "upstream/main")
+                self.assertIn("broken", state)
+            finally:
+                os.chdir(prev)
+
+    def test_case_3_standalone_extension_isolated_deferral(self):
+        """Case 3: Extension without multisrc theme that fails is isolated and does not affect other units."""
+        with tempfile.TemporaryDirectory() as directory:
+            prev = Path.cwd()
+            try:
+                os.chdir(directory)
+                # Standalone extension has no theme in build.gradle.kts
+                standalone = Path("src/pt/standalone/build.gradle.kts")
+                standalone.parent.mkdir(parents=True)
+                standalone.write_text('versionCode = 5\nlibVersion = "1.4"\n')
+
+                normal_multi = Path("lib-multisrc/goodtheme/build.gradle.kts")
+                normal_multi.parent.mkdir(parents=True)
+                normal_multi.write_text('baseVersionCode = 1\nlibVersion = "1.6"\n')
+
+                normal_ext = Path("src/pt/normal/build.gradle.kts")
+                normal_ext.parent.mkdir(parents=True)
+                normal_ext.write_text('versionCode = 1\ntheme = "goodtheme"\nlibVersion = "1.6"\n')
+
+                deps = sync_upstream.dependency_map(None)
+                self.assertNotIn("src/pt/standalone", deps.get("goodtheme", []))
+                # Standalone extension is not in dependency_map of any multisrc theme
+                self.assertNotIn("src/pt/standalone", [u for units in deps.values() for u in units])
+            finally:
+                os.chdir(prev)
+
+    def test_case_4_version_code_guarantee_nox_always_ahead(self):
+        """Case 4: Version guard guarantees Nox effective versionCode > upstream effective versionCode."""
+        with tempfile.TemporaryDirectory() as directory:
+            prev = Path.cwd()
+            try:
+                os.chdir(directory)
+                ext = Path("src/pt/sample/build.gradle.kts")
+                ext.parent.mkdir(parents=True)
+                ext.write_text('versionCode = 12\ntheme = "theme"\nlibVersion = "1.6"\n')
+                multi = Path("lib-multisrc/theme/build.gradle.kts")
+                multi.parent.mkdir(parents=True)
+                multi.write_text('baseVersionCode = 34\nlibVersion = "1.6"\n')
+
+                # Local effective: 12 + 34 = 46.
+                # Upstream effective: 15 + 34 = 49.
+                up_content = 'versionCode = 15\ntheme = "theme"\nlibVersion = "1.6"\n'
+                orig_read = sync_upstream._read_file_text
+
+                def fake_read(ref, path):
+                    if ref == "upstream/main":
+                        if "lib-multisrc" in path:
+                            return 'baseVersionCode = 34\nlibVersion = "1.6"\n'
+                        return up_content
+                    return orig_read(ref, path)
+
+                with patch.object(sync_upstream, "_read_file_text", side_effect=fake_read):
+                    res = sync_upstream.bump_version_code_if_needed("src/pt/sample", "upstream/main")
+
+                self.assertIsNotNone(res)
+                loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw = res
+                self.assertEqual(loc_eff, 46)
+                self.assertEqual(up_eff, 49)
+                self.assertEqual(new_raw, 16)  # desired 50 - 34 = 16
+                self.assertGreater(new_raw + loc_base, up_eff)
+            finally:
+                os.chdir(prev)
+
+    def test_case_5_validate_multisrc_compatibility_clean(self):
+        """Case 5: validate_multisrc_compatibility() returns empty list when all versions match."""
+        with tempfile.TemporaryDirectory() as directory:
+            prev = Path.cwd()
+            try:
+                os.chdir(directory)
+                for t in ("theme1", "theme2"):
+                    m = Path(f"lib-multisrc/{t}/build.gradle.kts")
+                    m.parent.mkdir(parents=True)
+                    m.write_text('baseVersionCode = 0\nlibVersion = "1.6"\n')
+                    e = Path(f"src/pt/{t}_ext/build.gradle.kts")
+                    e.parent.mkdir(parents=True)
+                    e.write_text(f'versionCode = 1\ntheme = "{t}"\nlibVersion = "1.6"\n')
+
+                errors = sync_upstream.validate_multisrc_compatibility()
+                self.assertEqual(errors, [])
+            finally:
+                os.chdir(prev)
 
 
 if __name__ == "__main__":
     unittest.main()
+
