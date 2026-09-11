@@ -1,7 +1,10 @@
 package eu.kanade.tachiyomi.extension.pt.mangastop
 
 import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.multisrc.mangathemesia.ClientHintsInterceptor
+import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -9,7 +12,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.lib.cookieinterceptor.CookieInterceptor
 import keiyoushi.lib.randomua.addRandomUAPreference
@@ -18,6 +21,7 @@ import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstanceOrNull
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
@@ -28,7 +32,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
 import java.text.ParseException
 import java.text.SimpleDateFormat
@@ -36,19 +39,17 @@ import java.util.Locale
 
 @Source
 abstract class MangaStop :
-    HttpSource(),
+    MangaThemesia(),
     ConfigurableSource {
-
-    override val supportsLatest = true
 
     private val apiUrl get() = "$baseUrl/wp-json/mangastop/v1"
 
     private val json: Json by injectLazy()
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
+    private val dateFormatCustom = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
 
-    override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor(
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor(
             Interceptor { chain ->
                 val request = chain.request()
                 if (request.url.host.contains("images")) {
@@ -63,23 +64,27 @@ abstract class MangaStop :
                 }
             },
         )
-        .addNetworkInterceptor(CookieInterceptor(baseUrl.substringAfter("//"), "wpmanga-ada" to "1"))
-        .addInterceptor(ClientHintsInterceptor())
-        .rateLimit(2)
-        .build()
+        addNetworkInterceptor(CookieInterceptor(baseUrl.substringAfter("//"), "wpmanga-ada" to "1"))
+        addInterceptor(ClientHintsInterceptor())
+        rateLimit(2)
+    }
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Accept", "application/json, text/plain, */*")
-        .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-        .set("Origin", baseUrl)
-        .set("Referer", "$baseUrl/")
-        .setRandomUserAgent()
+    override fun Headers.Builder.configureHeaders() = apply {
+        set("Accept", "application/json, text/plain, */*")
+        set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+        set("Origin", baseUrl)
+        set("Referer", "$baseUrl/")
+        setRandomUserAgent()
+    }
 
     // ============================== Popular ===============================
 
-    override fun popularMangaRequest(page: Int): Request = GET("$apiUrl/mais-populares?pagina=$page&por_pagina=20", headers)
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val request = GET("$apiUrl/mais-populares?pagina=$page&por_pagina=20", headers)
+        return popularMangaParse(client.newCall(request).awaitSuccess())
+    }
 
-    override fun popularMangaParse(response: Response): MangasPage {
+    private fun popularMangaParse(response: okhttp3.Response): MangasPage {
         val data = json.decodeFromString<JsonObject>(response.body.string())
         val mangasArray = data["mangas"]?.jsonArray ?: return MangasPage(emptyList(), false)
         val paginacao = data["paginacao"]?.jsonObject
@@ -102,14 +107,17 @@ abstract class MangaStop :
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$apiUrl/recentes?pagina=$page&por_pagina=24&tipo=Manhwa", headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val request = GET("$apiUrl/recentes?pagina=$page&por_pagina=24&tipo=Manhwa", headers)
+        return popularMangaParse(client.newCall(request).awaitSuccess())
+    }
 
     // =============================== Search ===============================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        if (query.isNotBlank()) {
+    // =============================== Search ===============================
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val request = if (query.isNotBlank()) {
             val url = "$apiUrl/busca".toHttpUrl().newBuilder().apply {
                 addQueryParameter("pagina", page.toString())
                 addQueryParameter("q", query)
@@ -120,7 +128,7 @@ abstract class MangaStop :
                 }
             }.build()
 
-            return GET(url.toString(), headers)
+            GET(url.toString(), headers)
         } else {
             val url = "$apiUrl/manga".toHttpUrl().newBuilder().apply {
                 addQueryParameter("pagina", page.toString())
@@ -132,11 +140,10 @@ abstract class MangaStop :
                 }
             }.build()
 
-            return GET(url.toString(), headers)
+            GET(url.toString(), headers)
         }
-    }
 
-    override fun searchMangaParse(response: Response): MangasPage {
+        val response = client.newCall(request).awaitSuccess()
         val requestUrl = response.request.url.toString()
         if (requestUrl.contains("/busca")) {
             val data = json.decodeFromString<JsonObject>(response.body.string())
@@ -164,11 +171,55 @@ abstract class MangaStop :
         }
     }
 
-    // =========================== Manga Details ============================
+    // =========================== Manga Details & Chapters ============================
 
-    override fun mangaDetailsRequest(manga: SManga): Request {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
         val id = manga.url.substringAfter("/obra/").substringBefore("#")
-        return GET("$apiUrl/obra/$id", headers)
+        val response = client.newCall(GET("$apiUrl/obra/$id", headers)).awaitSuccess()
+        val obj = json.decodeFromString<JsonObject>(response.body.string())
+
+        val details = if (fetchDetails) {
+            SManga.create().apply {
+                title = obj["titulo"]?.jsonPrimitive?.content ?: ""
+                thumbnail_url = obj["capa_url"]?.jsonPrimitive?.content ?: obj["thumbnail"]?.jsonPrimitive?.content
+
+                var syn = obj["sinopse"]?.jsonPrimitive?.content ?: obj["descricao_html"]?.jsonPrimitive?.content ?: obj["descricao"]?.jsonPrimitive?.content ?: ""
+                syn = syn.replace("<p>", "").replace("</p>", "\n").replace("<br />", "\n").replace("<br>", "\n").trim()
+                description = syn
+
+                author = obj["manga_autor"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" } ?: obj["autor"]?.jsonPrimitive?.content
+                artist = obj["manga_artista"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" } ?: obj["artista"]?.jsonPrimitive?.content
+
+                genre = obj["generos"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" }
+
+                status = customParseStatus(obj["status"]?.jsonPrimitive?.content)
+            }
+        } else {
+            manga
+        }
+
+        val chList = if (fetchChapters) {
+            val chaptersArray = obj["capitulos"]?.jsonArray ?: return SMangaUpdate(details, emptyList())
+            chaptersArray.map {
+                val chObj = it.jsonObject
+                SChapter.create().apply {
+                    val chId = chObj["id"]?.jsonPrimitive?.content ?: ""
+                    url = "/leitor/$chId"
+                    chapter_number = chObj["numero"]?.jsonPrimitive?.content?.toFloatOrNull() ?: -1f
+                    name = "Capítulo ${chObj["numero"]?.jsonPrimitive?.content}"
+                    date_upload = parseDate(chObj["data"]?.jsonPrimitive?.content)
+                }
+            }.sortedByDescending { it.chapter_number }
+        } else {
+            chapters
+        }
+
+        return SMangaUpdate(details, chList)
     }
 
     override fun getMangaUrl(manga: SManga): String {
@@ -176,27 +227,7 @@ abstract class MangaStop :
         return "$baseUrl/manga/$slug"
     }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val obj = json.decodeFromString<JsonObject>(response.body.string())
-
-        return SManga.create().apply {
-            title = obj["titulo"]?.jsonPrimitive?.content ?: ""
-            thumbnail_url = obj["capa_url"]?.jsonPrimitive?.content ?: obj["thumbnail"]?.jsonPrimitive?.content
-
-            var syn = obj["sinopse"]?.jsonPrimitive?.content ?: obj["descricao_html"]?.jsonPrimitive?.content ?: obj["descricao"]?.jsonPrimitive?.content ?: ""
-            syn = syn.replace("<p>", "").replace("</p>", "\n").replace("<br />", "\n").replace("<br>", "\n").trim()
-            description = syn
-
-            author = obj["manga_autor"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" } ?: obj["autor"]?.jsonPrimitive?.content
-            artist = obj["manga_artista"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" } ?: obj["artista"]?.jsonPrimitive?.content
-
-            genre = obj["generos"]?.jsonArray?.joinToString { it.jsonObject["nome"]?.jsonPrimitive?.content ?: "" }
-
-            status = parseStatus(obj["status"]?.jsonPrimitive?.content)
-        }
-    }
-
-    private fun parseStatus(status: String?) = when {
+    private fun customParseStatus(status: String?) = when {
         status == null -> SManga.UNKNOWN
         status.contains("Ongoing", ignoreCase = true) -> SManga.ONGOING
         status.contains("Completed", ignoreCase = true) -> SManga.COMPLETED
@@ -204,32 +235,12 @@ abstract class MangaStop :
         else -> SManga.UNKNOWN
     }
 
-    // ============================== Chapters ==============================
-
-    override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val obj = json.decodeFromString<JsonObject>(response.body.string())
-        val chaptersArray = obj["capitulos"]?.jsonArray ?: return emptyList()
-
-        return chaptersArray.map {
-            val chObj = it.jsonObject
-            SChapter.create().apply {
-                val id = chObj["id"]?.jsonPrimitive?.content ?: ""
-                url = "/leitor/$id"
-                chapter_number = chObj["numero"]?.jsonPrimitive?.content?.toFloatOrNull() ?: -1f
-                name = "Capítulo ${chObj["numero"]?.jsonPrimitive?.content}"
-                date_upload = parseDate(chObj["data"]?.jsonPrimitive?.content)
-            }
-        }.sortedByDescending { it.chapter_number }
-    }
-
     override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
 
     private fun parseDate(dateStr: String?): Long {
         if (dateStr == null) return 0L
         return try {
-            dateFormat.parse(dateStr)?.time ?: 0L
+            dateFormatCustom.parse(dateStr)?.time ?: 0L
         } catch (e: ParseException) {
             0L
         }
@@ -237,12 +248,9 @@ abstract class MangaStop :
 
     // =============================== Pages ================================
 
-    override fun pageListRequest(chapter: SChapter): Request {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val id = chapter.url.substringAfter("/leitor/")
-        return GET("$apiUrl/leitor/$id", headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
+        val response = client.newCall(GET("$apiUrl/leitor/$id", headers)).awaitSuccess()
         val obj = json.decodeFromString<JsonObject>(response.body.string())
         val imagesArray = obj["imagens"]?.jsonArray ?: return emptyList()
 
@@ -251,8 +259,6 @@ abstract class MangaStop :
             Page(i, imageUrl = url)
         }
     }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
 
     override fun imageRequest(page: Page): Request {
         val newHeaders = headersBuilder()
@@ -267,7 +273,7 @@ abstract class MangaStop :
 
     // ============================== Filters ===============================
 
-    override fun getFilterList() = FilterList(
+    override fun getFilterList(data: JsonElement?) = FilterList(
         TypeFilter(),
     )
 
