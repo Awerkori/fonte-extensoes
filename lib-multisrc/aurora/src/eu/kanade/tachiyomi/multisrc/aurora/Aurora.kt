@@ -51,7 +51,10 @@ abstract class Aurora : KeiSource() {
 
     override fun getMangaUrl(manga: SManga): String = entryURL(manga.memo)
 
-    override fun getChapterUrl(chapter: SChapter) = "${entryURL(chapter.memo)}/${chapter.chapter_number}"
+    override fun getChapterUrl(chapter: SChapter): String {
+        val number = chapter.memo["number"]?.string ?: chapter.chapter_number.toString().removeSuffix(".0")
+        return "${entryURL(chapter.memo)}/$number"
+    }
 
     private fun entryURL(memo: JsonObject): String = "$baseUrl/${memo["type"]!!.string}/${memo["slug"]!!.string}"
 
@@ -92,35 +95,56 @@ abstract class Aurora : KeiSource() {
                 }
         }
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val pageHeaders = headersBuilder()
-            .set("rsc", "1")
-            .set("Referer", entryURL(chapter.memo))
-            .set("Sec-Fetch-Mode", "cors")
-            .set("Sec-Fetch-Dest", "empty")
-            .set("Sec-Fetch-Site", "same-origin")
-            .set("next-url", entryURL(chapter.memo).toHttpUrl().encodedPath)
-            .set("Accept", "*/*")
-            .build()
-        val response = client
-            .newBuilder()
-            .addCookie("mnx_gate_${chapter.chapter_number}" to "1")
-            .build()
-            .get(getChapterUrl(chapter), pageHeaders)
+    private val gateTiming = GateTiming()
 
-        return response.extractNextJs<PagesDto>()?.toPageList { encodedUrl ->
-            decrypt(encodedUrl, getKey(encodedUrl))
-        } ?: emptyList()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        val counts = linkedMapOf<String, Int>()
+        var status = 0
+        fun read(response: Response): ReaderPayload = response.use {
+            status = it.code
+            extractReader(it.body.string(), it.header("Content-Type").orEmpty(), chapterUrl).also { payload ->
+                counts[payload.format] = payload.urls.size
+            }
+        }
+
+        var payload = read(client.get(chapterUrl, readerHeaders(chapter), ensureSuccess = false))
+        if (payload.gated) {
+            val response = unlockReader(client, chapterUrl, readerHeaders(chapter, rsc = false), gateTiming)
+            counts["gate"] = 1
+            payload = read(response)
+        }
+        if (payload.urls.isEmpty() && !payload.gated && status in 200..299) {
+            payload = read(client.get(chapterUrl, readerHeaders(chapter, rsc = false), ensureSuccess = false))
+        }
+        if (payload.urls.isEmpty()) readerFailure(name, chapterUrl, status, counts)
+
+        val urls = try {
+            decodePages(payload.urls, chapterUrl, ::getKey)
+        } catch (_: IllegalArgumentException) {
+            readerFailure(name, chapterUrl, status, counts + ("decrypt" to 0))
+        }
+        if (urls.isEmpty()) readerFailure(name, chapterUrl, status, counts + ("urls" to 0))
+        return urls.mapIndexed { index, url -> Page(index, imageUrl = url) }
     }
 
-    private var key: String? = null
-    suspend fun getKey(payload: String): String {
-        if (!key.isNullOrBlank()) {
-            return key!!
+    private fun readerHeaders(chapter: SChapter, rsc: Boolean = true): Headers {
+        val builder = headersBuilder()
+            .set("Referer", entryURL(chapter.memo))
+        if (rsc) {
+            builder
+                .set("rsc", "1")
+                .set("Sec-Fetch-Mode", "cors")
+                .set("Sec-Fetch-Dest", "empty")
+                .set("Sec-Fetch-Site", "same-origin")
+                .set("next-url", entryURL(chapter.memo).toHttpUrl().encodedPath)
+                .set("Accept", "*/*")
         }
-        val (v, e) = getParams(payload)
-        return client.get("$baseUrl/api/atfield/key?v=$v&e=$e").parseAs<KeyDto>().k.also {
-            key = it
-        }
+        return builder.build()
+    }
+
+    private suspend fun getKey(params: Pair<Int, Long>): String {
+        val (v, e) = params
+        return client.get("$baseUrl/api/atfield/key?v=$v&e=$e").parseAs<KeyDto>().k
     }
 }

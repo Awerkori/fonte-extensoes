@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.multisrc.aurora
 
-import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.string
@@ -97,11 +96,7 @@ class ChapterDto(
 @Serializable
 class PagesDto(
     val pages: List<ImageDto>,
-) {
-    suspend fun toPageList(decode: suspend (String) -> String) = pages.mapIndexed { index, image ->
-        Page(index, imageUrl = decode(image.url))
-    }
-}
+)
 
 @Serializable
 class ImageDto(
