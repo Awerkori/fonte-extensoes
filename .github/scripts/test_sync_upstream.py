@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -348,6 +349,286 @@ class StructuralMetadataTest(unittest.TestCase):
                 os.chdir(prev)
 
 
+class ProtectedMultisrcTest(unittest.TestCase):
+    theme = "sample"
+    unit = "lib-multisrc/sample"
+    extensions = ["src/pt/one", "src/pt/two"]
+
+    def setUp(self):
+        self.previous = Path.cwd()
+        self.directory = tempfile.TemporaryDirectory(prefix="nox-sync-test-")
+        os.chdir(self.directory.name)
+        self.addCleanup(self.cleanup)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@invalid")
+        self.git("config", "user.name", "Sync test")
+        self.write(f"{self.unit}/build.gradle.kts", 'libVersion = "1.6"\nbaseVersionCode = 3\n')
+        self.write(f"{self.unit}/Reader.kt", "reader = old\n" + "\n" * 12 + "backend = old\n")
+        for unit in self.extensions:
+            self.write(f"{unit}/build.gradle.kts", 'versionCode = 1\ntheme = "sample"\nlibVersion = "1.6"\n')
+        self.write("gradlew", "#!/usr/bin/env python3\nimport pathlib, sys\np = pathlib.Path('lib-multisrc/sample')\nassert 'reader = nox' in (p/'Reader.kt').read_text()\nassert 'too_fast' in (p/'Gate.kt').read_text()\nassert ':lib-multisrc:sample:testDebugUnitTest' in sys.argv\nfor name in ('one', 'two'):\n assert f':src:pt:{name}:assembleDebug' in sys.argv\n assert (p/'build.gradle.kts').read_text().splitlines()[0] in pathlib.Path(f'src/pt/{name}/build.gradle.kts').read_text()\n")
+        Path("gradlew").chmod(0o755)
+        self.base = self.commit("base")
+        self.git("branch", "upstream", self.base)
+        self.git("branch", "nox", self.base)
+        self.git("checkout", "-q", "nox")
+
+    def cleanup(self):
+        os.chdir(self.previous)
+        self.directory.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(self, path, text):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", ".")
+        self.git("commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def nox_patch(self):
+        path = Path(f"{self.unit}/Reader.kt")
+        path.write_text(path.read_text().replace("reader = old", "reader = nox"))
+        self.write(f"{self.unit}/Gate.kt", "too_fast retry once\n")
+        self.commit("functional Nox patch")
+
+    def advance(self, conflict=False, structural=False, fail_build=False):
+        self.git("checkout", "-q", "upstream")
+        path = Path(f"{self.unit}/Reader.kt")
+        path.write_text(path.read_text().replace("reader = old" if conflict else "backend = old", "reader = upstream" if conflict else "backend = new"))
+        if structural:
+            for path in [f"{self.unit}/build.gradle.kts", *(f"{unit}/build.gradle.kts" for unit in self.extensions)]:
+                p = Path(path)
+                p.write_text(p.read_text().replace('"1.6"', '"1.7"'))
+        if fail_build:
+            self.write("gradlew", "#!/bin/sh\nexit 1\n")
+        self.write("unrelated.txt", "upstream advance\n")
+        self.commit("upstream update")
+        self.git("checkout", "-q", "nox")
+
+    def prove(self):
+        before = self.git("status", "--porcelain")
+        index = self.git("write-tree")
+        result = sync_upstream.prove_protected_multisrc(self.base, "upstream", [], set())
+        self.assertEqual(self.git("status", "--porcelain"), before)
+        self.assertEqual(self.git("write-tree"), index)
+        return result
+
+    def test_a_upstream_only_multisrc_is_not_protected(self):
+        self.advance()
+        self.assertEqual(sync_upstream.protected_multisrc_bases(self.base, "upstream"), {})
+        self.assertEqual(self.prove(), ({}, {}))
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], set(), [], [], set(), {})
+        self.assertIn("backend = new", Path(f"{self.unit}/Reader.kt").read_text())
+
+    def test_b_unchanged_upstream_preserves_patch_without_build(self):
+        self.nox_patch()
+        self.git("checkout", "-q", "upstream")
+        self.write("unrelated.txt", "unrelated update\n")
+        self.commit("unrelated upstream change")
+        self.git("checkout", "-q", "nox")
+        self.assertEqual(sync_upstream.protected_multisrc_bases(self.base, "upstream"), {self.theme: self.base})
+        self.assertEqual(self.prove(), ({}, {}))
+        self.assertIn("reader = nox", Path(f"{self.unit}/Reader.kt").read_text())
+
+    def test_c_functional_merge_builds_all_dependents_and_tests(self):
+        self.nox_patch()
+        self.advance()
+        accepted, deferred = self.prove()
+        self.assertFalse(deferred)
+        tree = accepted[self.theme]["tree"]
+        reader = self.git("show", f"{tree}:{self.unit}/Reader.kt")
+        self.assertIn("reader = nox", reader)
+        self.assertIn("backend = new", reader)
+        self.assertEqual(accepted[self.theme]["units"], self.extensions)
+
+    def test_d_structural_upgrade_keeps_functional_delta(self):
+        self.nox_patch()
+        path = Path(f"{self.unit}/build.gradle.kts")
+        path.write_text(path.read_text() + "\n// Nox test configuration\n")
+        self.commit("test configuration")
+        self.advance(structural=True)
+        accepted, deferred = self.prove()
+        self.assertFalse(deferred)
+        tree = accepted[self.theme]["tree"]
+        gradle = self.git("show", f"{tree}:{self.unit}/build.gradle.kts")
+        self.assertIn('"1.7"', gradle)
+        self.assertIn("Nox test configuration", gradle)
+        self.assertIn("too_fast", self.git("show", f"{tree}:{self.unit}/Gate.kt"))
+
+    def test_e_conflict_defers_theme_and_all_dependents(self):
+        self.nox_patch()
+        self.advance(conflict=True, structural=True)
+        accepted, deferred = self.prove()
+        self.assertFalse(accepted)
+        self.assertEqual(deferred[self.theme]["patch_base"], self.base)
+        self.assertEqual(deferred[self.theme]["units"], self.extensions)
+        self.assertIn("functional conflict", deferred[self.theme]["reason"])
+
+    def test_f_build_failure_defers_without_touching_main(self):
+        self.nox_patch()
+        self.advance(fail_build=True)
+        accepted, deferred = self.prove()
+        self.assertFalse(accepted)
+        self.assertEqual(deferred[self.theme]["reason"], "proof build/tests failed")
+
+    def test_g_deferred_retry_keeps_original_base_after_ours_merge(self):
+        self.nox_patch()
+        self.advance(conflict=True)
+        _, deferred = self.prove()
+        sync_upstream.write_deferred_migrations(deferred)
+        self.commit("deferred backlog")
+        self.git("merge", "-s", "ours", "--no-edit", "upstream")
+        self.git("checkout", "-q", "upstream")
+        path = Path(f"{self.unit}/Reader.kt")
+        path.write_text(path.read_text().replace("reader = upstream", "reader = old").replace("backend = old", "backend = new"))
+        self.commit("compatible upstream revision")
+        self.git("checkout", "-q", "nox")
+        new_base = self.git("merge-base", "HEAD", "upstream")
+        self.assertNotEqual(new_base, self.base)
+        self.assertEqual(sync_upstream.protected_multisrc_bases(new_base, "upstream"), {self.theme: self.base})
+        accepted, deferred = sync_upstream.prove_protected_multisrc(new_base, "upstream", [], set())
+        self.assertIn(self.theme, accepted)
+        self.assertFalse(deferred)
+
+    def test_h_upstream_deletion_of_patched_file_is_deferred(self):
+        self.nox_patch()
+        self.git("checkout", "-q", "upstream")
+        self.git("rm", f"{self.unit}/Reader.kt")
+        self.commit("remove old reader")
+        self.git("checkout", "-q", "nox")
+        accepted, deferred = self.prove()
+        self.assertFalse(accepted)
+        self.assertIn("add/delete conflict", deferred[self.theme]["reason"])
+
+    def test_i_upstream_adopted_patch_needs_no_protection(self):
+        self.nox_patch()
+        self.git("branch", "-f", "upstream", "HEAD")
+        self.assertEqual(sync_upstream.protected_multisrc_bases(self.base, "upstream"), {})
+
+    def test_j_apply_uses_proven_tree_not_upstream_tree(self):
+        self.nox_patch()
+        self.advance(structural=True)
+        proven, deferred = self.prove()
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(self.base, "upstream"))[0]
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", units, {self.unit}, [], [], set(), deferred, proven)
+        self.assertIn("reader = nox", Path(f"{self.unit}/Reader.kt").read_text())
+        self.assertIn("backend = new", Path(f"{self.unit}/Reader.kt").read_text())
+        self.assertIn('"1.7"', Path(f"{self.unit}/build.gradle.kts").read_text())
+        self.assertTrue(Path("unrelated.txt").exists())
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+        self.assertFalse(sync_upstream.load_deferred_migrations())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_k_apply_defers_atomically_and_keeps_unrelated_updates(self):
+        self.nox_patch()
+        self.advance(conflict=True, structural=True)
+        proven, deferred = self.prove()
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(self.base, "upstream"))[0]
+        before = {unit: Path(f"{unit}/build.gradle.kts").read_bytes() for unit in [self.unit, *self.extensions]}
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", units, {self.unit}, self.extensions, [], {self.theme}, deferred, proven)
+        for unit, content in before.items():
+            self.assertEqual(Path(f"{unit}/build.gradle.kts").read_bytes(), content)
+        self.assertTrue(Path("unrelated.txt").exists())
+        self.assertEqual(sync_upstream.load_deferred_migrations()[self.theme]["patch_base"], self.base)
+        self.assertIn("reader = nox", Path(f"{self.unit}/Reader.kt").read_text())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_l_unproven_protected_theme_cannot_be_applied(self):
+        self.nox_patch()
+        self.advance()
+        head = self.git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(RuntimeError, "Unproven protected multisrc"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), {})
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertFalse(Path(".git/MERGE_HEAD").exists())
+
+    def test_m_shared_dependent_propagates_atomic_deferral(self):
+        proven = {"second": {"tree": "tree", "units": [self.extensions[0]]}}
+        deferred, blocked = {}, {self.theme}
+        with patch.object(sync_upstream, "dependency_map", return_value={self.theme: self.extensions, "second": [self.extensions[0]]}):
+            sync_upstream.propagate_multisrc_deferrals(proven, deferred, blocked, {"second": self.base}, "upstream")
+        self.assertFalse(proven)
+        self.assertEqual(blocked, {self.theme, "second"})
+        self.assertEqual(deferred["second"]["patch_base"], self.base)
+
+    def test_n_patch_is_protected_again_after_successful_sync(self):
+        self.nox_patch()
+        self.advance()
+        proven, deferred = self.prove()
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), deferred, proven)
+        self.git("checkout", "-q", "upstream")
+        path = Path(f"{self.unit}/Reader.kt")
+        path.write_text(path.read_text() + "\nsecond upstream improvement\n")
+        self.commit("second upstream update")
+        self.git("checkout", "-q", "nox")
+        base = self.git("merge-base", "HEAD", "upstream")
+        proven, deferred = sync_upstream.prove_protected_multisrc(base, "upstream", [], set())
+        self.assertFalse(deferred)
+        reader = self.git("show", f"{proven[self.theme]['tree']}:{self.unit}/Reader.kt")
+        self.assertIn("reader = nox", reader)
+        self.assertIn("second upstream improvement", reader)
+
+    def test_o_removing_protected_theme_is_deferred(self):
+        self.nox_patch()
+        self.git("checkout", "-q", "upstream")
+        self.git("rm", "-r", self.unit)
+        self.commit("remove theme")
+        self.git("checkout", "-q", "nox")
+        proven, deferred = self.prove()
+        self.assertFalse(proven)
+        self.assertIn("removed upstream", deferred[self.theme]["reason"])
+
+
+class BuildMatrixTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("build_matrices", SCRIPT.with_name("generate-build-matrices.py"))
+        cls.matrix = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.matrix)
+
+    def setUp(self):
+        previous = Path.cwd()
+        os.chdir(SCRIPT.resolve().parents[2])
+        self.addCleanup(os.chdir, previous)
+
+    def selected(self, path):
+        with patch.object(self.matrix, "run_command", return_value=f"M\t{path}"):
+            modules, deleted = self.matrix.get_module_list("HEAD")
+        return set(modules), set(deleted)
+
+    def test_a_sync_script_does_not_build_or_publish(self):
+        self.assertEqual(self.selected(".github/scripts/sync-upstream.py"), (set(), set()))
+
+    def test_b_sync_tests_do_not_build_or_publish(self):
+        self.assertEqual(self.selected(".github/scripts/test_sync_upstream.py"), (set(), set()))
+
+    def test_c_matrix_script_does_not_build_or_publish(self):
+        self.assertEqual(self.selected(".github/scripts/generate-build-matrices.py"), (set(), set()))
+
+    def test_d_core_still_builds_all_extensions(self):
+        self.assertTrue(Path("core/build.gradle.kts").is_file())
+        self.assertEqual(self.selected("core/build.gradle.kts"), tuple(map(set, self.matrix.get_all_modules())))
+
+    def test_e_aurora_builds_exactly_four_dependents(self):
+        names = {"mangasbrasuka", "mugiwarasoficial", "leitordemangas", "manganyx"}
+        self.assertEqual(self.selected("lib-multisrc/aurora/build.gradle.kts"), (
+            {f":src:pt:{name}" for name in names}, {f"pt.{name}" for name in names},
+        ))
+
+    def test_f_single_extension_stays_isolated(self):
+        self.assertEqual(self.selected("src/pt/mangasbrasuka/build.gradle.kts"), (
+            {":src:pt:mangasbrasuka"}, {"pt.mangasbrasuka"},
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -509,6 +509,172 @@ def get_protected_nox_units(base: str, upstream_ref: str) -> list[str]:
     return protected
 
 
+def protected_multisrc_bases(base: str, upstream_ref: str) -> dict[str, str]:
+    """Retain the original delta base across deferred `ours` merges."""
+    deferred = load_deferred_migrations()
+    units = collect_units(changed_entries(base, "HEAD"))[0]
+    themes = {unit.split("/", 1)[1] for unit in units if unit.startswith("lib-multisrc/")}
+    themes.update(theme for theme, entry in deferred.items() if entry.get("patch_base"))
+    result = {}
+    for theme in sorted(themes):
+        unit = f"lib-multisrc/{theme}"
+        patch_base = str(deferred.get(theme, {}).get("patch_base", base))
+        if path_exists("HEAD", unit) and git("diff", "--name-only", upstream_ref, "HEAD", "--", unit).strip():
+            result[theme] = patch_base
+    return result
+
+
+def merge_multisrc(sandbox: Path, theme: str, base: str, upstream_ref: str) -> None:
+    """Three-way functional merge; ambiguous edits/deletions fail closed."""
+    unit = f"lib-multisrc/{theme}"
+
+    def files(ref: str) -> dict[str, tuple[str, bytes]]:
+        entries = git("ls-tree", "-r", "-z", ref, "--", unit).split("\0")
+        result = {}
+        for entry in filter(None, entries):
+            metadata, path = entry.split("\t", 1)
+            mode, kind, oid = metadata.split()
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                raise ValueError("unsupported tree entry")
+            result[path] = (mode, subprocess.run(["git", "cat-file", "blob", oid], capture_output=True, check=True).stdout)
+        return result
+
+    ancestor, local, upstream = files(base), files("HEAD"), files(upstream_ref)
+    if not upstream:
+        raise ValueError("protected multisrc removed upstream")
+    for path in sorted(ancestor.keys() | local.keys() | upstream.keys()):
+        before, ours, theirs = ancestor.get(path), local.get(path), upstream.get(path)
+        if ours == before or ours == theirs:
+            merged = theirs
+        elif theirs == before:
+            merged = ours
+        elif None in (before, ours, theirs):
+            raise ValueError(f"add/delete conflict: {path}")
+        else:
+            mode = theirs[0] if ours[0] == before[0] else ours[0]
+            if theirs[0] != before[0] and ours[0] not in (before[0], theirs[0]):
+                raise ValueError(f"mode conflict: {path}")
+            with tempfile.TemporaryDirectory(prefix="nox-sync-merge-") as directory:
+                inputs = [Path(directory) / name for name in ("ours", "base", "upstream")]
+                contents = [ours[1], before[1], theirs[1]]
+                if path == f"{unit}/build.gradle.kts":
+                    # Only known structural fields prefer upstream; dependencies/test setup still merge.
+                    texts = [content.decode("utf-8") for content in contents]
+                    for pattern in (_LIB_VERSION_RE, _BASE_VERSION_CODE_RE):
+                        target = pattern.search(texts[2])
+                        for index in (0, 1):
+                            if target and not pattern.search(texts[index]):
+                                raise ValueError(f"structural field insertion requires review: {path}")
+                            texts[index] = pattern.sub(lambda _: target.group(0) if target else "", texts[index])
+                    contents = [text.encode("utf-8") for text in texts]
+                for target, content in zip(inputs, contents):
+                    target.write_bytes(content)
+                merge = subprocess.run(["git", "merge-file", "-p", *map(str, inputs)], capture_output=True)
+                if merge.returncode:
+                    raise ValueError(f"functional conflict: {path}")
+                merged = (mode, merge.stdout)
+        destination = sandbox / path
+        if merged is None:
+            destination.unlink(missing_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(merged[1])
+            destination.chmod(int(merged[0], 8) & 0o777)
+
+
+def prove_protected_multisrc(
+    base: str, upstream_ref: str, protected_units: list[str], blocked: set[str],
+) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    bases = protected_multisrc_bases(base, upstream_ref)
+    backlog = load_deferred_migrations()
+    changed = set(collect_units(changed_entries(base, upstream_ref))[0])
+    local_changed = set(collect_units(changed_entries(base, "HEAD"))[0])
+    local_deps, upstream_deps = dependency_map(None), dependency_map(upstream_ref)
+    accepted, deferred = {}, {}
+    for theme, patch_base in bases.items():
+        unit = f"lib-multisrc/{theme}"
+        dependents = sorted(set(local_deps.get(theme, [])) | set(upstream_deps.get(theme, [])))
+        selector_changed = any(
+            dependent in changed and structural_metadata(None, dependent) != structural_metadata(upstream_ref, dependent)
+            for dependent in dependents
+        )
+        if unit not in changed and theme not in backlog and not selector_changed:
+            continue
+        entry = {"patch_base": patch_base, "upstream_ref": git("rev-parse", upstream_ref).strip(), "units": dependents}
+        if theme in blocked:
+            deferred[theme] = dict(entry, reason="unsupported structural migration")
+            continue
+        with tempfile.TemporaryDirectory(prefix="nox-multisrc-proof-") as directory:
+            sandbox = Path(directory) / "repo"
+            git("worktree", "add", "--detach", str(sandbox), "HEAD")
+            try:
+                # Match normal sync decisions for build infrastructure without replacing Nox units.
+                excluded = set(dependents)
+                for other in set(bases) | blocked:
+                    excluded.add(f"lib-multisrc/{other}")
+                    excluded.update(local_deps.get(other, []))
+                    excluded.update(upstream_deps.get(other, []))
+                for normal in sorted(changed - local_changed - excluded):
+                    subprocess.run(["git", "-C", str(sandbox), "rm", "-r", "--ignore-unmatch", "--quiet", "--", normal], check=True)
+                    if path_exists(upstream_ref, normal):
+                        subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", normal], check=True)
+                merge_multisrc(sandbox, theme, patch_base, upstream_ref)
+                for dependent in dependents:
+                    target = structural_metadata(upstream_ref, dependent)
+                    preserve = dependent in protected_units or dependent in local_changed or target is None
+                    if preserve:
+                        if target:
+                            apply_structural_metadata_to_path(sandbox / dependent / "build.gradle.kts", *target)
+                    else:
+                        subprocess.run(["git", "-C", str(sandbox), "rm", "-r", "--ignore-unmatch", "--quiet", "--", dependent], check=True)
+                        subprocess.run(["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", dependent], check=True)
+                if Path("local.properties").exists():
+                    shutil.copy("local.properties", sandbox / "local.properties")
+                for dependent in dependents:
+                    metadata = (sandbox / dependent / "build.gradle.kts").read_text()
+                    selector, lib = _THEME_RE.search(metadata), _LIB_VERSION_RE.search(metadata)
+                    if selector:
+                        selected = sandbox / "lib-multisrc" / selector.group(1) / "build.gradle.kts"
+                        selected_lib = _LIB_VERSION_RE.search(selected.read_text()) if selected.exists() else None
+                        if not lib or not selected_lib or lib.group(1) != selected_lib.group(1):
+                            raise ValueError(f"incompatible dependent selector: {dependent}")
+                paths = [unit, *dependents]
+                subprocess.run(["git", "-C", str(sandbox), "add", "-A", "--", *paths], check=True)
+                tree = subprocess.run(["git", "-C", str(sandbox), "write-tree"], capture_output=True, text=True, check=True).stdout.strip()
+                tasks = [f":{dependent.replace('/', ':')}:assembleDebug" for dependent in dependents]
+                tasks.append(f":lib-multisrc:{theme}:testDebugUnitTest")
+                proof = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox)
+                if proof.returncode:
+                    raise ValueError("proof build/tests failed")
+                if subprocess.run(["git", "-C", str(sandbox), "diff", "--quiet", tree, "--", *paths]).returncode:
+                    raise ValueError("build changed candidate sources")
+                accepted[theme] = {"tree": tree, "units": dependents}
+                print(f"Protected Nox multisrc proven: {theme} ({len(dependents)} dependents)")
+            except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                deferred[theme] = dict(entry, reason=str(error))
+                print(f"Protected Nox multisrc deferred: {theme}: {error}")
+            finally:
+                git("worktree", "remove", "--force", str(sandbox), check=False)
+    return accepted, deferred
+
+
+def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref):
+    """A source switching themes cannot migrate independently of either theme."""
+    local, upstream = dependency_map(None), dependency_map(upstream_ref)
+    while True:
+        blocked_units = {unit for theme in blocked for unit in local.get(theme, []) + upstream.get(theme, [])}
+        affected = [theme for theme, candidate in proven.items() if blocked_units.intersection(candidate["units"])]
+        if not affected:
+            return
+        for theme in affected:
+            candidate = proven.pop(theme)
+            blocked.add(theme)
+            deferred[theme] = {
+                "patch_base": bases[theme], "upstream_ref": git("rev-parse", upstream_ref).strip(),
+                "units": candidate["units"], "reason": "dependent shared with deferred theme",
+            }
+
+
 def update_sync_branch(upstream_ref: str, push: bool) -> None:
     if push:
         git("push", "origin", f"{upstream_ref}:refs/heads/{SYNC_BRANCH}")
@@ -590,7 +756,18 @@ def apply_units(
     structural_units: list[str],
     blocked_themes: set[str],
     deferred: dict[str, dict[str, object]],
+    proven_multisrc: dict[str, dict[str, object]] | None = None,
 ) -> list[str]:
+    proven_multisrc = proven_multisrc or {}
+    base = git("merge-base", "HEAD", upstream_ref).strip()
+    for theme in protected_multisrc_bases(base, upstream_ref):
+        if f"lib-multisrc/{theme}" in units and theme not in blocked_themes and theme not in proven_multisrc:
+            raise RuntimeError(f"Unproven protected multisrc: {theme}")
+    proven_paths = {
+        path for theme, candidate in proven_multisrc.items()
+        for path in [f"lib-multisrc/{theme}", *candidate["units"]]
+    }
+    previous_versions = {unit: effective_version_code(None, unit) for unit in proven_paths if unit.startswith("src/")}
     git("merge", "--no-ff", "--no-commit", "-s", "ours", upstream_ref)
 
     local_deps = dependency_map(None)
@@ -604,6 +781,8 @@ def apply_units(
 
     # 1. Apply upstream units (except conflict units where Nox wins, and deferred themes/extensions)
     for unit in units:
+        if unit in proven_paths:
+            continue
         if unit.startswith("lib-multisrc/") and unit.split("/", 1)[1] in blocked_themes:
             print(f"Deferred structural migration: {unit}")
             continue
@@ -633,10 +812,17 @@ def apply_units(
         if path_exists(upstream_ref, unit):
             git("restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", unit)
 
+    for theme, candidate in proven_multisrc.items():
+        for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
+            git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
+            git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
+            if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
+                git("add", "--", f"{unit}/build.gradle.kts")
+
     # Deferred themes may no longer appear in base..upstream after an ours merge.
     # Their protected extensions must still receive their proven selector migration.
     for unit in structural_units:
-        if unit in conflict_units:
+        if unit in conflict_units or unit in proven_paths or unit in blocked_theme_extensions:
             continue
         previous_info = effective_version_code(None, unit)
         changed = merge_structural_metadata(unit, upstream_ref)
@@ -657,7 +843,7 @@ def apply_units(
     validation_units = set(structural_units)
     deferred_units = {str(unit) for entry in deferred.values() for unit in entry.get("units", [])}
     for unit in protected_units:
-        if unit in deferred_units:
+        if unit in deferred_units or unit in blocked_theme_extensions:
             print(f"Version guard: deferred {unit}; metadata and version preserved")
             continue
         res = bump_version_code_if_needed(unit, upstream_ref)
@@ -756,6 +942,9 @@ def main() -> None:
     main_only_units = sorted(set(main_units) - set(upstream_units))
     upstream_only_units = sorted(set(upstream_units) - conflict_set)
     preflight, preflight_blocked = preflight_multisrc(base, upstream_ref, protected_units)
+    protected_multisrc = protected_multisrc_bases(base, upstream_ref)
+    for theme in protected_multisrc:
+        print(f"Protected Nox multisrc: lib-multisrc/{theme}")
 
     print_plan(
         base,
@@ -793,11 +982,14 @@ def main() -> None:
         print("Dry run only; no changes were applied")
         return
 
-    blocked = preflight_blocked | verify_migration_plan(
-        {theme: rows for theme, rows in preflight.items() if theme not in preflight_blocked},
+    proven, multisrc_deferred = prove_protected_multisrc(base, upstream_ref, protected_units, preflight_blocked)
+    blocked = preflight_blocked | set(multisrc_deferred) | verify_migration_plan(
+        {theme: rows for theme, rows in preflight.items() if theme not in preflight_blocked and theme not in protected_multisrc},
         upstream_ref,
     )
     deferred = deferred_state(preflight, blocked, upstream_ref)
+    deferred.update(multisrc_deferred)
+    propagate_multisrc_deferrals(proven, deferred, blocked, protected_multisrc, upstream_ref)
     if blocked:
         print("Deferred migrations (proof build failed): " + ", ".join(sorted(blocked)))
     migration_units = {
@@ -815,6 +1007,7 @@ def main() -> None:
         structural_units,
         blocked,
         deferred,
+        proven,
     )
     _write_step_summary(protected_units, bumped)
     if args.push:
