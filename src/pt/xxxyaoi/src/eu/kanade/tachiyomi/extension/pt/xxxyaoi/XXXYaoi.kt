@@ -1,26 +1,37 @@
 package eu.kanade.tachiyomi.extension.pt.xxxyaoi
 
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.multisrc.madara.MadaraNoAjax
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import keiyoushi.utils.asJsoup
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.FormBody
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.text.SimpleDateFormat
-import java.util.Locale
-import kotlin.collections.plusAssign
+import org.jsoup.nodes.Document
+import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.seconds
 
 @Source
-abstract class XXXYaoi : Madara() {
-    override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
+abstract class XXXYaoi : MadaraNoAjax() {
 
-    override fun headersBuilder() = super.headersBuilder()
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy")
+
+    override fun OkHttpClient.Builder.configureClient() = rateLimit(3, 1.seconds)
+
+    override fun Headers.Builder.configureHeaders() = set("Upgrade-Insecure-Requests", "1")
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .set("Upgrade-Insecure-Requests", "1")
         .set("Sec-GPC", "1")
         .set("Sec-Fetch-User", "?1")
         .set("Sec-Fetch-Site", "none")
@@ -29,113 +40,113 @@ abstract class XXXYaoi : Madara() {
         .set("Priority", "u=0, i")
         .set("Pragma", "no-cache")
 
-    override val client: OkHttpClient = super.client.newBuilder()
-        .rateLimit(3, 1.seconds)
-        .build()
-
-    override val useNewChapterEndpoint = true
-
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-
     override val mangaSubString = "bl"
+    override val hiatusStatus = super.hiatusStatus + "hiato"
 
-    // The site uses a fully custom layout — no standard Madara selectors apply here.
-    override val mangaDetailsSelectorTitle = "h1.xyaoi-main-title"
-    override val mangaDetailsSelectorAuthor = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(AUTOR)) .xyaoi-prop-value a"
-    override val mangaDetailsSelectorArtist = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(ARTISTA)) .xyaoi-prop-value a"
-    override val mangaDetailsSelectorStatus = "span.xyaoi-prop-value[class*=status-value-]"
-    override val mangaDetailsSelectorDescription = "div.xyaoi-synopsis-content"
-    override val mangaDetailsSelectorGenre = "div.xyaoi-genres-list a.xyaoi-genre-pill"
+    override val mangaDetailsSelectorTitle = ".xyaoi-main-title, h1"
+    override val mangaDetailsSelectorAuthor = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(AUTOR)) a, a[href*=author]"
+    override val mangaDetailsSelectorArtist = ".xyaoi-prop-col:has(.xyaoi-prop-label:contains(ARTISTA)) a, a[href*=artist]"
+    override val mangaDetailsSelectorStatus = ".xyaoi-prop-value[class*=status-value-], span:matchesOwn((?i)^status:?$) + span"
+    override val mangaDetailsSelectorDescription = ".xyaoi-synopsis-content, [itemprop=description], [class*=synopsis-content]"
+
+    override val mangaDetailsSelectorGenre = ".xyaoi-genres-list a, a[href*='/genero/']"
     override val mangaDetailsSelectorTag = "[data-xxxyaoi-no-tags]"
     override val altNameSelector = "[data-xxxyaoi-no-alt-name]"
-    override val altName get() = intl["alt_names_heading"]
+    override val genreDirectory = "genero"
 
-    override fun chapterFromElement(element: org.jsoup.nodes.Element): eu.kanade.tachiyomi.source.model.SChapter {
-        val chapter = eu.kanade.tachiyomi.source.model.SChapter.create()
+    override fun searchCardSelector() = ".xyaoi-search-card, .c-tabs-item__content"
 
-        with(element) {
-            selectFirst(chapterUrlSelector)!!.let { urlElement ->
-                chapter.url = urlElement.attr("abs:href").let {
-                    it.substringBefore("?style=paged") + if (!it.endsWith(chapterUrlSuffix)) chapterUrlSuffix else ""
-                }
-                chapter.name = selectFirst(".xyaoi-chapter-name")?.text() ?: urlElement.text()
-            }
-            chapter.date_upload = selectFirst(".xyaoi-chapter-date-line span")?.text()?.let(::parseChapterDate)
-                ?: selectFirst("img:not(.thumb)")?.attr("alt")?.let { parseRelativeDate(it) }
-                ?: selectFirst("span a")?.attr("title")?.let { parseRelativeDate(it) }
-                ?: parseChapterDate(selectFirst(chapterDateSelector())?.text())
-        }
+    override val archiveUrlSelector = "h3 a, .post-title a"
 
-        return chapter
-    }
-
-    override val statusFilterOptions: Map<String, String> =
-        mapOf(
-            intl["status_filter_completed"] to "end",
-        )
-
-    override fun searchMangaSelector() = ".page-item-detail.manga"
-
-    override fun searchRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = baseUrl.toHttpUrl().newBuilder()
-
-        loop@ for (filter in filters) {
-            when (filter) {
-                is StatusFilter -> {
-                    filter.state.firstOrNull { it.state }?.let {
-                        url.addPathSegment(it.name)
-                        break@loop
-                    }
-                }
-
-                is GenreOptions -> {
-                    val selected = filter.selected()
-                    if (selected.isNotBlank()) {
-                        url.addPathSegment("genero")
-                            .addPathSegment(selected)
-                        break@loop
-                    }
-                }
-
-                else -> {}
+    override fun parseArchive(document: Document): List<SManga> = super.parseArchive(document).ifEmpty {
+        Layout.cards(document).mapNotNull { card ->
+            val id = card.id ?: return@mapNotNull null
+            SManga.create().apply {
+                url = id
+                title = card.title
+                thumbnail_url = card.image?.let(::imageFromElement)
+                memo = mangaMemo(card.path, emptyList())
             }
         }
-
-        url.addPathSegments(searchPage(page))
-        return GET(url.build(), headers)
     }
 
-    override fun getFilterList(): FilterList {
-        launchIO { fetchGenres() }
+    override fun parseSearchCards(document: Document): List<SearchCard> = super.parseSearchCards(document).ifEmpty {
+        Layout.cards(document).map { SearchCard(it.title, it.path, it.image?.let(::imageFromElement)) }
+    }
 
-        val filters: MutableList<Filter<out Any>> = mutableListOf(
-            StatusFilter(
-                title = intl["status_filter_title"],
-                status = statusFilterOptions.map { Tag(it.key, it.value) },
-            ),
-        )
-
-        if (genresList.isNotEmpty()) {
-            val options: Array<Pair<String, String>> = arrayOf("Todos" to "") + genresList.map { it.name to it.id }.toTypedArray()
-            filters += listOf(
-                Filter.Separator(),
-                Filter.Header(intl["genre_filter_header"]),
-                GenreOptions(
-                    displayName = intl["genre_filter_title"],
-                    vals = options,
-                ),
-            )
-        } else if (fetchGenres) {
-            filters += listOf(
-                Filter.Separator(),
-                Filter.Header(intl["genre_missing_warning"]),
-            )
+    override fun parseChapterList(document: Document, mangaPath: String): List<SChapter> = Layout.chapters(document, mangaPath).map { entry ->
+        SChapter.create().apply {
+            url = entry.path.substringBefore('?').trimEnd('/').substringAfterLast('/')
+            name = entry.name
+            date_upload = Layout.absoluteDate(entry.date) ?: parseChapterDate(entry.date)
+            memo = buildJsonObject {
+                put("mangaPath", mangaPath)
+                put("chapterPath", entry.path)
+            }
         }
-
-        return FilterList(filters)
     }
 
-    class GenreOptions(displayName: String, private val vals: Array<Pair<String, String>>, state: Int = 0) : Filter.Select<String>(displayName, vals.map { it.first }.toTypedArray(), state) {
-        fun selected() = vals[state].second
+    override suspend fun fetchChapters(mangaPath: String, id: String, mangaPage: Document?): List<SChapter> {
+        val inline = mangaPage?.let { parseChapterList(it, mangaPath) }.orEmpty()
+        return inline.ifEmpty {
+            val url = "$baseUrl${mangaPath.trimEnd('/')}/ajax/chapters/"
+            parseChapterList(client.post(url, xhrHeaders, FormBody.Builder().build()).asJsoup(), mangaPath)
+        }.also { check(it.isNotEmpty()) { "XXX Yaoi: capítulos não encontrados (chapter-links-not-found)." } }
     }
+
+    override fun parseDetails(document: Document, id: String, preserveUrl: String?): SManga {
+        val title = (document.selectFirst(".xyaoi-main-title") ?: document.selectFirst("h1"))?.text()
+        check(!title.isNullOrBlank()) {
+            "XXX Yaoi: título da obra não encontrado."
+        }
+        return super.parseDetails(document, id, preserveUrl).apply {
+            this.title = title
+            author = author ?: Layout.property(document, "Autor")?.text()?.takeIf(String::isNotBlank)
+            artist = artist ?: Layout.property(document, "Artista")?.text()?.takeIf(String::isNotBlank)
+            if (status == SManga.UNKNOWN) status = Layout.property(document, "Status")?.text()?.toStatus() ?: status
+            description = description ?: Layout.property(document, "Sinopse")?.text()?.takeIf(String::isNotBlank)
+        }
+    }
+
+    // Keep saved legacy chapter paths usable while Madara migrates chapter memos.
+    override fun getChapterUrl(chapter: SChapter): String = Layout.chapterUrl(
+        baseUrl,
+        chapter.url,
+        (chapter.memo["mangaPath"] as? JsonPrimitive)?.content,
+        (chapter.memo["chapterPath"] as? JsonPrimitive)?.content,
+    )
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        val first = client.get(chapterUrl).asJsoup()
+        val document = if (first.selectFirst("#single-pager") != null) {
+            val listUrl = first.location().toHttpUrlOrNull()?.newBuilder()?.setQueryParameter("style", "list")?.build()
+                ?: error("XXX Yaoi: endereço de capítulo inválido.")
+            client.get(listUrl).asJsoup()
+        } else {
+            first
+        }
+        return Reader.load(document, { super.parsePages(document).mapNotNull(Page::imageUrl) }) { scriptUrl ->
+            client.get(scriptUrl, ensureSuccess = false).use { response ->
+                if (!response.isSuccessful) return@use null
+                val body = response.body
+                if (body.contentLength() > 512_000) return@use null
+                val source = body.source()
+                if (source.request(512_001)) null else source.readUtf8()
+            }
+        }.mapIndexed { index, url -> Page(index, document.location(), url) }
+    }
+
+    override fun getFilterList(data: JsonElement?) = FilterList(
+        *super.getFilterList(data).toTypedArray(),
+        CompletedFilter(),
+    )
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList) = if (filters.filterIsInstance<CompletedFilter>().firstOrNull()?.state == true) {
+        archivePage(page, "", "/end/", query)
+    } else {
+        super.getSearchMangaList(page, query, filters)
+    }
+
+    private class CompletedFilter : Filter.CheckBox("Concluídos", false)
 }
