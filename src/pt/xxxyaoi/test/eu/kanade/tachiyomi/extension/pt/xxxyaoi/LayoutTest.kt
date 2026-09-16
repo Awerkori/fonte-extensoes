@@ -89,6 +89,10 @@ class LayoutTest {
             assertEquals("/cover.webp", parsed.image?.attr("data-src"))
         }
     }
+    @Test fun catalogSectionsKeepCards() {
+        val html = "<section id=popular>$card</section><section id=latest>${card.replace("123", "456").replace("he-might-bite", "another-work").replace("He Might Bite!", "Another Work")}</section>"
+        assertEquals(listOf("He Might Bite!", "Another Work"), Layout.cards(document(html)).map { it.title })
+    }
     @Test fun searchIdFallbackAndDuplicateTitleLinks() {
         val html = card.replace("data-post-id=\"123\"", "id=\"post-123\"").replace("</article>", "<h2><a href='$root'>He Might Bite!</a></h2></article>")
         assertEquals("123", Layout.cards(document(html)).single().id)

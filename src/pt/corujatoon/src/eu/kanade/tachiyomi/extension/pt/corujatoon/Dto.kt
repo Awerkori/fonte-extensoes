@@ -17,9 +17,6 @@ internal class SeriesListDto(
 )
 
 @Serializable
-internal class SeriesResponseDto(val series: SeriesDto)
-
-@Serializable
 internal class PaginationDto(val page: Int, val totalPages: Int)
 
 @Serializable
@@ -61,7 +58,7 @@ internal class ChapterDto(
     val title: String? = null,
     val publishedAt: String? = null,
 ) {
-    fun toSChapter(slug: String) = SChapter.create().apply {
+    fun toSChapter(slug: String, seriesId: String? = null) = SChapter.create().apply {
         url = "$slug/$id"
         name = title?.takeIf(String::isNotBlank) ?: "Capítulo ${number.display()}"
         chapter_number = number.toFloat()
@@ -70,6 +67,7 @@ internal class ChapterDto(
             put("id", id)
             put("slug", slug)
             put("number", number.display())
+            seriesId?.takeIf(String::isNotBlank)?.let { put("seriesId", it) }
         }
     }
 }
@@ -91,7 +89,8 @@ private fun String?.toStatus(): Int = when (this?.uppercase(Locale.ROOT)) {
 private fun Double.display(): String = if (this % 1 == 0.0) toInt().toString() else toString()
 
 private fun parseDate(value: String): Long? = runCatching {
+    val normalized = value.removePrefix("${'$'}D")
     SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
         timeZone = TimeZone.getTimeZone("UTC")
-    }.parse(value)?.time
+    }.parse(normalized)?.time
 }.getOrNull()

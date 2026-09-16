@@ -19,6 +19,7 @@ import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.jsoup.nodes.Document
 import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.seconds
@@ -118,11 +119,12 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
-        val first = client.get(chapterUrl).asJsoup()
+        val referer = chapterReferer(chapter, chapterUrl)
+        val first = client.get(chapterUrl, chapterHeaders(referer)).asJsoup()
         val document = if (first.selectFirst("#single-pager") != null) {
             val listUrl = first.location().toHttpUrlOrNull()?.newBuilder()?.setQueryParameter("style", "list")?.build()
                 ?: error("XXX Yaoi: endereço de capítulo inválido.")
-            client.get(listUrl).asJsoup()
+            client.get(listUrl.toString(), chapterHeaders(chapterUrl)).asJsoup()
         } else {
             first
         }
@@ -136,6 +138,39 @@ abstract class XXXYaoi : MadaraNoAjax() {
             }
         }.mapIndexed { index, url -> Page(index, document.location(), url) }
     }
+
+    private fun chapterHeaders(referer: String): Headers = headersBuilder()
+        .set("Referer", referer)
+        .set("Sec-Fetch-Site", "same-origin")
+        .set("Sec-Fetch-Mode", "navigate")
+        .set("Sec-Fetch-Dest", "document")
+        .build()
+
+    private fun chapterReferer(chapter: SChapter, chapterUrl: String): String {
+        val mangaPath = (chapter.memo["mangaPath"] as? JsonPrimitive)?.content
+        return mangaPath?.let { baseUrl.toHttpUrlOrNull()?.resolve(it)?.toString() }
+            ?: chapterUrl.toHttpUrlOrNull()?.let { url ->
+                url.newBuilder()
+                    .encodedPath("/${url.pathSegments.dropLast(1).joinToString("/")}/")
+                    .build()
+                    .toString()
+            }
+            ?: baseUrl
+    }
+
+    // Image requests must not inherit document headers (Origin/Sec-Fetch/HTML Accept).
+    // Cookies are still supplied by the same source client and its CookieJar.
+    override fun imageRequest(page: Page): Request = Request.Builder()
+        .url(page.imageUrl!!)
+        .headers(
+            Headers.Builder().apply {
+                headers["User-Agent"]?.let { set("User-Agent", it) }
+                set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                set("Referer", page.url)
+            }.build(),
+        )
+        .get()
+        .build()
 
     override fun getFilterList(data: JsonElement?) = FilterList(
         *super.getFilterList(data).toTypedArray(),

@@ -89,6 +89,12 @@ data class MangaDetailsResponse(
 )
 
 @Serializable
+data class ChapterListResponse(
+    val chapters: List<ChapterDto>,
+    val pagination: PaginationDto,
+)
+
+@Serializable
 data class ChapterDto(
     val id: Int,
     val title: String? = null,
@@ -135,3 +141,33 @@ data class ChapterPagesResponse(
     val id: Int,
     val pages: List<String>,
 )
+
+internal fun collectChapterPages(
+    firstPage: ChapterListResponse,
+    fetchPage: (Int) -> ChapterListResponse?,
+): List<ChapterDto> {
+    val chapters = firstPage.chapters.toMutableList()
+    val seenIds = chapters.mapTo(mutableSetOf()) { it.id }
+    val seenPages = mutableSetOf(firstPage.pagination.page)
+    var currentPage = firstPage
+
+    while (seenPages.size < MAX_CHAPTER_PAGES) {
+        val nextPage = currentPage.pagination.page + 1
+        val totalPages = currentPage.pagination.totalPages
+        val hasNext = totalPages?.let { nextPage <= it }
+            ?: (currentPage.chapters.size >= currentPage.pagination.limit)
+        if (!hasNext || !seenPages.add(nextPage)) break
+
+        val page = fetchPage(nextPage) ?: break
+        if (page.pagination.page != nextPage || page.chapters.isEmpty()) break
+
+        val newChapters = page.chapters.filter { seenIds.add(it.id) }
+        if (newChapters.isEmpty()) break
+        chapters += page.chapters
+        currentPage = page
+    }
+
+    return chapters.distinctBy { it.id }
+}
+
+private const val MAX_CHAPTER_PAGES = 1_000

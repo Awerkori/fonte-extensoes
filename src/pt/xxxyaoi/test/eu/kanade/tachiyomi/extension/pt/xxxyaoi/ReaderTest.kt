@@ -19,6 +19,36 @@ import java.util.Base64
 class ReaderTest {
     private val urls = listOf("https://cdn.example/001.webp?token=test", "https://cdn.example/002.webp")
     private val json = urls.joinToString(",", "[", "]") { "\"$it\"" }
+    private val secureKey = "3b57af5690964954d52a18d"
+
+    private fun rc4(input: ByteArray, key: String): ByteArray {
+        val state = IntArray(256) { it }
+        var j = 0
+        for (i in state.indices) {
+            j = (j + state[i] + key[i % key.length].code) % 256
+            state[i] = state[j].also { state[j] = state[i] }
+        }
+        var i = 0
+        j = 0
+        return ByteArray(input.size) { index ->
+            i = (i + 1) % 256
+            j = (j + state[i]) % 256
+            state[i] = state[j].also { state[j] = state[i] }
+            ((input[index].toInt() and 0xFF) xor state[(state[i] + state[j]) % 256]).toByte()
+        }
+    }
+
+    private fun currentSecureReaderFixture(): String {
+        val payload = Base64.getEncoder().encodeToString(rc4(json.toByteArray(), secureKey)).chunked(19).joinToString("~")
+        val keyExpression = secureKey.map { "String.fromCharCode(${it.code + 30} - 30)" }.joinToString("+")
+        return """
+            <div class="reading-content">
+              <div id="r_fixture" class="xyaoi-secure-reader-container" data-c_gate='{"pages":[],"error":"App access disabled"}'></div>
+              <script type="text/template" id="v_fixture">$payload</script>
+              <script>var containerId="r_fixture";var vaultId="v_fixture";function _rc4(){};var secKey=$keyExpression;</script>
+            </div>
+        """.trimIndent()
+    }
 
     // Minimal fixture of the public upstream's documented mechanism; not captured live HTML.
     private fun encoded(quote: String = "'", declaration: String = "let", attr: String = "data-pages", space: String = " ", key: String = "reader-key") : String {
@@ -32,6 +62,7 @@ class ReaderTest {
 
     @Test fun sharedJsonAvailable() { assertEquals(urls, json.parseAs<List<String>>()) }
     @Test fun upstreamMechanism() = assertEquals(urls, read(encoded()))
+    @Test fun currentSecureReaderPayload() = assertEquals(urls, read(currentSecureReaderFixture()))
     @Test fun doubleQuotes() = assertEquals(urls, read(encoded(quote = "\"")))
     @Test fun backticks() = assertEquals(urls, read(encoded(quote = "`")))
     @Test fun constDeclaration() = assertEquals(urls, read(encoded(declaration = "const")))

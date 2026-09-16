@@ -28,6 +28,8 @@ internal object Reader {
     private val nonPagePath = Regex("(?i)/(?:wp-admin|wp-json|wp-includes|wp-content/(?:plugins|themes))/")
     private val fieldName = Regex("[\"'`]?([A-Za-z_$][A-Za-z0-9_$]*)[\"'`]?$")
     private val readerSelector = ".reading-content, .page-break, [id*=reader], [class*=reader], [id*=chapter-images], [class*=chapter-content], [itemprop=articleBody]"
+    private val secureKeyAssignment = Regex("""(?s)(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*((?:String\.fromCharCode\s*\(\s*\d+\s*-\s*\d+\s*\)\s*\+?\s*)+);""")
+    private val secureKeyPart = Regex("""String\.fromCharCode\s*\(\s*(\d+)\s*-\s*(\d+)\s*\)""")
 
     private class Candidate(val urls: List<String>, val explicit: Boolean)
     private val candidateOrder = compareByDescending<Candidate> { it.explicit }.thenByDescending { it.urls.size }
@@ -69,6 +71,7 @@ internal object Reader {
     }.distinct().sortedByDescending { it.contains("reader", true) || it.contains("chapter", true) }.take(64)
 
     fun extract(document: Document, madara: () -> List<String> = { emptyList() }, externalScripts: List<String> = emptyList()): List<String> {
+        secureReaderPages(document)?.let { return it }
         val scripts = (
             document.select("script").map { script ->
                 script.attr("src").takeIf { it.startsWith("data:text/javascript;base64,") }
@@ -129,6 +132,54 @@ internal object Reader {
             else -> "no-image-candidates"
         }
         throw PagesNotFound(category)
+    }
+
+    /** XXX Yaoi's current reader mounts pages from an RC4-encrypted text/template vault. */
+    private fun secureReaderPages(document: Document): List<String>? {
+        val container = document.selectFirst(".reading-content .xyaoi-secure-reader-container") ?: return null
+        val script = document.select("script:not([src])").firstOrNull { element ->
+            element.data().let { source ->
+                source.contains("containerId") && source.contains("vaultId") &&
+                    source.contains("_rc4") && source.contains("String.fromCharCode")
+            }
+        } ?: return null
+        val source = script.data()
+        val expression = secureKeyAssignment.find(source)?.groupValues?.get(1) ?: return null
+        val codes = secureKeyPart.findAll(expression).map { match ->
+            match.groupValues[1].toInt() - match.groupValues[2].toInt()
+        }.toList()
+        if (codes.size < 8 || codes.any { it !in 0..255 }) return null
+        val key = codes.map(Int::toChar).joinToString("")
+        val vaultId = Regex("""\b(?:var|let|const)\s+\w*vault\w*\s*=\s*[\"'](v_[A-Za-z0-9_-]+)[\"']""", RegexOption.IGNORE_CASE)
+            .find(source)?.groupValues?.get(1)
+        val vault = vaultId?.let(document::getElementById)
+            ?: document.select("script[type=text/template][id^=v_]").firstOrNull()
+            ?: return null
+        if (container.id().isBlank() || vault.id().isBlank()) return null
+        return runCatching {
+            val encrypted = decode(vault.data().replace("~", "")) ?: return@runCatching null
+            val pages = rc4(key, encrypted).parseAs<List<String>>()
+            normalize(pages, document).takeIf(List<String>::isNotEmpty)
+        }.getOrNull()
+    }
+
+    private fun rc4(key: String, input: ByteArray): String {
+        val state = IntArray(256) { it }
+        var j = 0
+        for (i in state.indices) {
+            j = (j + state[i] + key[i % key.length].code) and 0xFF
+            state[i] = state[j].also { state[j] = state[i] }
+        }
+        var i = 0
+        j = 0
+        val output = ByteArray(input.size)
+        input.forEachIndexed { index, byte ->
+            i = (i + 1) and 0xFF
+            j = (j + state[i]) and 0xFF
+            state[i] = state[j].also { state[j] = state[i] }
+            output[index] = ((byte.toInt() and 0xFF) xor state[(state[i] + state[j]) and 0xFF]).toByte()
+        }
+        return output.toString(Charsets.UTF_8)
     }
 
     private fun decode(value: String): ByteArray? {

@@ -167,15 +167,35 @@ abstract class KuroMangas :
 
     override fun chapterListRequest(manga: SManga): Request {
         val mangaId = manga.url.substringAfterLast("/")
-        return GET("$apiUrl/mangas/$mangaId", headers)
+        return chapterPageRequest(mangaId, 1)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val result = response.parseAs<MangaDetailsResponse>()
-        val mangaId = result.manga.id
-        return result.chapters
+        val mangaId = response.request.url.pathSegments
+            .windowed(size = 2)
+            .firstOrNull { it.first() == "mangas" }
+            ?.last()
+            ?.toIntOrNull()
+            ?: return emptyList()
+
+        val firstPage = response.parseAs<ChapterListResponse>()
+        val allChapters = collectChapterPages(firstPage) { page ->
+            client.newCall(chapterPageRequest(mangaId.toString(), page)).execute().use { nextResponse ->
+                nextResponse.parseAs<ChapterListResponse>()
+            }
+        }
+
+        return allChapters
             .map { it.toSChapter(mangaId, dateFormat) }
-            .sortedByDescending { it.chapter_number }
+    }
+
+    private fun chapterPageRequest(mangaId: String, page: Int): Request {
+        val url = "$apiUrl/mangas/$mangaId/chapters".toHttpUrl().newBuilder()
+            .addQueryParameter("page", page.toString())
+            .addQueryParameter("limit", CHAPTER_PAGE_LIMIT.toString())
+            .addQueryParameter("order", "desc")
+            .build()
+        return GET(url, headers)
     }
 
     // ============================= Pages ==================================
@@ -375,6 +395,7 @@ abstract class KuroMangas :
 
     companion object {
         private const val PAGE_LIMIT = 24
+        private const val CHAPTER_PAGE_LIMIT = 60
         private const val API_HOST = "beta.kuromangas.com"
         private const val PREF_EMAIL = "kuromangas_email"
         private const val PREF_PASSWORD = "kuromangas_password"
