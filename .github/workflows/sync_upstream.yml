@@ -20,7 +20,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.BOT_PAT }}
+          token: ${{ github.token }}
           persist-credentials: true
 
       - name: Configure Git
