@@ -29,4 +29,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Sync upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: python .github/scripts/sync-upstream.py --push

@@ -499,13 +499,15 @@ def validate_affected_builds(units: list[str]) -> None:
 
 
 def get_protected_nox_units(base: str, upstream_ref: str) -> list[str]:
-    """Protected Nox extensions: src/<lang>/<ext> modified locally vs merge-base and existing in upstream."""
-    main_entries = changed_entries(base, "HEAD")
-    main_units, _ = collect_units(main_entries)
+    """Protected Nox extensions: Read from .github/nox-protected.txt."""
+    protected_file = Path(".github/nox-protected.txt")
+    if not protected_file.exists():
+        return []
     protected = []
-    for unit in sorted(main_units):
-        if unit.startswith("src/") and path_exists(upstream_ref, f"{unit}/build.gradle.kts"):
-            protected.append(unit)
+    for line in protected_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            protected.append(line)
     return protected
 
 
@@ -974,9 +976,20 @@ def main() -> None:
                     "migration supported={migration_supported}".format(**row),
                 )
 
-    if not upstream_units and not load_deferred_migrations():
+    # Determine effective differences between HEAD and upstream_ref
+    diff_entries = changed_entries("HEAD", upstream_ref)
+    diff_units, _ = collect_units(diff_entries)
+    effective_diff = [u for u in diff_units if u not in protected_units]
+
+    if not upstream_units and not load_deferred_migrations() and not effective_diff:
         print("No upstream changes to apply")
         return
+        
+    if not upstream_units and effective_diff:
+        print(f"Sync branch is up to date, but main is missing {len(effective_diff)} updates. Proceeding.")
+        upstream_units = effective_diff
+        conflict_set = set()
+        upstream_only_units = effective_diff
 
     if args.dry_run or not (args.push or args.apply_no_push):
         print("Dry run only; no changes were applied")
@@ -1011,7 +1024,10 @@ def main() -> None:
     )
     _write_step_summary(protected_units, bumped)
     if args.push:
-        git("push", "origin", "HEAD:main")
+        import time
+        branch_name = f"sync-update-{int(time.time())}"
+        git("push", "-f", "origin", f"HEAD:{branch_name}")
+        subprocess.run(["gh", "pr", "create", "--base", "main", "--head", branch_name, "--title", "Sync upstream changes", "--body", "Automated sync from upstream."], check=False)
         update_sync_branch(upstream_ref, push=True)
     else:
         print("Applied and validated locally; no push requested")
