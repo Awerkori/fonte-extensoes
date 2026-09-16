@@ -1,0 +1,21 @@
+name: Test Auth
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test BOT_PAT
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "BOT_PAT is empty"; exit 1; fi
+          if gh api repos/Awerkori/extensoes --jq '.full_name' > /dev/null 2>&1; then echo "AUTH_REPO: PASS"; else echo "AUTH_REPO: FAIL"; fi
+          if gh api repos/Awerkori/extensoes/branches/repo --jq '.name' > /dev/null 2>&1; then echo "AUTH_BRANCH_REPO: PASS"; else echo "AUTH_BRANCH_REPO: FAIL"; fi
+      - name: Test SYNC_PAT
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "SYNC_PAT is empty"; exit 1; fi
+          if gh api repos/Awerkori/extensoes --jq '.full_name' > /dev/null 2>&1; then echo "AUTH_REPO: PASS"; else echo "AUTH_REPO: FAIL"; fi
+          if gh api repos/Awerkori/extensoes/branches/repo --jq '.name' > /dev/null 2>&1; then echo "AUTH_BRANCH_REPO: PASS"; else echo "AUTH_BRANCH_REPO: FAIL"; fi
