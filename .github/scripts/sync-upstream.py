@@ -684,6 +684,27 @@ def update_sync_branch(upstream_ref: str, push: bool) -> None:
         print(f"Would update origin/{SYNC_BRANCH} from {upstream_ref}")
 
 
+def ensure_main_unchanged(start_main: str) -> None:
+    """Refuse to publish if main advanced while this sync was running."""
+    git("fetch", "origin")
+    current_main = git("rev-parse", "origin/main").strip()
+    if current_main != start_main:
+        raise RuntimeError(
+            "origin/main advanced during sync; refusing to publish "
+            f"over {start_main} (now {current_main})",
+        )
+
+
+def publish_sync(upstream_ref: str, start_main: str) -> None:
+    """Publish main first, then mirror upstream into the sync branch."""
+    ensure_main_unchanged(start_main)
+    print("Push origin/main: HEAD -> main")
+    git("push", "origin", "HEAD:main")
+    print("Push origin/main: PASS")
+    update_sync_branch(upstream_ref, push=True)
+    print("Push origin/sync: PASS")
+
+
 def print_plan(
     base: str,
     upstream_ref: str,
@@ -917,6 +938,15 @@ def main() -> None:
     ensure_upstream_remote()
 
     git("fetch", "origin")
+    start_main = git("rev-parse", "origin/main").strip()
+    sync_head = git("rev-parse", "HEAD").strip()
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", start_main, sync_head],
+        capture_output=True,
+    ).returncode != 0:
+        raise RuntimeError(
+            "HEAD is not based on the fetched origin/main; refusing to publish",
+        )
     git("fetch", UPSTREAM_REMOTE, UPSTREAM_BRANCH)
 
     upstream_ref = f"{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}"
@@ -1023,12 +1053,13 @@ def main() -> None:
         proven,
     )
     _write_step_summary(protected_units, bumped)
+    print(f"Commit Sync upstream: {git('rev-parse', 'HEAD').strip()}")
     if args.push:
-        import time
-        branch_name = f"sync-update-{int(time.time())}"
-        git("push", "-f", "origin", f"HEAD:{branch_name}")
-        subprocess.run(["gh", "pr", "create", "--base", "main", "--head", branch_name, "--title", "Sync upstream changes", "--body", "Automated sync from upstream."], check=False)
-        update_sync_branch(upstream_ref, push=True)
+        try:
+            publish_sync(upstream_ref, start_main)
+        except RuntimeError as error:
+            print(f"Publish aborted: {error}", file=sys.stderr)
+            sys.exit(1)
     else:
         print("Applied and validated locally; no push requested")
 

@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -12,6 +13,126 @@ SPEC = importlib.util.spec_from_file_location("sync_upstream", SCRIPT)
 sync_upstream = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(sync_upstream)
+
+
+class PublishSyncTest(unittest.TestCase):
+    def test_pushes_main_then_sync_without_pr_or_temporary_branch(self):
+        events = []
+
+        def fake_git(*args, check=True):
+            events.append(("git", args))
+            if args == ("rev-parse", "origin/main"):
+                return "main-start\n"
+            return ""
+
+        def fake_update(ref, push):
+            events.append(("sync", ref, push))
+
+        with patch.object(sync_upstream, "git", side_effect=fake_git), patch.object(
+            sync_upstream, "update_sync_branch", side_effect=fake_update,
+        ):
+            sync_upstream.publish_sync("upstream/main", "main-start")
+
+        self.assertIn(("git", ("push", "origin", "HEAD:main")), events)
+        self.assertIn(("sync", "upstream/main", True), events)
+        main_index = events.index(("git", ("push", "origin", "HEAD:main")))
+        sync_index = events.index(("sync", "upstream/main", True))
+        self.assertLess(main_index, sync_index)
+        git_args = [event[1] for event in events if event[0] == "git"]
+        self.assertFalse(any("sync-update-" in " ".join(args) for args in git_args))
+        self.assertFalse(any(args and args[0] == "gh" for args in git_args))
+
+    def test_main_push_failure_is_propagated_and_sync_is_not_attempted(self):
+        def fake_git(*args, check=True):
+            if args == ("rev-parse", "origin/main"):
+                return "main-start\n"
+            if args == ("push", "origin", "HEAD:main"):
+                raise SystemExit(7)
+            return ""
+
+        with patch.object(sync_upstream, "git", side_effect=fake_git), patch.object(
+            sync_upstream, "update_sync_branch",
+        ) as update:
+            with self.assertRaises(SystemExit):
+                sync_upstream.publish_sync("upstream/main", "main-start")
+        update.assert_not_called()
+
+    def test_sync_push_failure_is_propagated(self):
+        def fake_git(*args, check=True):
+            if args == ("rev-parse", "origin/main"):
+                return "main-start\n"
+            if args == ("push", "origin", "upstream/main:refs/heads/sync"):
+                raise SystemExit(8)
+            return ""
+
+        with patch.object(sync_upstream, "git", side_effect=fake_git):
+            with self.assertRaises(SystemExit):
+                sync_upstream.publish_sync("upstream/main", "main-start")
+
+    def test_main_push_is_normal_and_never_forced(self):
+        calls = []
+
+        def fake_git(*args, check=True):
+            calls.append(args)
+            if args == ("rev-parse", "origin/main"):
+                return "main-start\n"
+            return ""
+
+        with patch.object(sync_upstream, "git", side_effect=fake_git), patch.object(
+            sync_upstream, "update_sync_branch",
+        ):
+            sync_upstream.publish_sync("upstream/main", "main-start")
+
+        main_push = next(args for args in calls if args[:2] == ("push", "origin"))
+        self.assertEqual(main_push, ("push", "origin", "HEAD:main"))
+        self.assertNotIn("-f", main_push)
+
+    def test_main_advance_aborts_before_push(self):
+        calls = []
+
+        def fake_git(*args, check=True):
+            calls.append(args)
+            if args == ("rev-parse", "origin/main"):
+                return "new-main\n"
+            return ""
+
+        with patch.object(sync_upstream, "git", side_effect=fake_git), patch.object(
+            sync_upstream, "update_sync_branch",
+        ) as update:
+            with self.assertRaisesRegex(RuntimeError, "origin/main advanced"):
+                sync_upstream.publish_sync("upstream/main", "old-main")
+
+        self.assertFalse(any(args[:2] == ("push", "origin") for args in calls))
+        update.assert_not_called()
+
+    def test_no_upstream_changes_do_not_commit_or_push(self):
+        calls = []
+
+        def fake_git(*args, check=True):
+            calls.append(args)
+            if args == ("rev-parse", "origin/main"):
+                return "main\n"
+            if args == ("rev-parse", "HEAD"):
+                return "main\n"
+            return ""
+
+        with patch.object(sync_upstream, "ensure_clean_tree"), patch.object(
+            sync_upstream, "ensure_upstream_remote",
+        ), patch.object(sync_upstream, "changed_entries", return_value=[]), patch.object(
+            sync_upstream, "collect_units", return_value=([], []),
+        ), patch.object(sync_upstream, "get_protected_nox_units", return_value=[]), patch.object(
+            sync_upstream, "structural_conflicts", return_value=[],
+        ), patch.object(sync_upstream, "preflight_multisrc", return_value=({}, set())), patch.object(
+            sync_upstream, "protected_multisrc_bases", return_value={},
+        ), patch.object(sync_upstream, "print_plan"), patch.object(
+            sync_upstream, "load_deferred_migrations", return_value={},
+        ), patch.object(sync_upstream, "git", side_effect=fake_git), patch.object(
+            sync_upstream.subprocess, "run", return_value=SimpleNamespace(returncode=0),
+        ), patch.object(sync_upstream.sys, "argv", ["sync-upstream.py"]):
+            sync_upstream.main()
+
+        self.assertFalse(any(args and args[0] == "commit" for args in calls))
+        self.assertFalse(any(args and args[0] == "push" for args in calls))
 
 
 class StructuralMetadataTest(unittest.TestCase):
