@@ -109,6 +109,7 @@ _VERSION_CODE_RE = re.compile(r"(versionCode\s*=\s*)(\d+)")
 _THEME_RE = re.compile(r"""theme\s*=\s*["']([^"']+)["']""")
 _LIB_VERSION_RE = re.compile(r"""libVersion\s*=\s*["']([^"']+)["']""")
 _BASE_VERSION_CODE_RE = re.compile(r"baseVersionCode\s*=\s*(\d+)")
+_LOCAL_PROJECT_RE = re.compile(r"""project\s*\(\s*(?:path\s*=\s*)?["'](:[^"']+)["']""")
 
 
 def _read_file_text(ref: str | None, path: str) -> str | None:
@@ -481,6 +482,34 @@ def validate_multisrc_compatibility() -> list[str]:
             errors.append(
                 f"{unit}: extensão libVersion {extension_lib} != multisrc {theme} {multisrc_lib or 'ausente'}",
             )
+    return errors
+
+
+def validate_local_project_dependencies() -> list[str]:
+    """Return Gradle project dependencies whose local module no longer exists."""
+    errors = []
+    roots = [Path("core"), Path("compiler"), Path("lib"), Path("lib-multisrc"), Path("src")]
+    build_files = []
+    for root in roots:
+        if root.is_dir():
+            build_files.extend(root.rglob("build.gradle.kts"))
+            build_files.extend(root.rglob("build.gradle"))
+
+    for build_file in sorted(set(build_files)):
+        content = build_file.read_text()
+        for match in _LOCAL_PROJECT_RE.finditer(content):
+            project_path = match.group(1)
+            module_path = Path(*project_path.removeprefix(":").split(":"))
+            has_build_file = any(
+                (module_path / filename).is_file()
+                for filename in ("build.gradle.kts", "build.gradle")
+            )
+            if not has_build_file:
+                line_number = content.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"{build_file}:{line_number}: {project_path} -> "
+                    f"{module_path} não existe",
+                )
     return errors
 
 
@@ -883,6 +912,14 @@ def apply_units(
         git("add", "--", str(DEFERRED_MIGRATIONS_FILE))
 
     git("diff", "--check")
+
+    dependency_errors = validate_local_project_dependencies()
+    if dependency_errors:
+        print("Local project dependency validation failed:")
+        for error in dependency_errors:
+            print(f"  - {error}")
+        git("merge", "--abort", check=False)
+        sys.exit(1)
 
     errors = validate_multisrc_compatibility()
     if errors:

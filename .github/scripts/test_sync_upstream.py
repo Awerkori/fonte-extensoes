@@ -470,6 +470,65 @@ class StructuralMetadataTest(unittest.TestCase):
                 os.chdir(prev)
 
 
+class LocalProjectDependencyTest(unittest.TestCase):
+    def setUp(self):
+        self.previous = Path.cwd()
+        self.directory = tempfile.TemporaryDirectory(prefix="nox-dependency-test-")
+        os.chdir(self.directory.name)
+        self.addCleanup(self.cleanup)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@invalid")
+        self.git("config", "user.name", "Sync test")
+
+    def cleanup(self):
+        os.chdir(self.previous)
+        self.directory.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(self, path, content):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    def commit(self, message):
+        self.git("add", ".")
+        self.git("commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def test_missing_protected_dependency_blocks_sync_before_commit(self):
+        self.write(".github/nox-protected.txt", "src/pt/protected\n")
+        self.write(
+            "src/pt/protected/build.gradle.kts",
+            'dependencies { api(project(":lib:removed")) }\n',
+        )
+        self.write("base.txt", "base\n")
+        base = self.commit("base")
+        self.git("branch", "upstream")
+        self.write("upstream.txt", "upstream\n")
+        self.commit("upstream")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with self.assertRaises(SystemExit):
+            sync_upstream.apply_units("upstream", ["upstream.txt"], set(), [], [], set(), {})
+
+        self.assertFalse(Path("upstream.txt").exists())
+        self.assertFalse(Path(".git/MERGE_HEAD").exists())
+        self.assertEqual(
+            sync_upstream.validate_local_project_dependencies(),
+            ["src/pt/protected/build.gradle.kts:1: :lib:removed -> lib/removed não existe"],
+        )
+
+    def test_existing_local_dependency_is_valid(self):
+        self.write("lib/available/build.gradle.kts", "plugins {}\n")
+        self.write(
+            "src/pt/extension/build.gradle.kts",
+            'dependencies { implementation(project(":lib:available")) }\n',
+        )
+        self.assertEqual(sync_upstream.validate_local_project_dependencies(), [])
+
+
 class ProtectedMultisrcTest(unittest.TestCase):
     theme = "sample"
     unit = "lib-multisrc/sample"

@@ -14,9 +14,9 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.lib.cookieinterceptor.CookieInterceptor
 import keiyoushi.lib.randomua.addRandomUAPreference
 import keiyoushi.lib.randomua.setRandomUserAgent
+import keiyoushi.network.addCookie
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstanceOrNull
 import kotlinx.serialization.decodeFromString
@@ -64,7 +64,7 @@ abstract class MangaStop :
                 }
             },
         )
-        addNetworkInterceptor(CookieInterceptor(baseUrl.substringAfter("//"), "wpmanga-ada" to "1"))
+        addCookie("wpmanga-ada" to "1")
         addInterceptor(ClientHintsInterceptor())
         rateLimit(2)
     }

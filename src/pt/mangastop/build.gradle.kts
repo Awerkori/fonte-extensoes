@@ -19,6 +19,5 @@ keiyoushi {
 }
 
 dependencies {
-    api(project(":lib:cookieinterceptor"))
     implementation(project(":lib:randomua"))
 }
