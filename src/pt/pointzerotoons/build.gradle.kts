@@ -5,8 +5,8 @@ plugins {
 }
 
 keiyoushi {
-    name = "Kitsune Yako"
-    versionCode = 3
+    name = "Point Zero Toons"
+    versionCode = 2
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "mangathemesia"
@@ -15,20 +15,4 @@ keiyoushi {
         lang = "pt-BR"
         baseUrl = "https://kitsuneyako.com"
     }
-}
-
-android {
-    sourceSets.named("test") {
-        kotlin.directories.add("test")
-    }
-}
-
-tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") }.configureEach {
-    enabled = false
-}
-
-dependencies {
-    testImplementation(libs.junit)
-    testImplementation(libs.bundles.common)
-    testImplementation(libs.tachiyomi.lib.v16)
 }
