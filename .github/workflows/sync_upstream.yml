@@ -3,7 +3,14 @@ name: Sync Upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 23 * * *" # Executa diariamente às 20:00 (UTC-3 / Horário de Brasília)
+    - cron: "17 20 * * *"
+      timezone: "America/Sao_Paulo"
+    - cron: "17 21 * * *"
+      timezone: "America/Sao_Paulo"
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 permissions: {}
 
