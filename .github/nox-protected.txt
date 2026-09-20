@@ -47,6 +47,7 @@ src/pt/mugiwarasoficial
 src/pt/nexusmangas
 src/pt/nhentaibr
 src/pt/osakascan
+src/pt/pointzerotoons
 src/pt/portalyaoi
 src/pt/remangas
 src/pt/rfdragonscan

@@ -528,6 +528,34 @@ class LocalProjectDependencyTest(unittest.TestCase):
         )
         self.assertEqual(sync_upstream.validate_local_project_dependencies(), [])
 
+    def test_protected_nox_unit_preserves_local_identity_and_extra_files(self):
+        unit = "src/pt/pointzerotoons"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write(
+            f"{unit}/build.gradle.kts",
+            'name = "Kitsune Yako"\nversionCode = 3\n',
+        )
+        self.write(f"{unit}/PointZeroToons.kt", "class PointZeroToons // Nox\n")
+        self.write(f"{unit}/PointZeroToonsParser.kt", "class PointZeroToonsParser // Nox\n")
+        base = self.commit("base")
+
+        self.git("branch", "upstream")
+        self.git("checkout", "-q", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'name = "Point Zero Toons"\nversionCode = 2\n')
+        self.git("rm", f"{unit}/PointZeroToonsParser.kt")
+        self.commit("upstream changes")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        protected = sync_upstream.get_protected_nox_units(base, "upstream")
+        self.assertIn(unit, protected)
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], {unit}, protected, [], set(), {})
+
+        self.assertIn('name = "Kitsune Yako"', Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertIn("versionCode = 3", Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertTrue(Path(f"{unit}/PointZeroToons.kt").is_file())
+        self.assertTrue(Path(f"{unit}/PointZeroToonsParser.kt").is_file())
+
 
 class ProtectedMultisrcTest(unittest.TestCase):
     theme = "sample"
