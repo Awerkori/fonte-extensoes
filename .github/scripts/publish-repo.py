@@ -10,6 +10,7 @@ from pathlib import Path
 import index_pb2
 from github_utils import REPO_NAME, run_gh
 from google.protobuf import json_format
+from legacy_index import update_legacy_index
 
 # Artifacts downloaded from the build jobs: one APK per extension plus the source metadata JSON
 # emitted by each assembleRelease.
@@ -182,6 +183,14 @@ final_extensions.extend(
 final_extensions.extend(ext for ext, _, _, _, _ in new_extensions)
 final_extensions.sort(key=lambda ext: ext.packageName)
 
+legacy_path = REPO_DIR / "index.min.json"
+legacy_entries = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.exists() else []
+legacy_index = update_legacy_index(
+    legacy_entries,
+    [ext for ext, _, _, _, _ in new_extensions] if legacy_path.exists() else final_extensions,
+    to_delete,
+)
+
 index = index_pb2.Index(
     name="Project Nox",
     badgeLabel="NOX",
@@ -206,6 +215,10 @@ with REPO_DIR.joinpath("index.pb").open("wb") as f:
 
 with release_assets_path.open("w", encoding="utf-8") as f:
     json.dump(updated_release_assets, f, indent=2, sort_keys=True)
+    f.write("\n")
+
+with legacy_path.open("w", encoding="utf-8") as f:
+    json.dump(legacy_index, f, ensure_ascii=False, separators=(",", ":"))
     f.write("\n")
 
 with REPO_DIR.joinpath("index.html").open("w", encoding="utf-8") as f:
