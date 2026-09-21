@@ -151,6 +151,20 @@ def effective_version_code(ref: str | None, unit: str) -> tuple[int, int, int] |
     return raw_vc, base_vc, raw_vc + base_vc
 
 
+def local_version_ahead_of_upstream(
+    unit: str,
+    upstream_ref: str,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """Return local/upstream versions when applying upstream would downgrade a unit."""
+    local_info = effective_version_code(None, unit)
+    upstream_info = effective_version_code(upstream_ref, unit)
+    if local_info is None or upstream_info is None:
+        return None
+    if local_info[0] <= upstream_info[0] and local_info[2] <= upstream_info[2]:
+        return None
+    return local_info, upstream_info
+
+
 def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int, int, int, int, int, int] | None:
     """If upstream effective version >= local effective version, bump local raw versionCode.
 
@@ -829,10 +843,23 @@ def apply_units(
         for theme in blocked_themes
         for ext in (local_deps.get(theme, []) + upstream_deps.get(theme, []))
     }
+    protected_set = set(protected_units)
     base = git("merge-base", "HEAD", upstream_ref).strip()
 
     # 1. Apply upstream units (except conflict units where Nox wins, and deferred themes/extensions)
     for unit in units:
+        if unit in protected_set:
+            print(f"Protected Nox unit: preserving local {unit}")
+            continue
+        downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
+        if downgrade is not None:
+            local_info, upstream_info = downgrade
+            print(
+                f"Version guard: preserving {unit}; downgrade blocked "
+                f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
+                f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
+            )
+            continue
         if unit in proven_paths:
             continue
         if unit.startswith("lib-multisrc/") and unit.split("/", 1)[1] in blocked_themes:
@@ -866,6 +893,18 @@ def apply_units(
 
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
+            if unit in protected_set:
+                print(f"Protected Nox unit: preserving local {unit}")
+                continue
+            downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
+            if downgrade is not None:
+                local_info, upstream_info = downgrade
+                print(
+                    f"Version guard: preserving {unit}; downgrade blocked "
+                    f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
+                    f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
+                )
+                continue
             git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
             git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
             if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
@@ -874,6 +913,18 @@ def apply_units(
     # Deferred themes may no longer appear in base..upstream after an ours merge.
     # Their protected extensions must still receive their proven selector migration.
     for unit in structural_units:
+        if unit in protected_set:
+            print(f"Protected Nox unit: preserving local {unit}")
+            continue
+        downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
+        if downgrade is not None:
+            local_info, upstream_info = downgrade
+            print(
+                f"Version guard: preserving {unit}; downgrade blocked "
+                f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
+                f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
+            )
+            continue
         if unit in conflict_units or unit in proven_paths or unit in blocked_theme_extensions:
             continue
         previous_info = effective_version_code(None, unit)
@@ -895,6 +946,9 @@ def apply_units(
     validation_units = set(structural_units)
     deferred_units = {str(unit) for entry in deferred.values() for unit in entry.get("units", [])}
     for unit in protected_units:
+        if not path_exists(upstream_ref, unit):
+            print(f"Version guard: preserving protected {unit}; unit is absent upstream")
+            continue
         if unit in deferred_units or unit in blocked_theme_extensions:
             print(f"Version guard: deferred {unit}; metadata and version preserved")
             continue

@@ -66,3 +66,5 @@ src/pt/xxxyaoi
 src/pt/yaoifanclub
 src/pt/yomumangas
 src/pt/zinnes
+src/pt/karikari
+src/pt/onereader

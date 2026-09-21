@@ -556,6 +556,44 @@ class LocalProjectDependencyTest(unittest.TestCase):
         self.assertTrue(Path(f"{unit}/PointZeroToons.kt").is_file())
         self.assertTrue(Path(f"{unit}/PointZeroToonsParser.kt").is_file())
 
+    def test_protected_nox_unit_is_preserved_when_upstream_deletes_it(self):
+        unit = "src/pt/karikari"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write(f"{unit}/build.gradle.kts", "versionCode = 1\n")
+        self.write(f"{unit}/KariKari.kt", "class KariKari\n")
+        base = self.commit("base")
+
+        self.git("branch", "upstream")
+        self.git("checkout", "-q", "upstream")
+        self.git("rm", "-r", unit)
+        self.commit("upstream deletes local-only unit")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [unit], [], set(), {})
+
+        self.assertTrue(Path(f"{unit}/build.gradle.kts").is_file())
+        self.assertTrue(Path(f"{unit}/KariKari.kt").is_file())
+
+    def test_global_version_guard_blocks_unprotected_downgrade(self):
+        unit = "src/pt/onereader"
+        self.write(f"{unit}/build.gradle.kts", "versionCode = 3\n")
+        self.write(f"{unit}/OneReader.kt", "reader = new\n")
+        base = self.commit("base")
+
+        self.git("branch", "upstream")
+        self.git("checkout", "-q", "upstream")
+        self.write(f"{unit}/build.gradle.kts", "versionCode = 2\n")
+        self.write(f"{unit}/OneReader.kt", "reader = old\n")
+        self.commit("upstream downgrade")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertIn("versionCode = 3", Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertIn("reader = new", Path(f"{unit}/OneReader.kt").read_text())
+
 
 class ProtectedMultisrcTest(unittest.TestCase):
     theme = "sample"
