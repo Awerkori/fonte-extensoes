@@ -24,91 +24,15 @@ import java.util.Locale
 import java.util.TimeZone
 
 @Serializable
-internal class PaginationDto(
-    val page: Int = 1,
-    val totalPages: Int = 1,
-)
-
-@Serializable
-internal class CatalogDto(
-    private val works: List<WorkDto> = emptyList(),
-    private val pagination: PaginationDto = PaginationDto(),
+internal class SearchDto(
+    private val data: List<MangaDto>,
+    private val page: Int,
+    private val totalPages: Int,
 ) {
-    fun toMangasPage() = MangasPage(works.map { it.toSManga() }, pagination.page < pagination.totalPages)
-}
-
-@Serializable
-internal class UpdatesDto(
-    private val items: List<WorkDto> = emptyList(),
-    private val pagination: PaginationDto = PaginationDto(),
-) {
-    fun toMangasPage() = MangasPage(items.map { it.toSManga() }, pagination.page < pagination.totalPages)
-}
-
-@Serializable
-internal class HomeDto(
-    private val popular: List<WorkDto> = emptyList(),
-) {
-    fun toPopularPage() = MangasPage(popular.map { it.toSManga() }, false)
-}
-
-@Serializable
-internal class MetaDto(
-    val genres: Map<String, List<GenreDto>> = emptyMap(),
-)
-
-@Serializable
-internal class GenreDto(val name: String)
-
-@Serializable
-internal class WorkDetailsDto(
-    val work: WorkDto,
-    val chapters: List<ChapterDto> = emptyList(),
-)
-
-@Serializable
-internal class WorkDto(
-    val id: String,
-    val slug: String? = null,
-    val title: String,
-    val originalName: String? = null,
-    val nativeTitle: String? = null,
-    val author: String? = null,
-    val artist: String? = null,
-    val synopsis: String? = null,
-    val status: String? = null,
-    val contentType: String? = null,
-    val type: String? = null,
-    val originCountry: String? = null,
-    val releaseYear: Int? = null,
-    val genres: List<String> = emptyList(),
-    val coverUrl: String? = null,
-    val publisher: String? = null,
-    val totalChapters: Int? = null,
-) {
-    fun toSManga(details: Boolean = false): SManga = SManga.create().apply {
-        url = id
-        title = this@WorkDto.title
-        thumbnail_url = coverUrl
-        author = this@WorkDto.author?.takeIf(String::isNotBlank)
-        artist = this@WorkDto.artist?.takeIf(String::isNotBlank)
-        genre = genres.takeIf(List<String>::isNotEmpty)?.joinToString()
-        status = this@WorkDto.status.orEmpty().toStatus()
-        description = buildString {
-            synopsis?.takeIf(String::isNotBlank)?.let(::append)
-            val metadata = listOfNotNull(
-                originalName?.takeIf { it.isNotBlank() }?.let { "Título original: $it" },
-                nativeTitle?.takeIf { it.isNotBlank() }?.let { "Título nativo: $it" },
-                (contentType ?: type)?.takeIf { it.isNotBlank() }?.let { "Tipo: $it" },
-                originCountry?.takeIf { it.isNotBlank() }?.let { "País: $it" },
-                releaseYear?.let { "Ano: $it" },
-                publisher?.takeIf { it.isNotBlank() }?.let { "Editora: $it" },
-            )
-            if (isNotEmpty() && metadata.isNotEmpty()) append("\n\n")
-            append(metadata.joinToString("\n"))
-        }.ifBlank { null }
-        initialized = details
-    }
+    fun toMangasPage() = MangasPage(
+        data.map(MangaDto::toSManga),
+        page < totalPages,
+    )
 }
 
 @Serializable
@@ -190,47 +114,34 @@ internal class MangaDto(
 
 @Serializable
 internal class ChapterDto(
-    val id: String = "",
-    val number: Double,
-    val title: String? = null,
-    val postedAt: String? = null,
+    @SerialName("manga_key")
+    private val mangaKey: String,
+    @SerialName("posted_date")
+    private val postedDate: String,
 ) {
-    fun toSChapter(mangaKey: String): SChapter = SChapter.create().apply {
-        val numberString = number.toString().removeSuffix(".0")
-        url = "$mangaKey/$numberString"
+    fun toSChapter(number: String): SChapter = SChapter.create().apply {
+        url = "$mangaKey/$number"
         memo = buildJsonObject {
             put("id", mangaKey)
-            put("number", numberString)
+            put("number", number)
         }
-        name = title?.takeIf(String::isNotBlank) ?: "Capítulo $numberString"
-        chapter_number = number.toFloat()
-        date_upload = postedAt?.let(chapterDateFormat::tryParse) ?: 0L
+        name = "Capítulo $number"
+        chapter_number = number.toFloatOrNull() ?: -1F
+        date_upload = chapterDateFormat.tryParse(postedDate)
     }
 }
 
 @Serializable
 internal class PagesDto(
-    private val chapter: ChapterPagesDto? = null,
+    private val pages: List<String>,
 ) {
-    fun toPages(apiBaseUrl: HttpUrl): List<Page> = (chapter?.pages ?: emptyList()).mapIndexed { index, path ->
+    fun toPages(apiBaseUrl: HttpUrl): List<Page> = pages.mapIndexed { index, path ->
         Page(
             index = index,
             imageUrl = requireNotNull(apiBaseUrl.resolve(path)).toString(),
         )
     }
 }
-
-@Serializable
-internal class ChapterPagesDto(val pages: List<String> = emptyList())
-
-@Serializable
-internal class MediaGrantDto(
-    val ok: Boolean = false,
-    val url: String = "",
-    val key: String = "",
-    val mode: String = "",
-    val contentType: String = "image/webp",
-)
 
 private object TagsSerializer : JsonTransformingSerializer<List<String>>(
     ListSerializer(String.serializer()),
