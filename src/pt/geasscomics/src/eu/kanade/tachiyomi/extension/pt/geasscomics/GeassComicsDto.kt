@@ -75,6 +75,7 @@ class ChapterDto(
 @Serializable
 class ReaderChapterDto(
     val pages: List<String> = emptyList(),
+    val pageScrambles: List<String?> = emptyList(),
 )
 
 @Serializable

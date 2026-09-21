@@ -32,6 +32,7 @@ abstract class GeassComics :
     private val preferences by getPreferencesLazy()
 
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2)
+        .addInterceptor(ImageInterceptor())
 
     override fun Headers.Builder.configureHeaders(): Headers.Builder = this
         .add("Accept", "application/json, text/plain, */*")
@@ -119,8 +120,17 @@ abstract class GeassComics :
     override suspend fun getPageList(chapter: SChapter): List<Page> = client
         .get("$baseUrl/api/read/${chapter.url}")
         .parseAs<ReaderChapterDto>()
-        .pages
-        .mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+        .let { chapterData ->
+            chapterData.pages.mapIndexed { index, imageUrl ->
+                val scramble = chapterData.pageScrambles.getOrNull(index)
+                val url = if (Scramble.parse(scramble) != null) {
+                    imageUrl.toHttpUrl().newBuilder().fragment("geass:$scramble").build().toString()
+                } else {
+                    imageUrl
+                }
+                Page(index, imageUrl = url)
+            }
+        }
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/work/${manga.url}"
 
