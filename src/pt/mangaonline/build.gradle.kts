@@ -5,13 +5,14 @@ plugins {
 }
 
 keiyoushi {
-    name = "Manga Online RED"
-    versionCode = 60
+    name = "Manga Online"
+    versionCode = 61
     contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
 
     source {
+        id = 1057607826304767869L
         lang = "pt-BR"
-        baseUrl = "https://mangaonline.red"
+        baseUrl = "https://mangaonline.love"
     }
 }

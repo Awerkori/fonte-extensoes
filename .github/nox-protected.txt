@@ -17,6 +17,7 @@ src/pt/corujatoon
 src/pt/drakz
 src/pt/dropescan
 src/pt/fliptru
+src/pt/fenixproject
 src/pt/geasscomics
 src/pt/hentaifusion
 src/pt/hentaihome
@@ -51,6 +52,7 @@ src/pt/pointzerotoons
 src/pt/portalyaoi
 src/pt/remangas
 src/pt/rfdragonscan
+src/pt/ragnarokscanlation
 src/pt/risentoons
 src/pt/sexkomix
 src/pt/shadowmanga
@@ -62,6 +64,7 @@ src/pt/tiamanhwa
 src/pt/timelinecomics
 src/pt/tomato
 src/pt/valkyuri
+src/pt/vegitoons
 src/pt/xxxyaoi
 src/pt/yaoifanclub
 src/pt/yomumangas

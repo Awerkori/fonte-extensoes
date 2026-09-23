@@ -5,17 +5,16 @@ plugins {
 }
 
 keiyoushi {
-    name = "Manga Online GREEN"
+    name = "Ragnarok Scanlation"
     versionCode = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
-
     source {
-        baseUrl = "https://mangaonline.green"
         lang = "pt-BR"
+        baseUrl = "https://ragnarokscanlation.org"
     }
+}
 
-    deeplink {
-        path("/..*")
-    }
+dependencies {
+    implementation(project(":lib-multisrc:madara"))
 }

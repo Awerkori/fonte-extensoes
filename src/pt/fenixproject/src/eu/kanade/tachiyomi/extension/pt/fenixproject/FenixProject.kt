@@ -3,19 +3,27 @@ package eu.kanade.tachiyomi.extension.pt.fenixproject
 import android.util.Base64
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.lib.cryptoaes.CryptoAES
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.decodeHex
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 @Source
 abstract class FenixProject : Madara() {
@@ -29,6 +37,152 @@ abstract class FenixProject : Madara() {
     override val useLoadMoreRequest = LoadMoreStrategy.Never
 
     override val chapterUrlSuffix = ""
+
+    private val chapterPreviews = ConcurrentHashMap<String, ChapterPreview>()
+
+    override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
+
+    override fun popularMangaParse(response: Response): MangasPage = MangasPage(
+        response.asJsoup().select("section").firstOrNull {
+            it.selectFirst("h2")?.text() == "Os Mais Lidos do Ninho"
+        }?.select("ol > li")?.mapNotNull(::fenixMangaFromElement).orEmpty(),
+        false,
+    )
+
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/?pagina=$page", headers)
+
+    override fun latestUpdatesParse(response: Response): MangasPage = fenixMangaPage(response.asJsoup())
+
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val url = "$baseUrl/pesquisar".toHttpUrl().newBuilder()
+            .addQueryParameter("q", query)
+            .addQueryParameter("pagina", page.toString())
+            .build()
+        return GET(url, headers)
+    }
+
+    override fun searchMangaParse(response: Response): MangasPage = fenixMangaPage(response.asJsoup())
+
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", headers)
+
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = response.asJsoup()
+        cacheChapterPreview(document)
+        return SManga.create().apply {
+            title = document.selectFirst("#work-banner h1, h1")?.text()
+                ?: throw IllegalStateException("Fenix manga title is missing")
+            thumbnail_url = document.select("img[alt]")
+                .firstOrNull { it.attr("alt") == title }
+                ?.attr("abs:src")
+            author = document.metadata("Autor")
+            artist = document.metadata("Artista")
+            status = document.metadata("Status").toStatus()
+            genre = document.select("a[href*='genero=']").eachText().joinToString()
+            description = document.selectFirst("h2:matchesOwn(^Sinopse$) + p")?.text()
+        }
+    }
+
+    override fun chapterListRequest(manga: SManga): Request {
+        val preview = chapterPreviews[manga.url]
+        return if (preview != null && System.currentTimeMillis() - preview.createdAt < CHAPTER_PREVIEW_TTL) {
+            GET("$baseUrl${preview.readerUrl}", headers)
+        } else {
+            mangaDetailsRequest(manga)
+        }
+    }
+
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val document = response.asJsoup()
+        val readerLinks = document.select("[data-select-list] a[href*='/capitulo-']")
+        if (readerLinks.isNotEmpty()) {
+            val mangaUrl = readerLinks.firstOrNull()?.attr("href")?.substringBeforeLast("/capitulo-")
+                ?: return emptyList()
+            val dates = chapterPreviews[mangaUrl]?.dates.orEmpty()
+            return readerLinks.map { link ->
+                SChapter.create().apply {
+                    url = link.attr("href")
+                    name = link.text()
+                    date_upload = dates[url] ?: 0L
+                }
+            }
+        }
+        val visibleChapters = document.select("[id^=chapter-card-]").mapNotNull { card ->
+            val link = card.selectFirst("a[href*='/capitulo-']") ?: return@mapNotNull null
+            SChapter.create().apply {
+                url = link.attr("href")
+                name = card.selectFirst("span[title]")?.text() ?: link.text()
+                date_upload = parseChapterDate(card.selectFirst("span.text-xs")?.text())
+            }
+        }
+
+        val dates = visibleChapters.associateBy(SChapter::url)
+        val firstChapter = visibleChapters.firstOrNull() ?: return emptyList()
+        val chaptersDocument = client.newCall(GET("$baseUrl${firstChapter.url}", headers)).execute().use {
+            it.asJsoup()
+        }
+
+        return chaptersDocument.select("[data-select-list] a[href*='/capitulo-']")
+            .map { link ->
+                dates[link.attr("href")] ?: SChapter.create().apply {
+                    url = link.attr("href")
+                    name = link.text()
+                }
+            }
+    }
+
+    private fun fenixMangaPage(document: Document): MangasPage = MangasPage(
+        document.select("[id^=work-]").mapNotNull(::fenixMangaFromElement),
+        document.selectFirst("a[rel=next]") != null,
+    )
+
+    private fun fenixMangaFromElement(element: Element): SManga? {
+        val link = element.selectFirst("a[href^=/manga/]:not([href*=/capitulo-])") ?: return null
+        val title = element.selectFirst("h3")?.text()
+            ?: element.selectFirst("img[alt]")?.attr("alt")
+            ?: return null
+        return SManga.create().apply {
+            url = link.attr("href")
+            this.title = title
+            thumbnail_url = element.selectFirst("img")?.attr("abs:src")
+        }
+    }
+
+    private fun Document.metadata(label: String): String? = select("dt")
+        .firstOrNull { it.text() == label }
+        ?.nextElementSibling()
+        ?.text()
+        ?.takeIf(String::isNotBlank)
+
+    private fun cacheChapterPreview(document: Document) {
+        val chapters = document.select("[id^=chapter-card-]").mapNotNull { card ->
+            val link = card.selectFirst("a[href*='/capitulo-']") ?: return@mapNotNull null
+            link.attr("href") to parseChapterDate(card.selectFirst("span.text-xs")?.text())
+        }
+        val readerUrl = chapters.firstOrNull()?.first ?: return
+        chapterPreviews[readerUrl.substringBeforeLast("/capitulo-")] = ChapterPreview(
+            readerUrl = readerUrl,
+            dates = chapters.toMap(),
+            createdAt = System.currentTimeMillis(),
+        )
+    }
+
+    private class ChapterPreview(
+        val readerUrl: String,
+        val dates: Map<String, Long>,
+        val createdAt: Long,
+    )
+
+    private fun String?.toStatus(): Int = when (this?.lowercase()) {
+        "concluído", "concluido", "completo" -> SManga.COMPLETED
+        "em andamento" -> SManga.ONGOING
+        "hiato", "pausado" -> SManga.ON_HIATUS
+        "cancelado" -> SManga.CANCELLED
+        else -> SManga.UNKNOWN
+    }
+
+    private companion object {
+        const val CHAPTER_PREVIEW_TTL = 2 * 60 * 1000L
+    }
 
     override fun pageListRequest(chapter: SChapter): Request {
         val request = super.pageListRequest(chapter)
@@ -46,6 +200,10 @@ abstract class FenixProject : Madara() {
 
     override fun pageListParse(document: Document): List<Page> {
         launchIO { countViews(document) }
+
+        document.select("#reader-pages img").mapIndexed { index, image ->
+            Page(index, document.location(), image.attr("abs:src"))
+        }.takeIf { it.isNotEmpty() }?.let { return it }
 
         var chapterData: String? = null
         var password: String? = null
@@ -100,10 +258,10 @@ abstract class FenixProject : Madara() {
         if (chapterData != null && password != null) {
             val chapterDataJson = json.parseToJsonElement(chapterData.replace("\\/", "/")).jsonObject
             val unsaltedCiphertext = Base64.decode(
-                chapterDataJson["ct"]!!.jsonPrimitive.content,
+                chapterDataJson["ct"]?.jsonPrimitive?.content ?: return emptyList(),
                 Base64.DEFAULT,
             )
-            val salt = chapterDataJson["s"]!!.jsonPrimitive.content.decodeHex()
+            val salt = chapterDataJson["s"]?.jsonPrimitive?.content?.decodeHex() ?: return emptyList()
             val ciphertext = salted + salt + unsaltedCiphertext
 
             val rawImgArray = CryptoAES.decrypt(Base64.encodeToString(ciphertext, Base64.DEFAULT), password)

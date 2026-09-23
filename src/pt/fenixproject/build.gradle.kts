@@ -6,13 +6,16 @@ plugins {
 
 keiyoushi {
     name = "Fenix Project"
-    versionCode = 3
+    versionCode = 56
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
-    theme = "madaralegacy"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://fenixproject.site"
+        baseUrl = "https://fenixproject.website"
     }
+}
+
+dependencies {
+    implementation(project(":lib-multisrc:madaralegacy"))
 }

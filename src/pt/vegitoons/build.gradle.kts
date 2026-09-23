@@ -6,13 +6,16 @@ plugins {
 
 keiyoushi {
     name = "Vegitoons"
-    versionCode = 0
+    versionCode = 13
     contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
-    theme = "greenshit"
 
     source {
         lang = "pt-BR"
         baseUrl = "https://vegitoons.black"
     }
+}
+
+dependencies {
+    implementation(project(":lib-multisrc:greenshit"))
 }
