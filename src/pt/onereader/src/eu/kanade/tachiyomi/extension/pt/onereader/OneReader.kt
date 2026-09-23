@@ -112,7 +112,7 @@ abstract class OneReader : KeiSource() {
             .apply { initialized = true }
     }
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga-details".toHttpUrl().newBuilder()
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/obra".toHttpUrl().newBuilder()
         .addQueryParameter("id", manga.url)
         .build()
         .toString()

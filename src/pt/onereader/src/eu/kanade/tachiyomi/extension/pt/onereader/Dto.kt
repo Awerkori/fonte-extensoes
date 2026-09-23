@@ -9,10 +9,12 @@ import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.nullable
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonTransformingSerializer
 import kotlinx.serialization.json.buildJsonObject
@@ -83,6 +85,7 @@ internal class WorkDto(
     val releaseYear: Int? = null,
     val genres: List<String> = emptyList(),
     val coverUrl: String? = null,
+    @Serializable(with = PublisherSerializer::class)
     val publisher: String? = null,
     val totalChapters: Int? = null,
 ) {
@@ -108,6 +111,14 @@ internal class WorkDto(
             append(metadata.joinToString("\n"))
         }.ifBlank { null }
         initialized = details
+    }
+}
+
+internal object PublisherSerializer : JsonTransformingSerializer<String?>(String.serializer().nullable) {
+    override fun transformDeserialize(element: JsonElement): JsonElement = when (element) {
+        is JsonObject -> element["name"]?.takeIf { it is JsonPrimitive && it.isString } ?: JsonNull
+        is JsonPrimitive -> element.takeIf { it is JsonNull || it.isString } ?: JsonNull
+        else -> JsonNull
     }
 }
 
