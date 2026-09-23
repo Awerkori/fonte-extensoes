@@ -16,6 +16,18 @@ SPEC.loader.exec_module(sync_upstream)
 
 
 class PublishSyncTest(unittest.TestCase):
+    def test_local_versions_ahead_are_not_treated_as_missing_upstream_updates(self):
+        with patch.object(
+            sync_upstream,
+            "local_version_ahead_of_upstream",
+            return_value=((3, 0, 3), (2, 0, 2)),
+        ):
+            pending = sync_upstream.pending_sync_units(
+                ["src/tr/korelimanga"], [], "upstream/main",
+            )
+
+        self.assertEqual(pending, [])
+
     def test_pushes_main_then_sync_without_pr_or_temporary_branch(self):
         events = []
 
@@ -593,6 +605,40 @@ class LocalProjectDependencyTest(unittest.TestCase):
 
         self.assertIn("versionCode = 3", Path(f"{unit}/build.gradle.kts").read_text())
         self.assertIn("reader = new", Path(f"{unit}/OneReader.kt").read_text())
+
+    def test_version_guard_noop_exits_without_an_empty_commit(self):
+        unit = "src/tr/korelimanga"
+        self.write(f"{unit}/build.gradle.kts", 'versionCode = 2\nlibVersion = "1.6"\n')
+        base = self.commit("base")
+        self.git("branch", "upstream", base)
+        self.write(f"{unit}/build.gradle.kts", 'versionCode = 3\nlibVersion = "1.6"\n')
+        before = self.commit("local version ahead")
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertFalse(Path(".git/MERGE_HEAD").exists())
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
+    def test_new_upstream_merge_is_committed_even_when_version_guard_preserves_tree(self):
+        unit = "src/tr/korelimanga"
+        self.write(f"{unit}/build.gradle.kts", 'versionCode = 2\nlibVersion = "1.6"\n')
+        base = self.commit("base")
+        self.git("branch", "upstream", base)
+        self.write(f"{unit}/build.gradle.kts", 'versionCode = 3\nlibVersion = "1.6"\n')
+        before = self.commit("local version ahead")
+        self.git("checkout", "-q", "upstream")
+        self.write("upstream.txt", "new upstream ancestry\n")
+        self.commit("upstream advance")
+        self.git("checkout", "-q", "master")
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(len(self.git("show", "-s", "--format=%P", "HEAD").split()), 2)
+        self.assertFalse(Path(".git/MERGE_HEAD").exists())
 
 
 class ProtectedMultisrcTest(unittest.TestCase):

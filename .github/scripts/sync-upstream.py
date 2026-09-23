@@ -165,6 +165,46 @@ def local_version_ahead_of_upstream(
     return local_info, upstream_info
 
 
+def pending_sync_units(
+    diff_units: list[str],
+    protected_units: list[str],
+    upstream_ref: str,
+) -> list[str]:
+    """Return HEAD/upstream differences which still need a sync attempt.
+
+    Protected Nox units and units whose local version is deliberately ahead are
+    expected divergences, not missing upstream updates.
+    """
+    protected = set(protected_units)
+    pending = []
+    for unit in diff_units:
+        if unit in protected:
+            print(f"Expected Nox divergence: preserving protected {unit}")
+            continue
+        if local_version_ahead_of_upstream(unit, upstream_ref) is not None:
+            print(f"Expected version divergence: local {unit} is ahead of upstream")
+            continue
+        pending.append(unit)
+    return pending
+
+
+def has_staged_changes() -> bool:
+    """Return whether the index differs from HEAD, failing on git errors."""
+    result = subprocess.run(["git", "diff", "--cached", "--quiet"])
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    raise RuntimeError("Unable to inspect staged sync changes")
+
+
+def merge_in_progress() -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        capture_output=True,
+    ).returncode == 0
+
+
 def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int, int, int, int, int, int] | None:
     """If upstream effective version >= local effective version, bump local raw versionCode.
 
@@ -1008,6 +1048,10 @@ def apply_units(
     if bumped:
         commit_msg += "\n\nNox-resolved conflicts touched by upstream:\n" + "\n".join(f"  - {b}" for b in bumped)
 
+    if not has_staged_changes() and not merge_in_progress():
+        print("No sync changes to commit")
+        return bumped
+
     git("commit", "-m", commit_msg)
     return bumped
 
@@ -1114,7 +1158,7 @@ def main() -> None:
     # Determine effective differences between HEAD and upstream_ref
     diff_entries = changed_entries("HEAD", upstream_ref)
     diff_units, _ = collect_units(diff_entries)
-    effective_diff = [u for u in diff_units if u not in protected_units]
+    effective_diff = pending_sync_units(diff_units, protected_units, upstream_ref)
 
     if not upstream_units and not load_deferred_migrations() and not effective_diff:
         print("No upstream changes to apply")
