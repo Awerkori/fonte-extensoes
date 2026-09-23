@@ -772,6 +772,43 @@ class ProtectedMultisrcTest(unittest.TestCase):
         self.assertFalse(sync_upstream.load_deferred_migrations())
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_j1_proven_migration_overrides_version_guard_atomically(self):
+        self.nox_patch()
+        for unit in self.extensions:
+            self.write(f"{unit}/Nox.kt", "nox source\n")
+            gradle = Path(f"{unit}/build.gradle.kts")
+            gradle.write_text(gradle.read_text().replace("versionCode = 1", "versionCode = 7"))
+        self.commit("protected dependents ahead")
+        self.advance(structural=True)
+        proven, deferred = sync_upstream.prove_protected_multisrc(self.base, "upstream", self.extensions, set())
+        self.assertFalse(deferred)
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(self.base, "upstream"))[0]
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", units, {self.unit}, self.extensions, [], set(), deferred, proven)
+        for unit in self.extensions:
+            gradle = Path(f"{unit}/build.gradle.kts").read_text()
+            self.assertIn('libVersion = "1.7"', gradle)
+            self.assertIn("versionCode = 8", gradle)
+            self.assertEqual(Path(f"{unit}/Nox.kt").read_text(), "nox source\n")
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+
+    def test_j2_structural_migration_overrides_unprotected_version_guard(self):
+        for unit in self.extensions:
+            self.write(f"{unit}/src/Nox.kt", "local source\n")
+            gradle = Path(f"{unit}/build.gradle.kts")
+            gradle.write_text(gradle.read_text().replace("versionCode = 1", "versionCode = 7"))
+        self.commit("local dependents ahead")
+        self.advance(structural=True)
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(self.base, "upstream"))[0]
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", units, {self.unit}, [], self.extensions, set(), {}, {})
+        for unit in self.extensions:
+            gradle = Path(f"{unit}/build.gradle.kts").read_text()
+            self.assertIn('libVersion = "1.7"', gradle)
+            self.assertIn("versionCode = 8", gradle)
+            self.assertEqual(Path(f"{unit}/src/Nox.kt").read_text(), "local source\n")
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+
     def test_k_apply_defers_atomically_and_keeps_unrelated_updates(self):
         self.nox_patch()
         self.advance(conflict=True, structural=True)

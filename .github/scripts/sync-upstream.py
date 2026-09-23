@@ -302,15 +302,15 @@ def preflight_multisrc(
             local_lib = local[1] if local else None
             upstream_lib = upstream[1] if upstream else None
             new_lib = upstream_multi[0] if upstream_multi else None
-            needs = bool(unit in protected and (local_lib != new_lib or (local and upstream and local[0] != upstream[0])))
+            needs = bool(local_lib != new_lib or (local and upstream and local[0] != upstream[0]))
             supported = bool(
                 upstream_multi
                 and upstream
                 and upstream[0] == theme
                 and upstream_lib == new_lib
             )
-            source_changed = bool(unit in protected and subprocess.run(
-                ["git", "diff", "--quiet", upstream_ref, "--", f"{unit}/src"],
+            source_changed = bool(subprocess.run(
+                ["git", "diff", "--quiet", base, "HEAD", "--", f"{unit}/src"],
             ).returncode != 0)
             rows.append({
                 "unit": unit,
@@ -393,12 +393,20 @@ def verify_migration_plan(
                 if result.returncode:
                     blocked.add(theme)
                     continue
+                rows_by_unit = {str(row["unit"]): row for row in report.get(theme, [])}
                 for unit in units:
                     local = sandbox / unit / "build.gradle.kts"
                     upstream = _read_file_text(upstream_ref, f"{unit}/build.gradle.kts")
                     if not local.exists() or upstream is None:
                         blocked.add(theme)
                         break
+                    if not rows_by_unit[unit]["source_divergent"]:
+                        result = subprocess.run(
+                            ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", unit],
+                        )
+                        if result.returncode:
+                            blocked.add(theme)
+                            break
                     target = structural_metadata(upstream_ref, unit)
                     if target is None:
                         blocked.add(theme)
@@ -848,6 +856,21 @@ def apply_units(
 
     # 1. Apply upstream units (except conflict units where Nox wins, and deferred themes/extensions)
     for unit in units:
+        if unit in structural_units and not unit.startswith("lib-multisrc/"):
+            previous_info = effective_version_code(None, unit)
+            source_divergent = subprocess.run(
+                ["git", "diff", "--quiet", base, "HEAD", "--", f"{unit}/src"],
+            ).returncode != 0
+            if source_divergent:
+                changed = merge_structural_metadata(unit, upstream_ref)
+            else:
+                git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
+                git("restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", unit)
+                changed = True
+            version_changed = bump_after_structural_change(unit, previous_info) if changed else False
+            if changed or version_changed:
+                git("add", "--", f"{unit}/build.gradle.kts")
+            continue
         if unit in protected_set:
             print(f"Protected Nox unit: preserving local {unit}")
             continue
@@ -893,18 +916,9 @@ def apply_units(
 
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
-            if unit in protected_set:
-                print(f"Protected Nox unit: preserving local {unit}")
-                continue
-            downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
-            if downgrade is not None:
-                local_info, upstream_info = downgrade
-                print(
-                    f"Version guard: preserving {unit}; downgrade blocked "
-                    f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
-                    f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
-                )
-                continue
+            # This tree was built successfully with the upstream multisrc metadata
+            # and the preserved Nox source. Apply it before the generic version
+            # guard, which must not block an atomic structural migration.
             git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
             git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
             if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
