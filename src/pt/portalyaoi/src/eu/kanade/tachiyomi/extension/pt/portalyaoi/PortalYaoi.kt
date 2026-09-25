@@ -14,6 +14,10 @@ import kotlin.time.Duration.Companion.seconds
 abstract class PortalYaoi : MadaraNoAjax() {
     override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale("pt", "BR"))
 
+    override suspend fun getPopularManga(page: Int) = archivePage(page, "views", "/?post_type=wp-manga")
+
+    override suspend fun getLatestUpdates(page: Int) = archivePage(page, "latest", "/?post_type=wp-manga")
+
     override fun OkHttpClient.Builder.configureClient() = rateLimit(1, 2.seconds) {
         !it.encodedPath.startsWith("/wp-content/uploads/")
     }
