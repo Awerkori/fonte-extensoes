@@ -1,8 +1,11 @@
 package eu.kanade.tachiyomi.extension.pt.fenixproject
 
 import android.util.Base64
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -13,6 +16,7 @@ import keiyoushi.lib.cryptoaes.CryptoAES
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.decodeHex
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -26,10 +30,33 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 @Source
-abstract class FenixProject : Madara() {
+abstract class FenixProject :
+    Madara(),
+    ConfigurableSource {
+    private val preferences by getPreferencesLazy()
+
+    private val showAdultContent get() = preferences.getBoolean(ADULT_CONTENT_PREF, false)
+
     override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale("pt", "BR"))
     override val client = super.client.newBuilder()
         .rateLimit(3)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (request.url.host != baseUrl.toHttpUrl().host) {
+                chain.proceed(request)
+            } else {
+                val cookies = request.header("Cookie").orEmpty()
+                    .split(';')
+                    .map(String::trim)
+                    .filter { it.isNotEmpty() && !it.startsWith("$ADULT_CONTENT_COOKIE=") }
+                val adultCookie = "$ADULT_CONTENT_COOKIE=${if (showAdultContent) "1" else "0"}"
+                chain.proceed(
+                    request.newBuilder()
+                        .header("Cookie", (cookies + adultCookie).joinToString("; "))
+                        .build(),
+                )
+            }
+        }
         .build()
 
     override val useNewChapterEndpoint = true
@@ -39,6 +66,15 @@ abstract class FenixProject : Madara() {
     override val chapterUrlSuffix = ""
 
     private val chapterPreviews = ConcurrentHashMap<String, ChapterPreview>()
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        SwitchPreferenceCompat(screen.context).apply {
+            key = ADULT_CONTENT_PREF
+            title = "Mostrar conteúdo adulto"
+            summary = "Inclui obras +18 nos populares, nas últimas atualizações e na busca."
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+    }
 
     override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
 
@@ -182,6 +218,8 @@ abstract class FenixProject : Madara() {
 
     private companion object {
         const val CHAPTER_PREVIEW_TTL = 2 * 60 * 1000L
+        const val ADULT_CONTENT_PREF = "pref_show_adult_content"
+        const val ADULT_CONTENT_COOKIE = "fenix_adult"
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
