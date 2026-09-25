@@ -7,6 +7,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
@@ -17,6 +18,7 @@ internal object Reader {
     private val literals = Regex(""""(?:\\.|[^"\\])*+"|'(?:\\.|[^'\\])*+'|`(?:\\.|[^`\\])*+`""")
     private val nonUrl = Regex("[\\*{}<>]")
     private val imagePath = Regex("""\.(?:avif|gif|jpe?g|png|webp)(?:$|[?#])""", RegexOption.IGNORE_CASE)
+    private val thumbnailSuffix = Regex("""-\d+x\d+(?=\.(?:avif|gif|jpe?g|png|webp)(?:$|[?#]))""", RegexOption.IGNORE_CASE)
     private val noise = Regex("""(?:^|[/_.\s-])(?:logo|avatar|icon|favicon|placeholder|loading|spinner|spacer|blank|banner)(?:$|[/_.\s-])""", RegexOption.IGNORE_CASE)
     private val base64 = Regex("[A-Za-z0-9+/]+={0,2}")
     private val unicodeEscape = Regex("""\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})""")
@@ -28,16 +30,21 @@ internal object Reader {
     private val nonPagePath = Regex("(?i)/(?:wp-admin|wp-json|wp-includes|wp-content/(?:plugins|themes))/")
     private val fieldName = Regex("[\"'`]?([A-Za-z_$][A-Za-z0-9_$]*)[\"'`]?$")
     private val readerSelector = ".reading-content, .page-break, [id*=reader], [class*=reader], [id*=chapter-images], [class*=chapter-content], [itemprop=articleBody]"
-    private val secureKeyAssignment = Regex("""(?s)(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*((?:String\.fromCharCode\s*\(\s*\d+\s*-\s*\d+\s*\)\s*\+?\s*)+);""")
+    private val secureKeyAssignment = Regex("""(?s)(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*((?:String\.fromCharCode\s*\(\s*\d+\s*-\s*\d+\s*\)\s*\+?\s*)+);?""")
     private val secureKeyPart = Regex("""String\.fromCharCode\s*\(\s*(\d+)\s*-\s*(\d+)\s*\)""")
+    private const val BROWSER_RESTRICTION_MESSAGE = "O 3xYaoi bloqueou a leitura deste capítulo em clientes Mihon/Tachiyomi. Abra este capítulo pelo navegador oficial do site."
 
     private class Candidate(val urls: List<String>, val explicit: Boolean)
     private val candidateOrder = compareByDescending<Candidate> { it.explicit }.thenByDescending { it.urls.size }
 
     class PagesNotFound(category: String) : IllegalStateException("XXX Yaoi: não foi possível localizar as páginas do capítulo (reader mudou; $category).")
+    class BrowserRestricted : IOException(BROWSER_RESTRICTION_MESSAGE)
 
     // Only scripts explicitly declared by the chapter are fetched, and only after local extraction fails.
     suspend fun load(document: Document, madara: () -> List<String> = { emptyList() }, fetchScript: suspend (String) -> String?): List<String> {
+        // The current reader is self-contained. Do not probe unrelated scripts
+        // when its encrypted payload is present but malformed.
+        if (AesGcmReader.present(document) || CssReader.present(document) || hasSecureReader(document)) return extract(document, madara)
         val failure = try {
             return extract(document, madara)
         } catch (error: PagesNotFound) {
@@ -71,7 +78,13 @@ internal object Reader {
     }.distinct().sortedByDescending { it.contains("reader", true) || it.contains("chapter", true) }.take(64)
 
     fun extract(document: Document, madara: () -> List<String> = { emptyList() }, externalScripts: List<String> = emptyList()): List<String> {
-        secureReaderPages(document)?.let { return it }
+        if (AesGcmReader.present(document)) return AesGcmReader.extract(document)
+        // The new CSS/data-d reader coexists with an RC4 decoy; prioritize its actual payload.
+        if (CssReader.present(document)) return CssReader.extract(document)
+        if (hasSecureReader(document)) {
+            return secureReaderPages(document)
+                ?: throw PagesNotFound("secure-payload-invalid")
+        }
         val scripts = (
             document.select("script").map { script ->
                 script.attr("src").takeIf { it.startsWith("data:text/javascript;base64,") }
@@ -125,7 +138,15 @@ internal object Reader {
             if (ranked.getOrNull(1)?.let { it.urls.size == best.urls.size && it.explicit == best.explicit } == true) throw PagesNotFound("ambiguous-image-candidates")
             return best.urls
         }
-        runCatching { normalize(madara(), document) }.getOrNull()?.takeIf(List<String>::isNotEmpty)?.let { return it }
+        try {
+            normalize(madara(), document).takeIf(List<String>::isNotEmpty)?.let { return it }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: BrowserRestricted) {
+            throw error
+        } catch (_: Exception) {
+            // Ignore an unavailable Madara fallback.
+        }
         val category = when {
             payloads.isNotEmpty() && keys.isEmpty() -> "key-not-found"
             payloads.isNotEmpty() -> "payload-invalid"
@@ -134,33 +155,49 @@ internal object Reader {
         throw PagesNotFound(category)
     }
 
+    // The site has used both an HTML fragment and a JSON list inside encrypted readers.
+    // Accept either only after it validates as a page list.
+    internal fun decryptedPages(payload: String, document: Document): List<String> {
+        jsonPages(payload, document, true)?.urls?.let { return it }
+        val decrypted = Jsoup.parseBodyFragment(payload, document.location())
+        return normalize(images(decrypted.body()), decrypted).takeIf(List<String>::isNotEmpty)
+            ?: throw PagesNotFound("aes-pages-empty")
+    }
+
     /** XXX Yaoi's current reader mounts pages from an RC4-encrypted text/template vault. */
+    private fun hasSecureReader(document: Document): Boolean = document.select("script[type=text/template]").any { it.data().contains('~') } &&
+        document.select("script:not([src])").any { script ->
+            script.data().contains("_rc4") && script.data().contains("String.fromCharCode")
+        }
+
     private fun secureReaderPages(document: Document): List<String>? {
-        val container = document.selectFirst(".reading-content .xyaoi-secure-reader-container") ?: return null
-        val script = document.select("script:not([src])").firstOrNull { element ->
-            element.data().let { source ->
-                source.contains("containerId") && source.contains("vaultId") &&
-                    source.contains("_rc4") && source.contains("String.fromCharCode")
-            }
-        } ?: return null
-        val source = script.data()
+        val templates = document.select("script[type=text/template]").filter { it.data().contains('~') }
+        val source = document.select("script:not([src])").firstOrNull { element ->
+            element.data().contains("_rc4") && element.data().contains("String.fromCharCode")
+        }?.data() ?: return null
         val expression = secureKeyAssignment.find(source)?.groupValues?.get(1) ?: return null
         val codes = secureKeyPart.findAll(expression).map { match ->
             match.groupValues[1].toInt() - match.groupValues[2].toInt()
         }.toList()
         if (codes.size < 8 || codes.any { it !in 0..255 }) return null
         val key = codes.map(Int::toChar).joinToString("")
-        val vaultId = Regex("""\b(?:var|let|const)\s+\w*vault\w*\s*=\s*[\"'](v_[A-Za-z0-9_-]+)[\"']""", RegexOption.IGNORE_CASE)
+        val vaultId = Regex("""\b(?:var|let|const)\s+\w*vault\w*\s*=\s*[\"']([A-Za-z0-9_-]+)[\"']""", RegexOption.IGNORE_CASE)
             .find(source)?.groupValues?.get(1)
-        val vault = vaultId?.let(document::getElementById)
-            ?: document.select("script[type=text/template][id^=v_]").firstOrNull()
-            ?: return null
-        if (container.id().isBlank() || vault.id().isBlank()) return null
-        return runCatching {
-            val encrypted = decode(vault.data().replace("~", "")) ?: return@runCatching null
-            val pages = rc4(key, encrypted).parseAs<List<String>>()
-            normalize(pages, document).takeIf(List<String>::isNotEmpty)
-        }.getOrNull()
+        val preferredTemplate = vaultId?.let(document::getElementById)
+        val orderedTemplates = preferredTemplate?.let { template ->
+            listOf(template) + templates.filterNot { it === template }
+        } ?: templates
+        return orderedTemplates.firstNotNullOfOrNull { vault ->
+            try {
+                val encrypted = decode(vault.data().replace("~", "")) ?: return@firstNotNullOfOrNull null
+                val pages = rc4(key, encrypted).parseAs<List<String>>()
+                normalize(pages, document).takeIf(List<String>::isNotEmpty)
+            } catch (error: BrowserRestricted) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     private fun rc4(key: String, input: ByteArray): String {
@@ -243,13 +280,15 @@ internal object Reader {
             !noise.containsMatchIn(img.className() + " " + img.id() + " " + img.attr("alt")) &&
             listOf("width", "height").none { img.attr(it).toIntOrNull()?.let { size -> size in 1..64 } == true }
     }.flatMap { img ->
-        val attrs = listOf("data-src", "data-lazy-src", "data-original", "data-srcset", "srcset", "src") +
+        val attrs = listOf("data-xsec", "data-src", "data-lazy-src", "data-original", "data-srcset", "srcset", "src") +
             img.attributes().filter { it.key.startsWith("data-") }.map { it.key }
         // Keep alternatives together; normalization chooses one usable URL per image.
         listOfNotNull(
             attrs.firstNotNullOfOrNull { attr ->
                 val raw = img.attr(attr).trim()
-                val url = if (attr.endsWith("srcset")) {
+                val url = if (attr == "data-xsec") {
+                    raw.reversed()
+                } else if (attr.endsWith("srcset")) {
                     srcsetEntry.findAll(raw).lastOrNull()?.groupValues?.get(1) ?: raw.substringBefore(' ').trimEnd(',')
                 } else {
                     raw
@@ -265,7 +304,8 @@ internal object Reader {
             val value = Parser.unescapeEntities(raw, false).trim().replace("\\/", "/")
             if (!looksLikeImage(value) || value.startsWith("data:") || value.startsWith('#') || value.contains("\${")) return@mapNotNull null
             val url = base.resolve(value)?.takeIf { it.scheme == "http" || it.scheme == "https" } ?: return@mapNotNull null
-            if (url.username.isNotEmpty() || url.password.isNotEmpty() || nonPagePath.containsMatchIn(url.encodedPath) || noise.containsMatchIn(url.encodedPath)) return@mapNotNull null
+            if (url.encodedPath.trimEnd('/').substringAfterLast('/').equals("warning_app.jpg", ignoreCase = true)) throw BrowserRestricted()
+            if (url.username.isNotEmpty() || url.password.isNotEmpty() || nonPagePath.containsMatchIn(url.encodedPath) || noise.containsMatchIn(url.encodedPath) || thumbnailSuffix.containsMatchIn(url.encodedPath)) return@mapNotNull null
             url.toString()
         }.distinct()
     }

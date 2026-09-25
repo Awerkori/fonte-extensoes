@@ -1,4 +1,4 @@
-package eu.kanade.tachiyomi.extension.pt.ragnarokscanlation
+package eu.kanade.tachiyomi.extension.all.ragnarokscanlation
 
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.multisrc.madara.MadaraBase.ChapterMode

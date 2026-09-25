@@ -9,15 +9,16 @@ import okhttp3.Response
 import java.io.IOException
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class FleurBlanche : Madara() {
     override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.forLanguageTag("pt-BR"))
     override val chapterMode = ChapterMode.MangaAjax
+    override val mangaDetailsSelectorDescription = "div.manga-summary"
+    override val sendViewCount = false
 
     override fun OkHttpClient.Builder.configureClient() = addInterceptor(::authWarningIntercept)
-        .rateLimit(1, 2.seconds) { !it.encodedPath.startsWith("/wp-content/uploads/") }
+        .rateLimit(2) { !it.encodedPath.startsWith("/wp-content/uploads/") }
 
     override val mangaDetailsSelectorStatus = "div.post-content_item:contains(Status) > div.summary-content"
 

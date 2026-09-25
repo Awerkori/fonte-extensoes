@@ -43,15 +43,7 @@ abstract class PointZeroToons : MangaThemesia() {
         }
     }
 
-    override fun searchMangaUrl(page: Int, query: String, filters: FilterList) = super.searchMangaUrl(page, query, filters).apply {
-        if (build().queryParameter("order") == "update") {
-            setQueryParameter("order", "updated")
-        }
-        if (page > 1) {
-            encodedPath(pointZeroCatalogPath(page))
-            removeAllQueryParameters("page")
-        }
-    }
+    override fun searchMangaUrl(page: Int, query: String, filters: FilterList) = pointZeroSearchUrl(super.searchMangaUrl(page, query, filters), page)
 
     override fun searchMangaParse(document: Document): MangasPage {
         val mangas = parsePointZeroCards(document).map { card ->

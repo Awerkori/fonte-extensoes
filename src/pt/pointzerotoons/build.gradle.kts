@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Kitsune Yako"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "mangathemesia"
@@ -20,6 +20,7 @@ keiyoushi {
 android {
     sourceSets.named("test") {
         kotlin.directories.add("test")
+        resources.srcDir("test/fixtures")
     }
 }
 

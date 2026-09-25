@@ -241,6 +241,16 @@ internal class MediaGrantDto(
     val key: String = "",
     val mode: String = "",
     val contentType: String = "image/webp",
+    val keyWrap: MediaKeyWrapDto? = null,
+)
+
+@Serializable
+internal class MediaKeyWrapDto(
+    val mode: String = "",
+    val serverKey: String = "",
+    val iv: String = "",
+    val payload: String = "",
+    val context: String = "",
 )
 
 private object TagsSerializer : JsonTransformingSerializer<List<String>>(

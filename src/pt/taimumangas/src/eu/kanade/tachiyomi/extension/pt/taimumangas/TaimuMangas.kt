@@ -168,7 +168,7 @@ abstract class TaimuMangas : HttpSource() {
     private fun extractIdentifier(url: String): String = url.trimEnd('/').substringAfterLast('/')
 
     companion object {
-        private const val API_BASE_URL = "https://apiv2.taimumangas.com/api/v1/reader"
+        private const val API_BASE_URL = "https://api.taimumangas.com/api/v1/reader"
         private const val PAGE_SIZE = 24
         private const val CHAPTER_PAGE_SIZE = 100
     }

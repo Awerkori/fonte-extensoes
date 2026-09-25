@@ -1,29 +1,53 @@
-# XXX Yaoi — validação local (2026-09-13)
+# XXX Yaoi — contratos do reader
+
+## Mecanismo confirmado no aparelho
+
+O HTML HTTP 200 contém payload em atributo `data-d`, chave em propriedade CSS e o decodificador do site. O RC4/text-template pode coexistir como isca que retorna `warning_app.jpg`. O reader CSS tem prioridade; falha nele não autoriza usar a isca, procurar chaves por tentativa ou baixar scripts aleatórios.
+
+O usuário confirmou leitura funcional no Komikku após corrigir o fechamento da regex para Android. A rodada de endurecimento precisa de nova validação manual; testes locais não substituem GETs reais do site.
+
+## Invariantes
+
+- Nomes de variáveis/funções não identificam o reader novo. ID, seletor, atributo, propriedade CSS, seed e shift são extraídos do script de cada capítulo.
+- Aceitar espaços/quebras, aspas simples/duplas, parâmetros decimais/hexadecimais, comentários entre parâmetros, CSS :root/html e !important.
+- Só aceitar uma combinação não ambígua. CSS condicional/herança/expressões dinâmicas não suportadas exigem manutenção; nunca escolher uma chave aleatória.
+- Payload completo, ordem original, deduplicação e query de imagens assinadas preservados. Nenhuma página inválida pode ser descartada silenciosamente no reader novo.
+- Nenhuma chave/payload/URL de capítulo é armazenada globalmente. Capítulos concorrentes são testados.
+- `warning_app.jpg` em qualquer posição é bloqueio, não página. Capas/thumbs não substituem páginas.
+- `Page.url` é a URL do capítulo. GET de imagem usa somente User-Agent, Accept image/* e Referer; CookieJar do cliente permanece responsável pelos cookies.
+- Sem WebView adicional, hooks fetch/XHR, metadados de headers no Page.url ou logs de credenciais.
+- Limite de 4 milhões de caracteres no payload para proteger memória; não é limite de páginas.
+
+## Verificação automática
+
+### Regressão confirmada em 23/09/2026: data-xsec
+
+Revisão adicional: scripts AES/CSS compartilhados só selecionam esses leitores quando o contêiner referenciado existe no documento. Testes verificam coexistência com `data-xsec` e scripts CSS inativos sem ambiguidade. Cancelamento no fallback Madara é propagado, sem iniciar buscas de scripts após sair do leitor. A suíte AES inicializa a dependência JSON antes dos testes e cobre também saída JSON descriptografada.
+
+Love Jinx / capitulo-bonus-04 retornou HTTP 200 tanto no OkHttp do Komikku quanto no Firefox do aparelho. O HTML original traz `img[data-xsec]` com URL invertida e `src` SVG vazio; o JavaScript oficial aplica `split("").reverse().join("")`. O parser antigo ignorava essas URLs, buscava scripts externos e terminava em `payload-invalid`. Isso é distinto dos HTTP 403 observados no catálogo/curl.
+
+A correção decodifica apenas `data-xsec` antes de validar a URL e mantém os headers e CookieJar existentes. Testes cobrem ordem, query, entidades HTML, URLs relativas, páginas mistas, classes CSS diferentes, esquemas inválidos e ausência de requests adicionais de scripts. No aparelho, Bônus 04 e Bônus 03 entregaram 7/7 imagens HTTP 200 cada; o HTML do Firefox também informa sete páginas por capítulo. Os 102 testes locais passaram, junto com lintRelease e assembleDebug. Reiniciar o app após instalar APK de mesma versão é parte da validação.
 
 ```sh
-./gradlew :src:pt:xxxyaoi:testDebugUnitTest :src:pt:xxxyaoi:assembleDebug :src:pt:xxxyaoi:lintRelease
+./gradlew :src:pt:xxxyaoi:assembleRelease
 ```
 
-- 67 testes JVM, zero falhas; fixtures sintéticas do mecanismo XOR/Base64 e da matriz de bytes observada no site ao vivo, variações de JS/atributos, JSON, HTML/lazy-load, normalização, ordem, payload longo, exclusões de cache com curingas e erros.
-- JS externo é testado com downloads simulados (incluindo script após 24 arquivos, falha HTTP, divisão de declarações e cancelamento); o site atual usa JS inline.
-- O teste do fallback Madara verifica o contrato do callback; não é uma execução do protector AES real.
-- Build debug e lint aprovados (dois avisos no manifesto gerado: AppLinkWarning e DataExtractionRules).
-- APK: `build/outputs/apk/debug/tachiyomi-pt.xxxyaoi-v1.6.61.apk`.
-- Fonte: ID público preservado, `2490962516027621137`.
-- Versões: pública Nox anterior `1.4.59`; local anterior `7 + 52 = 59`; upstream `4 + 54 = 58`; candidata `7 + 54 = 61`, Android versionCode `106061`. Sem bump do versionCode bruto.
-- Sync: `get_protected_nox_units` já inclui `src/pt/xxxyaoi`; mecanismo padrão preserva fonte Nox e atualiza theme/libVersion com verificação de compilação. Sem lista manual.
+O assembleRelease depende de testDebugUnitTest, spotlessCheck e lintRelease. Assim, o CI existente falha antes de publicar quando esses checks falham. Não foram alteradas as regras de matriz, push ou publicação. A fonte já consta em .github/nox-protected.txt.
 
-## Validação real no Mihon / Waydroid
+A suíte é determinística e não usa internet/proxies públicos. Inclui um servidor HTTP local para verificar GET, corpo PNG preservado, cookies, Referer, headers proibidos e URLs distintas. Esse teste NÃO prova funcionamento do CDN real.
 
-- Catálogo, busca `He Might Bite`, detalhes e lista de 36 capítulos funcionaram.
-- Reproduzido o erro real: o site constrói a chave XOR por um array numérico; sem reconhecê-lo, o fallback anterior aceitava sete curingas de configuração de cache como URLs de páginas, gerando HTTP 404.
-- Corrigido: arrays de bytes decimais/hexadecimais também fornecem chaves candidatas, sem depender de nomes de variáveis. Curingas e diretórios vazios não são imagens.
-- He Might Bite!: capítulos 1 (antigo, 16 páginas), 2 (15), 34 (16), 35 (18) e 36 (recente, 16) abriram no reader. Imagens solicitadas retornaram HTTP 200; ordem mantida conforme payload. Navegação página 1 → 2 e capítulos 34 → 35 → 36 confirmadas.
-- Nova rodada: busca Love Jinx, 80 capítulos, bônus 04 com 7 imagens, HTTP 200 e rolagem vertical confirmada. He Might Bite! teve a lista atualizada e os capítulos 1, 2 e 36 abertos novamente.
-- Fixtures `test/fixtures/live-chapter.html` e `live-properties.html` vêm de trechos reais sanitizados, com testes removendo todas as classes. Datas e nomes são identificados pelo conteúdo; `EM HIATO` é reconhecido. Datas sem fuso usam meia-noite local para não aparecerem no dia anterior.
-- URLs reais dos capítulos ficam no memo, preservando o slug como identidade e os parâmetros necessários. Links relativos do AJAX são resolvidos contra o caminho da obra.
-- Reader ignora comentários de JS, aceita objetos literais e vírgulas finais sem executar código, prioriza listas explícitas de páginas, rejeita rotas/coringas/configurações e falha descritivamente se houver empate entre listas diferentes. JS externo é buscado apenas quando a extração local falha (até 64 scripts declarados, 512 KB por arquivo, 2 MB no conjunto).
-- Logs temporários usados para comparar URLs e status HTTP foram removidos do APK final.
-- Sem NPE ou 404 nos capítulos testados após a correção. Mudanças arbitrárias futuras do site não são cobertas por essa garantia.
+## Regex no Android (obrigatório após mudanças nos padrões)
 
-Validação final para publicação do lote XXX Yaoi + Manga NXY.
+O JDK aceitou uma regex que o Android ICU rejeitou, fechando ReaderActivity com ExceptionInInitializerError. Este check compila os padrões reais do arquivo CssReader.kt no dispositivo:
+
+```sh
+python3 src/pt/xxxyaoi/tools/check_android_regex.py --serial SERIAL_DO_ADB
+```
+
+Requer JDK, SDK local e adb. Usa um DEX temporário em /data/local/tmp e remove somente esse artefato; não modifica dados de aplicativos. Os parâmetros interpolados usam valores de teste. A validação não executa o parser completo no Android.
+
+## Teste real antes de publicar
+
+Reiniciar o Komikku após atualizar APK de mesma versão. Abrir capítulos novos: Aporia (3), Shell Boy (3), outra obra (1). Confirmar ordem e quantidade plausível, warning_app=0, primeiro/meio/último GET de imagem 200, image/* e bytes > 0. Revalidar catálogo/busca/detalhes/capítulos. Não considerar cache antigo ou testes sintéticos como prova do CDN.
+
+Não há garantia contra mudanças arbitrárias do site. Quando o formato sair do contrato, manter erro explícito em vez de devolver páginas falsas.

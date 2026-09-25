@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.pointzerotoons
 
+import okhttp3.HttpUrl
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
@@ -58,6 +59,20 @@ internal fun parsePointZeroChapters(document: Document): List<PointZeroChapter> 
     .distinctBy { it.url }
 
 internal fun pointZeroCatalogPath(page: Int): String = if (page <= 1) "/manga/" else "/manga/page/$page/"
+
+internal fun pointZeroSearchUrl(builder: HttpUrl.Builder, page: Int): HttpUrl.Builder = builder.apply {
+    build().queryParameter("title")?.let { query ->
+        removeAllQueryParameters("title")
+        setQueryParameter("s", query)
+    }
+    if (build().queryParameter("order") == "update") {
+        setQueryParameter("order", "updated")
+    }
+    if (page > 1) {
+        encodedPath(pointZeroCatalogPath(page))
+        removeAllQueryParameters("page")
+    }
+}
 
 private fun Element.pointZeroImageUrl(): String = sequenceOf(
     "data-lazy-src",

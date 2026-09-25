@@ -49,6 +49,9 @@ src/pt/nexusmangas
 src/pt/nhentaibr
 src/pt/osakascan
 src/pt/pointzerotoons
+src/pt/taimumangas
+src/pt/fleurblanche
+src/all/ragnarokscanlation
 src/pt/portalyaoi
 src/pt/remangas
 src/pt/rfdragonscan

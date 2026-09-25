@@ -119,6 +119,7 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
+
         val referer = chapterReferer(chapter, chapterUrl)
         val first = client.get(chapterUrl, chapterHeaders(referer)).asJsoup()
         val document = if (first.selectFirst("#single-pager") != null) {
@@ -136,7 +137,7 @@ abstract class XXXYaoi : MadaraNoAjax() {
                 val source = body.source()
                 if (source.request(512_001)) null else source.readUtf8()
             }
-        }.mapIndexed { index, url -> Page(index, document.location(), url) }
+        }.mapIndexed { index, url -> Page(index, chapterUrl, url) }
     }
 
     private fun chapterHeaders(referer: String): Headers = headersBuilder()
@@ -160,17 +161,7 @@ abstract class XXXYaoi : MadaraNoAjax() {
 
     // Image requests must not inherit document headers (Origin/Sec-Fetch/HTML Accept).
     // Cookies are still supplied by the same source client and its CookieJar.
-    override fun imageRequest(page: Page): Request = Request.Builder()
-        .url(page.imageUrl!!)
-        .headers(
-            Headers.Builder().apply {
-                headers["User-Agent"]?.let { set("User-Agent", it) }
-                set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                set("Referer", page.url)
-            }.build(),
-        )
-        .get()
-        .build()
+    override fun imageRequest(page: Page): Request = buildImageRequest(page, headers["User-Agent"])
 
     override fun getFilterList(data: JsonElement?) = FilterList(
         *super.getFilterList(data).toTypedArray(),
@@ -184,4 +175,22 @@ abstract class XXXYaoi : MadaraNoAjax() {
     }
 
     private class CompletedFilter : Filter.CheckBox("Concluídos", false)
+}
+
+internal fun buildImageRequest(page: Page, userAgent: String?): Request {
+    require('\n' !in page.url && '\r' !in page.url) { "XXX Yaoi: referência de capítulo inválida." }
+    val chapterUrl = page.url.toHttpUrlOrNull()
+        ?: throw IllegalArgumentException("XXX Yaoi: referência de capítulo inválida.")
+    require(chapterUrl.username.isEmpty() && chapterUrl.password.isEmpty()) { "XXX Yaoi: referência de capítulo inválida." }
+    return Request.Builder()
+        .url(page.imageUrl!!)
+        .headers(
+            Headers.Builder().apply {
+                userAgent?.let { set("User-Agent", it) }
+                set("Accept", "image/*")
+                set("Referer", chapterUrl.toString())
+            }.build(),
+        )
+        .get()
+        .build()
 }
