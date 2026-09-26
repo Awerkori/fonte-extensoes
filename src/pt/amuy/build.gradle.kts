@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Amuy"
-    versionCode = 4
+    versionCode = 7
     contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
     theme = "madaralegacy"

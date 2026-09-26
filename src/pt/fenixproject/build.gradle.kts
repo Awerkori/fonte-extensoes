@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Fenix Project"
-    versionCode = 57
+    versionCode = 59
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
 
