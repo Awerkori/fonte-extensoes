@@ -21,6 +21,10 @@ class PublishSyncTest(unittest.TestCase):
             sync_upstream,
             "local_version_ahead_of_upstream",
             return_value=((3, 0, 3), (2, 0, 2)),
+        ), patch.object(
+            sync_upstream,
+            "has_newer_upstream_for_version_only_unit",
+            return_value=False,
         ):
             pending = sync_upstream.pending_sync_units(
                 ["src/tr/korelimanga"], [], "upstream/main",
@@ -641,6 +645,130 @@ class LocalProjectDependencyTest(GitFixture):
         self.assertNotEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(len(self.git("show", "-s", "--format=%P", "HEAD").split()), 2)
         self.assertFalse(Path(".git/MERGE_HEAD").exists())
+
+
+class VersionOnlyAheadMigrationTest(GitFixture):
+    unit = "src/en/qiscans"
+
+    def gradle(self, version_code, theme=None, lib_version="1.6", extra=""):
+        theme_line = f'theme = "{theme}"\n' if theme else ""
+        return (
+            f'versionCode = {version_code}\n'
+            f'libVersion = "{lib_version}"\n'
+            f"{theme_line}"
+            f"{extra}"
+        )
+
+    def prepare(self, theme=None, upstream_base=None):
+        if theme:
+            self.write(
+                f"lib-multisrc/{theme}/build.gradle.kts",
+                'baseVersionCode = 0\nlibVersion = "1.6"\n',
+            )
+        self.write(f"{self.unit}/build.gradle.kts", self.gradle(0, theme))
+        self.write(f"{self.unit}/src/Source.kt", "upstream old source\n")
+        base = self.commit("upstream snapshot")
+
+        self.git("checkout", "-qb", "upstream")
+        if theme and upstream_base is not None:
+            self.write(
+                f"lib-multisrc/{theme}/build.gradle.kts",
+                f'baseVersionCode = {upstream_base}\nlibVersion = "1.6"\n',
+            )
+        self.write(f"{self.unit}/build.gradle.kts", self.gradle(1, theme))
+        self.write(f"{self.unit}/src/Source.kt", "upstream new source\n")
+        self.commit("upstream functional update")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+        self.write(f"{self.unit}/build.gradle.kts", self.gradle(25, theme))
+        self.commit("Nox publication metadata")
+
+    def test_version_only_ahead_imports_new_upstream_code_and_is_idempotent(self):
+        self.prepare()
+
+        self.assertTrue(sync_upstream.unit_matches_upstream_history(self.unit, "upstream"))
+        self.assertTrue(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+        self.assertEqual(sync_upstream.pending_sync_units([self.unit], [], "upstream"), [self.unit])
+        with patch.object(sync_upstream, "validate_affected_builds") as validate:
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), {})
+
+        validate.assert_called_once_with([self.unit])
+        self.assertEqual(Path(f"{self.unit}/src/Source.kt").read_text(), "upstream new source\n")
+        result = sync_upstream.effective_version_code(None, self.unit)
+        self.assertEqual((result.name, result.android_code), ("1.6.26", 106026))
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+        self.assertEqual(sync_upstream.pending_sync_units([self.unit], [], "upstream"), [])
+
+    def test_functional_nox_change_remains_local_ahead(self):
+        self.prepare()
+        self.write(f"{self.unit}/src/Source.kt", "functional Nox customization\n")
+        self.commit("Nox functional change")
+
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+        self.assertEqual(sync_upstream.pending_sync_units([self.unit], [], "upstream"), [])
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), {})
+
+        self.assertEqual(Path(f"{self.unit}/src/Source.kt").read_text(), "functional Nox customization\n")
+        self.assertIn("versionCode = 25", Path(f"{self.unit}/build.gradle.kts").read_text())
+
+    def test_version_only_history_requires_no_functional_gradle_difference(self):
+        self.prepare()
+        self.write(
+            f"{self.unit}/build.gradle.kts",
+            self.gradle(25, extra='dependencies { implementation(project(":lib:custom")) }\n'),
+        )
+        self.commit("Nox dependency customization")
+        self.assertFalse(sync_upstream.unit_matches_upstream_history(self.unit, "upstream"))
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+
+    def test_assets_are_not_ignored_as_version_metadata(self):
+        self.prepare()
+        self.write(f"{self.unit}/assets/config.json", "Nox customization\n")
+        self.commit("Nox asset customization")
+
+        self.assertFalse(sync_upstream.unit_matches_upstream_history(self.unit, "upstream"))
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+
+    def test_theme_and_lib_version_are_not_ignored_as_version_metadata(self):
+        self.prepare()
+        self.write(f"{self.unit}/build.gradle.kts", self.gradle(25, "other"))
+        self.commit("Nox theme customization")
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+
+        self.git("reset", "--hard", "HEAD~1")
+        self.write(f"{self.unit}/build.gradle.kts", self.gradle(25, lib_version="1.7"))
+        self.commit("Nox library customization")
+        self.assertFalse(sync_upstream.has_newer_upstream_for_version_only_unit(self.unit, "upstream"))
+
+    def test_multisrc_base_and_raw_version_bump_to_next_public_version(self):
+        theme = "sample"
+        self.prepare(theme, upstream_base=10)
+
+        with patch.object(sync_upstream, "validate_affected_builds") as validate:
+            sync_upstream.apply_units(
+                "upstream",
+                [f"lib-multisrc/{theme}", self.unit],
+                {self.unit},
+                [],
+                [],
+                set(),
+                {},
+            )
+
+        validate.assert_called_once_with([self.unit])
+        result = sync_upstream.effective_version_code(None, self.unit)
+        self.assertEqual((result.raw, result.base, result.name, result.android_code), (16, 10, "1.6.26", 106026))
+        self.assertEqual(sync_upstream.pending_sync_units([self.unit], [], "upstream"), [])
+
+    def test_protected_unit_stays_preserved_even_when_version_only(self):
+        self.prepare()
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [self.unit], [], set(), {})
+
+        self.assertEqual(Path(f"{self.unit}/src/Source.kt").read_text(), "upstream old source\n")
+        self.assertIn("versionCode = 25", Path(f"{self.unit}/build.gradle.kts").read_text())
 
 
 class PublicationVersionTest(unittest.TestCase):

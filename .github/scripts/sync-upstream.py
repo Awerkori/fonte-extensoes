@@ -225,6 +225,10 @@ def pending_sync_units(
             print(f"Expected Nox divergence: preserving protected {unit}")
             continue
         if local_version_ahead_of_upstream(unit, upstream_ref) is not None:
+            if has_newer_upstream_for_version_only_unit(unit, upstream_ref):
+                print(f"Version-only divergence: applying upstream update for {unit}")
+                pending.append(unit)
+                continue
             print(f"Expected version divergence: local {unit} is ahead of upstream")
             continue
         pending.append(unit)
@@ -948,46 +952,91 @@ def structural_conflicts(conflict_units: list[str], upstream_ref: str) -> list[s
     return units
 
 
-def unit_matches_upstream_history(unit: str, upstream_ref: str) -> bool:
+def unit_matches_upstream_history(
+    unit: str,
+    upstream_ref: str,
+    local_ref: str = "HEAD",
+) -> bool:
     """Whether the complete unit matches a historical upstream snapshot.
 
     Structural application restores an entire extension directory.  Comparing
     only ``src`` would therefore mistake Nox changes in Gradle, assets, or
     resources for an upstream snapshot and silently overwrite them.
     """
-    path = unit
-    local_tree = git("rev-parse", f"HEAD:{path}", check=False).strip()
+    return matching_upstream_history_revision(unit, upstream_ref, local_ref) is not None
+
+
+def matching_upstream_history_revision(
+    unit: str,
+    upstream_ref: str,
+    local_ref: str = "HEAD",
+) -> str | None:
+    """Return the upstream snapshot matching a complete local unit."""
+    for revision in git("log", "--format=%H", upstream_ref, "--", unit).splitlines():
+        if unit_matches_ref_except_version_code(unit, revision, local_ref):
+            return revision
+    return None
+
+
+def unit_matches_ref_except_version_code(
+    unit: str,
+    reference: str,
+    local_ref: str = "HEAD",
+) -> bool:
+    """Whether a complete unit differs from a ref only by ``versionCode``."""
+    local_tree = git("rev-parse", f"{local_ref}:{unit}", check=False).strip()
     if not local_tree:
         return False
-    for revision in git("log", "--format=%H", upstream_ref, "--", path).splitlines():
-        if git("rev-parse", f"{revision}:{path}", check=False).strip() == local_tree:
-            return True
-        # versionCode is publication metadata maintained by this sync. A raw
-        # Nox version bump alone must not turn an otherwise complete upstream
-        # snapshot into a source customization, but every other file and every
-        # other Gradle setting remains part of the comparison.
-        changed_paths = git(
-            "diff", "--name-only", revision, "HEAD", "--", path,
-        ).splitlines()
-        gradle_path = f"{unit}/build.gradle.kts"
-        if changed_paths != [gradle_path]:
-            continue
-        historical_gradle = _read_file_text(revision, gradle_path)
-        local_gradle = _read_file_text("HEAD", gradle_path)
-        if historical_gradle is None or local_gradle is None:
-            continue
-        if _VERSION_CODE_RE.sub(r"\1<versionCode>", historical_gradle) == _VERSION_CODE_RE.sub(
-            r"\1<versionCode>", local_gradle,
-        ):
-            return True
-    return False
+    if git("rev-parse", f"{reference}:{unit}", check=False).strip() == local_tree:
+        return True
+    changed_paths = git(
+        "diff", "--name-only", reference, local_ref, "--", unit,
+    ).splitlines()
+    gradle_path = f"{unit}/build.gradle.kts"
+    if changed_paths != [gradle_path]:
+        return False
+    # versionCode is sync-controlled publication metadata. Every other Gradle
+    # setting and every other file remains functional unit content.
+    reference_gradle = _read_file_text(reference, gradle_path)
+    local_gradle = _read_file_text(local_ref, gradle_path)
+    if reference_gradle is None or local_gradle is None:
+        return False
+    return _VERSION_CODE_RE.sub(r"\1<versionCode>", reference_gradle) == _VERSION_CODE_RE.sub(
+        r"\1<versionCode>", local_gradle,
+    )
+
+
+def has_newer_upstream_for_version_only_unit(
+    unit: str,
+    upstream_ref: str,
+    local_ref: str = "HEAD",
+) -> bool:
+    """Whether a version-only local divergence masks newer upstream content."""
+    if not unit.startswith("src/"):
+        return False
+    local_info = effective_version_code(local_ref, unit)
+    upstream_info = effective_version_code(upstream_ref, unit)
+    if local_info is None or upstream_info is None:
+        return False
+    if is_lib_version_downgrade(local_info.lib, upstream_info.lib):
+        return False
+    matched_revision = matching_upstream_history_revision(unit, upstream_ref, local_ref)
+    if matched_revision is None or unit_matches_ref_except_version_code(unit, upstream_ref, local_ref):
+        return False
+    matched_info = effective_version_code(matched_revision, unit)
+    if matched_info is None or is_lib_version_downgrade(matched_info.lib, upstream_info.lib):
+        return False
+    return upstream_info.android_code > matched_info.android_code
 
 
 def unprotected_structural_migrations(units: list[str], protected: list[str], upstream_ref: str) -> set[str]:
     return {
         unit for unit in structural_conflicts(units, upstream_ref)
         if unit.startswith("src/") and unit not in protected
-        and local_version_ahead_of_upstream(unit, upstream_ref) is None
+        and (
+            local_version_ahead_of_upstream(unit, upstream_ref) is None
+            or has_newer_upstream_for_version_only_unit(unit, upstream_ref)
+        )
     }
 
 
@@ -1082,6 +1131,10 @@ def _apply_units(
         for ext in (local_deps.get(theme, []) + upstream_deps.get(theme, []))
     }
     protected_set = set(protected_units)
+    version_only_units = {
+        unit for unit in units
+        if unit not in protected_set and has_newer_upstream_for_version_only_unit(unit, upstream_ref)
+    }
     base = git("merge-base", "HEAD", upstream_ref).strip()
 
     validation_units = set(structural_units) - blocked_theme_extensions
@@ -1121,7 +1174,7 @@ def _apply_units(
             continue
         # Earlier units may have already replaced this source's multisrc base.
         downgrade = local_version_ahead_of_upstream(unit, upstream_ref, local_ref="HEAD")
-        if downgrade is not None:
+        if downgrade is not None and unit not in version_only_units:
             local_info, upstream_info = downgrade
             print(
                 f"Version guard: preserving {unit}; downgrade blocked "
@@ -1147,7 +1200,8 @@ def _apply_units(
                         git("rm", "--quiet", "--", df.strip())
                 if changed or version_changed:
                     git("add", "--", f"{unit}/build.gradle.kts")
-            continue
+            if unit not in version_only_units:
+                continue
 
         print(f"Applying {unit}")
         git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
@@ -1176,7 +1230,7 @@ def _apply_units(
             print(f"Protected Nox unit: preserving local {unit}")
             continue
         downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
-        if downgrade is not None:
+        if downgrade is not None and not has_newer_upstream_for_version_only_unit(unit, upstream_ref):
             local_info, upstream_info = downgrade
             print(
                 f"Version guard: preserving {unit}; downgrade blocked "
