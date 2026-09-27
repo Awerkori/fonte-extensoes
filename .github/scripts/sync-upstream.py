@@ -7,6 +7,7 @@ import sys
 import shutil
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 UPSTREAM_REMOTE = "upstream"
 UPSTREAM_URL = "https://github.com/keiyoushi/extensions-source.git"
@@ -133,8 +134,41 @@ def read_base_version_code(ref: str | None, theme: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def effective_version_code(ref: str | None, unit: str) -> tuple[int, int, int] | None:
-    """Read (raw_version, base_version, effective_version) for an extension unit."""
+class ExtensionVersion(NamedTuple):
+    raw: int
+    base: int
+    suffix: int
+    lib: str
+
+    @property
+    def android_code(self) -> int:
+        # Keep identical to ExtensionPlugin.androidVersionCodeProvider.
+        return int("".join(part.zfill(2) for part in self.lib.split("."))) * 1000 + self.suffix
+
+    @property
+    def name(self) -> str:
+        return f"{self.lib}.{self.suffix}"
+
+
+def lib_version_key(lib_version: str) -> tuple[int, ...]:
+    """Return the semantic ordering key used for library compatibility."""
+    parts = [int(part) for part in lib_version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def is_lib_version_downgrade(local_lib: str | None, upstream_lib: str | None) -> bool:
+    """Whether replacing local metadata would lower the shared library API."""
+    return bool(
+        local_lib
+        and upstream_lib
+        and lib_version_key(local_lib) > lib_version_key(upstream_lib)
+    )
+
+
+def effective_version_code(ref: str | None, unit: str) -> ExtensionVersion | None:
+    """Read both the effective suffix and the complete Android publication version."""
     gradle_path = f"{unit}/build.gradle.kts"
     content = _read_file_text(ref, gradle_path)
     if not content:
@@ -148,19 +182,28 @@ def effective_version_code(ref: str | None, unit: str) -> tuple[int, int, int] |
     t_match = _THEME_RE.search(content)
     theme = t_match.group(1) if t_match else None
     base_vc = read_base_version_code(ref, theme) if theme else 0
-    return raw_vc, base_vc, raw_vc + base_vc
+    lib_match = _LIB_VERSION_RE.search(content)
+    if lib_match is None:
+        return None
+    return ExtensionVersion(raw_vc, base_vc, raw_vc + base_vc, lib_match.group(1))
 
 
 def local_version_ahead_of_upstream(
     unit: str,
     upstream_ref: str,
-) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    local_ref: str | None = None,
+) -> tuple[ExtensionVersion, ExtensionVersion] | None:
     """Return local/upstream versions when applying upstream would downgrade a unit."""
-    local_info = effective_version_code(None, unit)
+    local_info = effective_version_code(local_ref, unit)
     upstream_info = effective_version_code(upstream_ref, unit)
     if local_info is None or upstream_info is None:
         return None
-    if local_info[0] <= upstream_info[0] and local_info[2] <= upstream_info[2]:
+    # A lower library version is a compatibility downgrade even if a malformed
+    # or unusually large raw versionCode happens to make its publication number
+    # look newer.
+    if is_lib_version_downgrade(local_info.lib, upstream_info.lib):
+        return local_info, upstream_info
+    if local_info.android_code <= upstream_info.android_code:
         return None
     return local_info, upstream_info
 
@@ -206,7 +249,7 @@ def merge_in_progress() -> bool:
 
 
 def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int, int, int, int, int, int] | None:
-    """If upstream effective version >= local effective version, bump local raw versionCode.
+    """If upstream publication version >= local publication version, bump local raw versionCode.
 
     Returns (loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw) if bumped, None otherwise.
     Only rewrites the file on disk; caller must `git add` it.
@@ -217,10 +260,19 @@ def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int,
     if local_info is None or upstream_info is None:
         return None
 
-    loc_raw, loc_base, loc_eff = local_info
-    up_raw, up_base, up_eff = upstream_info
+    if is_lib_version_downgrade(local_info.lib, upstream_info.lib):
+        print(f"Version guard: blocked {unit}; libVersion downgrade "
+              f"({local_info.name} -> {upstream_info.name})")
+        return None
 
-    if up_eff < loc_eff:
+    loc_raw, loc_base, loc_eff, _ = local_info
+    up_raw, up_base, up_eff, _ = upstream_info
+
+    if upstream_info.android_code < local_info.android_code:
+        return None
+    if local_info.lib != upstream_info.lib:
+        print(f"Version guard: deferred {unit}; libVersion migration required "
+              f"({local_info.name} -> {upstream_info.name}), preserving Nox code and version")
         return None
 
     desired_effective = up_eff + 1
@@ -342,6 +394,7 @@ def preflight_multisrc(
             local_lib = local[1] if local else None
             upstream_lib = upstream[1] if upstream else None
             new_lib = upstream_multi[0] if upstream_multi else None
+            lib_downgrade = is_lib_version_downgrade(local_lib, new_lib)
             needs = bool(local_lib != new_lib or (local and upstream and local[0] != upstream[0]))
             supported = bool(
                 upstream_multi
@@ -352,18 +405,27 @@ def preflight_multisrc(
             source_changed = bool(subprocess.run(
                 ["git", "diff", "--quiet", base, "HEAD", "--", f"{unit}/src"],
             ).returncode != 0)
+            unit_changed = bool(subprocess.run(
+                ["git", "diff", "--quiet", base, "HEAD", "--", unit],
+            ).returncode != 0)
             rows.append({
                 "unit": unit,
                 "protected": unit in protected,
                 "local_libVersion": local_lib,
                 "upstream_libVersion": upstream_lib,
                 "multisrc_libVersion": new_lib,
+                "libVersion_downgrade": lib_downgrade,
                 "source_divergent": source_changed,
+                "unit_divergent": unit_changed,
                 "migration_required": needs,
                 "migration_supported": supported,
             })
         report[theme] = rows
-        if any(row["migration_required"] and not row["migration_supported"] for row in rows):
+        if any(
+            row["libVersion_downgrade"]
+            or (row["migration_required"] and not row["migration_supported"])
+            for row in rows
+        ):
             blocked.add(theme)
     return report, blocked
 
@@ -440,7 +502,11 @@ def verify_migration_plan(
                     if not local.exists() or upstream is None:
                         blocked.add(theme)
                         break
-                    if not rows_by_unit[unit]["source_divergent"]:
+                    # This restore replaces the complete extension directory,
+                    # so source equality alone is insufficient. Preserve any
+                    # local Gradle, asset, or resource customization in the
+                    # candidate and prove that reconciliation can build.
+                    if not rows_by_unit[unit]["unit_divergent"]:
                         result = subprocess.run(
                             ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", unit],
                         )
@@ -502,16 +568,26 @@ def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
     return changed
 
 
-def bump_after_structural_change(unit: str, previous_info: tuple[int, int, int] | None) -> bool:
-    """Keep a structural migration strictly newer than the pre-migration effective version."""
+def bump_after_structural_change(unit: str, previous_info: ExtensionVersion | None) -> bool:
+    """Keep a structural migration strictly newer than the pre-migration Android version."""
     if previous_info is None:
         return False
     current_info = effective_version_code(None, unit)
-    if current_info is None or current_info[2] > previous_info[2]:
+    if current_info is None:
         return False
 
-    raw_vc, base_vc, _ = current_info
-    new_raw = previous_info[2] + 1 - base_vc
+    if is_lib_version_downgrade(previous_info.lib, current_info.lib):
+        raise RuntimeError(f"Refusing structural libVersion downgrade for {unit}: "
+                           f"{previous_info.name} -> {current_info.name}")
+    if current_info.android_code > previous_info.android_code:
+        return False
+
+    if current_info.lib != previous_info.lib:
+        # A compatible library migration is planned before mutation. Do not
+        # encode a library migration by changing only the raw versionCode.
+        return False
+    raw_vc, base_vc, _, _ = current_info
+    new_raw = previous_info.suffix + 1 - base_vc
     if new_raw <= raw_vc:
         return False
     gradle_path = Path(f"{unit}/build.gradle.kts")
@@ -576,11 +652,15 @@ def validate_local_project_dependencies() -> list[str]:
 
 
 def validate_affected_builds(units: list[str]) -> None:
-    """Run the cheap source-info task for units whose structural metadata changed."""
+    """Compile migrated sources too: source-info alone cannot detect shared API breakage."""
     gradlew = Path("gradlew")
     if not units or not gradlew.exists():
         return
-    tasks = [f":{unit.replace('/', ':')}:generateSourceInfo" for unit in units if unit.startswith("src/")]
+    tasks = [
+        f":{unit.replace('/', ':')}:{task}"
+        for unit in units if unit.startswith("src/")
+        for task in ("generateSourceInfo", "compileReleaseKotlin")
+    ]
     if not tasks:
         return
     print(f"Validating affected extensions: {', '.join(units)}")
@@ -835,8 +915,8 @@ def print_plan(
             up_info = effective_version_code(upstream_ref, unit)
             if not loc_info or not up_info:
                 continue
-            loc_raw, loc_base, loc_eff = loc_info
-            up_raw, up_base, up_eff = up_info
+            loc_raw, loc_base, loc_eff, _ = loc_info
+            up_raw, up_base, up_eff, _ = up_info
             print(f"{unit}:")
             print(f"  local raw: {loc_raw}")
             print(f"  local base: {loc_base}")
@@ -844,12 +924,18 @@ def print_plan(
             print(f"  upstream raw: {up_raw}")
             print(f"  upstream base: {up_base}")
             print(f"  upstream effective: {up_eff}")
-            if up_eff >= loc_eff:
+            print(f"  local publication: {loc_info.name} / {loc_info.android_code}")
+            print(f"  upstream publication: {up_info.name} / {up_info.android_code}")
+            if is_lib_version_downgrade(loc_info.lib, up_info.lib):
+                print("  action: block libVersion downgrade")
+            elif up_info.android_code >= loc_info.android_code and up_info.lib != loc_info.lib:
+                print("  action: defer version bump (structural migration required)")
+            elif up_info.android_code >= loc_info.android_code:
                 desired_eff = up_eff + 1
                 new_raw = desired_eff - loc_base
                 print(f"  action: bump local raw -> {new_raw}")
             else:
-                print(f"  action: keep (local effective ahead)")
+                print(f"  action: keep (local publication ahead)")
 
 
 def structural_conflicts(conflict_units: list[str], upstream_ref: str) -> list[str]:
@@ -862,7 +948,84 @@ def structural_conflicts(conflict_units: list[str], upstream_ref: str) -> list[s
     return units
 
 
+def unit_matches_upstream_history(unit: str, upstream_ref: str) -> bool:
+    """Whether the complete unit matches a historical upstream snapshot.
+
+    Structural application restores an entire extension directory.  Comparing
+    only ``src`` would therefore mistake Nox changes in Gradle, assets, or
+    resources for an upstream snapshot and silently overwrite them.
+    """
+    path = unit
+    local_tree = git("rev-parse", f"HEAD:{path}", check=False).strip()
+    if not local_tree:
+        return False
+    for revision in git("log", "--format=%H", upstream_ref, "--", path).splitlines():
+        if git("rev-parse", f"{revision}:{path}", check=False).strip() == local_tree:
+            return True
+        # versionCode is publication metadata maintained by this sync. A raw
+        # Nox version bump alone must not turn an otherwise complete upstream
+        # snapshot into a source customization, but every other file and every
+        # other Gradle setting remains part of the comparison.
+        changed_paths = git(
+            "diff", "--name-only", revision, "HEAD", "--", path,
+        ).splitlines()
+        gradle_path = f"{unit}/build.gradle.kts"
+        if changed_paths != [gradle_path]:
+            continue
+        historical_gradle = _read_file_text(revision, gradle_path)
+        local_gradle = _read_file_text("HEAD", gradle_path)
+        if historical_gradle is None or local_gradle is None:
+            continue
+        if _VERSION_CODE_RE.sub(r"\1<versionCode>", historical_gradle) == _VERSION_CODE_RE.sub(
+            r"\1<versionCode>", local_gradle,
+        ):
+            return True
+    return False
+
+
+def unprotected_structural_migrations(units: list[str], protected: list[str], upstream_ref: str) -> set[str]:
+    return {
+        unit for unit in structural_conflicts(units, upstream_ref)
+        if unit.startswith("src/") and unit not in protected
+        and local_version_ahead_of_upstream(unit, upstream_ref) is None
+    }
+
+
 def apply_units(
+    upstream_ref: str,
+    units: list[str],
+    conflict_units: set[str],
+    protected_units: list[str],
+    structural_units: list[str],
+    blocked_themes: set[str],
+    deferred: dict[str, dict[str, object]],
+    proven_multisrc: dict[str, dict[str, object]] | None = None,
+) -> list[str]:
+    """Apply one sync as an atomic working-tree transaction.
+
+    All validation that can happen before the merge is performed by the inner
+    function.  The outer guard still aborts an in-progress merge on any later
+    exception so a failed structural migration cannot leave an index or
+    working tree half-applied.
+    """
+    try:
+        return _apply_units(
+            upstream_ref,
+            units,
+            conflict_units,
+            protected_units,
+            structural_units,
+            blocked_themes,
+            deferred,
+            proven_multisrc,
+        )
+    except BaseException:
+        if merge_in_progress():
+            git("merge", "--abort", check=False)
+        raise
+
+
+def _apply_units(
     upstream_ref: str,
     units: list[str],
     conflict_units: set[str],
@@ -881,7 +1044,34 @@ def apply_units(
         path for theme, candidate in proven_multisrc.items()
         for path in [f"lib-multisrc/{theme}", *candidate["units"]]
     }
-    previous_versions = {unit: effective_version_code(None, unit) for unit in proven_paths if unit.startswith("src/")}
+    structural_units = sorted(set(structural_units) | unprotected_structural_migrations(
+        units, protected_units, upstream_ref,
+    ))
+    previous_versions = {
+        unit: effective_version_code(None, unit)
+        for unit in set(units) | proven_paths | set(structural_units) if unit.startswith("src/")
+    }
+
+    structural_downgrades = []
+    for unit in structural_units:
+        if not unit.startswith("src/"):
+            continue
+        previous_info = previous_versions.get(unit)
+        upstream_info = effective_version_code(upstream_ref, unit)
+        if (
+            previous_info is not None
+            and upstream_info is not None
+            and is_lib_version_downgrade(previous_info.lib, upstream_info.lib)
+        ):
+            structural_downgrades.append(
+                f"{unit} ({previous_info.name} -> {upstream_info.name})",
+            )
+    if structural_downgrades:
+        raise RuntimeError(
+            "Structural libVersion downgrade blocked before merge: "
+            + ", ".join(structural_downgrades),
+        )
+
     git("merge", "--no-ff", "--no-commit", "-s", "ours", upstream_ref)
 
     local_deps = dependency_map(None)
@@ -894,14 +1084,32 @@ def apply_units(
     protected_set = set(protected_units)
     base = git("merge-base", "HEAD", upstream_ref).strip()
 
+    validation_units = set(structural_units) - blocked_theme_extensions
+
     # 1. Apply upstream units (except conflict units where Nox wins, and deferred themes/extensions)
     for unit in units:
+        if unit in proven_paths:
+            continue
+        # A protected source is only changed through a separately proven
+        # multisrc candidate. It must never enter a generic full restore.
+        if unit in protected_set:
+            print(f"Protected Nox unit: preserving local {unit}")
+            continue
+        if unit in blocked_theme_extensions:
+            print(f"Deferred structural migration (atomic with theme): {unit}")
+            continue
         if unit in structural_units and not unit.startswith("lib-multisrc/"):
-            previous_info = effective_version_code(None, unit)
-            source_divergent = subprocess.run(
-                ["git", "diff", "--quiet", base, "HEAD", "--", f"{unit}/src"],
+            previous_info = previous_versions.get(unit)
+            unit_divergent = subprocess.run(
+                ["git", "diff", "--quiet", base, "HEAD", "--", unit],
             ).returncode != 0
-            if source_divergent:
+            # A full restore is safe only for an entire historical upstream
+            # unit. Otherwise retain all local files and merge selectors; the
+            # build validation below is the proof that this reconciliation is
+            # compatible before the transaction can be committed.
+            preserve_local_unit = unit_divergent and not unit_matches_upstream_history(unit, upstream_ref)
+            if preserve_local_unit:
+                print(f"Preserving local files outside upstream history: {unit}")
                 changed = merge_structural_metadata(unit, upstream_ref)
             else:
                 git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
@@ -911,25 +1119,18 @@ def apply_units(
             if changed or version_changed:
                 git("add", "--", f"{unit}/build.gradle.kts")
             continue
-        if unit in protected_set:
-            print(f"Protected Nox unit: preserving local {unit}")
-            continue
-        downgrade = local_version_ahead_of_upstream(unit, upstream_ref)
+        # Earlier units may have already replaced this source's multisrc base.
+        downgrade = local_version_ahead_of_upstream(unit, upstream_ref, local_ref="HEAD")
         if downgrade is not None:
             local_info, upstream_info = downgrade
             print(
                 f"Version guard: preserving {unit}; downgrade blocked "
-                f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
-                f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
+                f"(local {local_info.name} / {local_info.android_code} > "
+                f"upstream {upstream_info.name} / {upstream_info.android_code})",
             )
-            continue
-        if unit in proven_paths:
             continue
         if unit.startswith("lib-multisrc/") and unit.split("/", 1)[1] in blocked_themes:
             print(f"Deferred structural migration: {unit}")
-            continue
-        if unit in blocked_theme_extensions:
-            print(f"Deferred structural migration (atomic with theme): {unit}")
             continue
         if unit in conflict_units and not unit.startswith("lib-multisrc/"):
             if unit in structural_units:
@@ -953,6 +1154,10 @@ def apply_units(
 
         if path_exists(upstream_ref, unit):
             git("restore", f"--source={upstream_ref}", "--staged", "--worktree", "--", unit)
+            if unit.startswith("src/"):
+                validation_units.add(unit)
+                if bump_after_structural_change(unit, previous_versions.get(unit)):
+                    git("add", "--", f"{unit}/build.gradle.kts")
 
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
@@ -975,8 +1180,8 @@ def apply_units(
             local_info, upstream_info = downgrade
             print(
                 f"Version guard: preserving {unit}; downgrade blocked "
-                f"(local versionCode {local_info[0]} / effective {local_info[2]} > "
-                f"upstream versionCode {upstream_info[0]} / effective {upstream_info[2]})",
+                f"(local {local_info.name} / {local_info.android_code} > "
+                f"upstream {upstream_info.name} / {upstream_info.android_code})",
             )
             continue
         if unit in conflict_units or unit in proven_paths or unit in blocked_theme_extensions:
@@ -997,7 +1202,6 @@ def apply_units(
 
     # 2. Version Guard on all protected Nox units
     bumped = []
-    validation_units = set(structural_units)
     deferred_units = {str(unit) for entry in deferred.values() for unit in entry.get("units", [])}
     for unit in protected_units:
         if not path_exists(upstream_ref, unit):
@@ -1014,7 +1218,7 @@ def apply_units(
             validation_units.add(unit)
             print(f"Version guard: bumped {unit} (versionCode {loc_raw} -> {new_raw})")
         else:
-            print(f"Version guard: {unit} already ahead")
+            print(f"Version guard: {unit} unchanged")
 
     if write_deferred_migrations(deferred):
         git("add", "--", str(DEFERRED_MIGRATIONS_FILE))
@@ -1151,7 +1355,9 @@ def main() -> None:
                 print(
                     "    {unit}: protected={protected}, local libVersion={local_libVersion}, "
                     "upstream libVersion={upstream_libVersion}, new multisrc={multisrc_libVersion}, "
-                    "source divergent={source_divergent}, migration required={migration_required}, "
+                    "libVersion downgrade={libVersion_downgrade}, "
+                    "source divergent={source_divergent}, unit divergent={unit_divergent}, "
+                    "migration required={migration_required}, "
                     "migration supported={migration_supported}".format(**row),
                 )
 
@@ -1169,6 +1375,12 @@ def main() -> None:
         upstream_units = effective_diff
         conflict_set = set()
         upstream_only_units = effective_diff
+
+    # Recover structural updates skipped by an earlier ours merge even when new
+    # unrelated upstream changes are also pending.
+    upstream_units = sorted(set(upstream_units) | unprotected_structural_migrations(
+        effective_diff, protected_units, upstream_ref,
+    ))
 
     if args.dry_run or not (args.push or args.apply_no_push):
         print("Dry run only; no changes were applied")
