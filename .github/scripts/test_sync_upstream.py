@@ -1380,6 +1380,201 @@ class ProtectedMultisrcTest(unittest.TestCase):
         self.assertIn("removed upstream", deferred[self.theme]["reason"])
 
 
+class BladeToonsRegressionTest(GitFixture):
+    theme = "mangotheme"
+    theme_unit = "lib-multisrc/mangotheme"
+    extension = "src/pt/bladetoons"
+
+    def setUp(self):
+        super().setUp()
+        self.write(".github/nox-protected.txt", f"{self.extension}\n")
+        # Base: mangotheme 1.4, baseVersionCode 3
+        self.write(
+            f"{self.theme_unit}/build.gradle.kts",
+            'libVersion = "1.4"\nbaseVersionCode = 3\n',
+        )
+        # Base: BladeToons 1.4, raw versionCode 4 -> effective 7, pub 1.4.7 / 104007
+        self.write(
+            f"{self.extension}/build.gradle.kts",
+            'libVersion = "1.4"\ntheme = "mangotheme"\nversionCode = 4\n',
+        )
+        self.write(
+            f"{self.extension}/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt",
+            "// base source\n",
+        )
+        self.write(
+            "gradlew",
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "source = pathlib.Path('src/pt/bladetoons/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt').read_text()\n"
+            "assert 'Nox functional code' in source, 'Nox code must be preserved in proof candidate'\n"
+            "gradle = pathlib.Path('src/pt/bladetoons/build.gradle.kts').read_text()\n"
+            "assert 'libVersion = \"1.6\"' in gradle, 'BladeToons metadata must be migrated to 1.6'\n"
+            "multi = pathlib.Path('lib-multisrc/mangotheme/build.gradle.kts').read_text()\n"
+            "assert 'libVersion = \"1.6\"' in multi, 'Mangotheme must be 1.6 in proof candidate'\n"
+            "assert ':src:pt:bladetoons:assembleDebug' in sys.argv\n",
+        )
+        Path("gradlew").chmod(0o755)
+        self.base = self.commit("base with mangotheme 1.4 and bladetoons 1.4")
+        self.git("branch", "upstream", self.base)
+        self.git("branch", "nox", self.base)
+
+        # Nox customization on BladeToons
+        self.git("checkout", "-q", "nox")
+        self.write(
+            f"{self.extension}/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt",
+            "// Nox functional code: custom login and filters\n",
+        )
+        self.commit("Nox BladeToons customization")
+
+    def _setup_upstream(self):
+        self.git("checkout", "-q", "upstream")
+        # Upstream updates mangotheme to 1.6, baseVersionCode 0
+        self.write(
+            f"{self.theme_unit}/build.gradle.kts",
+            'libVersion = "1.6"\nbaseVersionCode = 0\n',
+        )
+        # Upstream updates BladeToons to 1.6, raw versionCode 0 -> pub 1.6.0 / 106000
+        self.write(
+            f"{self.extension}/build.gradle.kts",
+            'libVersion = "1.6"\ntheme = "mangotheme"\nversionCode = 0\n',
+        )
+        self.write(
+            f"{self.extension}/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt",
+            "// Upstream source rewrite\n",
+        )
+        self.commit("upstream mangotheme 1.6 and bladetoons 1.6")
+        self.git("checkout", "-q", "nox")
+
+    def test_bladetoons_structural_migration_proven_atomic_apply(self):
+        self._setup_upstream()
+
+        base = self.git("merge-base", "HEAD", "upstream").strip()
+        protected = sync_upstream.get_protected_nox_units(base, "upstream")
+        self.assertIn(self.extension, protected)
+
+        report, preflight_blocked = sync_upstream.preflight_multisrc(base, "upstream", protected)
+        self.assertEqual(preflight_blocked, set())
+        self.assertIn(self.theme, report)
+        bt_row = next(r for r in report[self.theme] if r["unit"] == self.extension)
+        self.assertTrue(bt_row["protected"])
+        self.assertEqual(bt_row["local_libVersion"], "1.4")
+        self.assertEqual(bt_row["upstream_libVersion"], "1.6")
+        self.assertEqual(bt_row["multisrc_libVersion"], "1.6")
+        self.assertTrue(bt_row["migration_required"])
+        self.assertTrue(bt_row["migration_supported"])
+        self.assertTrue(bt_row["source_divergent"])
+        self.assertTrue(bt_row["unit_divergent"])
+
+        # Preflight verification succeeds
+        verified_blocked, verified_proven = sync_upstream.verify_migration_plan(report, "upstream")
+        self.assertEqual(verified_blocked, set())
+        self.assertIn(self.theme, verified_proven)
+        self.assertEqual(verified_proven[self.theme]["units"], [self.extension])
+
+        # Apply transaction
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(base, "upstream"))[0]
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units(
+                "upstream",
+                units,
+                set(),
+                protected,
+                [self.extension],
+                set(),
+                {},
+                verified_proven,
+            )
+
+        # 1. Nox functional code preserved
+        bt_code = Path(f"{self.extension}/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt").read_text()
+        self.assertIn("Nox functional code: custom login and filters", bt_code)
+        self.assertNotIn("Upstream source rewrite", bt_code)
+
+        # 2. Structural metadata migrated to 1.6
+        bt_gradle = Path(f"{self.extension}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.6"', bt_gradle)
+        self.assertIn('theme = "mangotheme"', bt_gradle)
+
+        # 3. Mangotheme migrated to 1.6
+        multi_gradle = Path(f"{self.theme_unit}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.6"', multi_gradle)
+        self.assertIn("baseVersionCode = 0", multi_gradle)
+
+        # 4. Compatibility check passes
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+
+        # 5. Versioning is monotonic and not arbitrarily bumped
+        # Local before: 1.4.7 (code 104007)
+        # Upstream new: 1.6.0 (code 106000)
+        # Local after: raw 4 preserved, base 0 -> effective 4 -> 1.6.4 (code 106004)
+        info = sync_upstream.effective_version_code(None, self.extension)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.name, "1.6.4")
+        self.assertEqual(info.android_code, 106004)
+        self.assertGreater(info.android_code, 104007)
+        self.assertGreater(info.android_code, 106000)
+
+        # 6. Tree is clean and committed
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_bladetoons_structural_migration_failure_atomic_defer(self):
+        self._setup_upstream()
+        # Gradlew fails proof build
+        self.write("gradlew", "#!/bin/sh\nexit 1\n")
+        Path("gradlew").chmod(0o755)
+        self.commit("make proof build fail")
+
+        base = self.git("merge-base", "HEAD", "upstream").strip()
+        protected = sync_upstream.get_protected_nox_units(base, "upstream")
+        report, preflight_blocked = sync_upstream.preflight_multisrc(base, "upstream", protected)
+
+        verified_blocked, verified_proven = sync_upstream.verify_migration_plan(report, "upstream")
+        self.assertIn(self.theme, verified_blocked)
+        self.assertNotIn(self.theme, verified_proven)
+
+        blocked = preflight_blocked | verified_blocked
+        deferred = sync_upstream.deferred_state(report, blocked, "upstream")
+        units = sync_upstream.collect_units(sync_upstream.changed_entries(base, "upstream"))[0]
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units(
+                "upstream",
+                units,
+                set(),
+                protected,
+                [],
+                blocked,
+                deferred,
+                verified_proven,
+            )
+
+        # 1. Mangotheme stays 1.4
+        multi_gradle = Path(f"{self.theme_unit}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.4"', multi_gradle)
+        self.assertIn("baseVersionCode = 3", multi_gradle)
+
+        # 2. BladeToons stays 1.4
+        bt_gradle = Path(f"{self.extension}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.4"', bt_gradle)
+        self.assertIn("versionCode = 4", bt_gradle)
+
+        # 3. Nox functional code preserved
+        bt_code = Path(f"{self.extension}/src/eu/kanade/tachiyomi/extension/pt/bladetoons/BladeToons.kt").read_text()
+        self.assertIn("Nox functional code: custom login and filters", bt_code)
+
+        # 4. Compatibility check passes (both are 1.4)
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+
+        # 5. Deferred recorded
+        deferred_saved = sync_upstream.load_deferred_migrations()
+        self.assertIn(self.theme, deferred_saved)
+        self.assertIn(self.extension, deferred_saved[self.theme]["units"])
+
+        # 6. Tree is clean and committed
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+
 class BuildMatrixTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -466,10 +466,44 @@ def apply_structural_metadata_to_path(
     return True
 
 
+class MigrationPlanResult(tuple):
+    """Result of verify_migration_plan.
+
+    Unpacks as `(blocked, proven)`.
+    For backwards compatibility, behaves like a set of blocked themes when compared
+    or operated on with sets.
+    """
+    def __new__(cls, blocked: set[str], proven: dict[str, dict[str, object]]):
+        return super().__new__(cls, (blocked, proven))
+
+    @property
+    def blocked(self) -> set[str]:
+        return self[0]
+
+    @property
+    def proven(self) -> dict[str, dict[str, object]]:
+        return self[1]
+
+    def __eq__(self, other):
+        if isinstance(other, (set, frozenset)):
+            return self.blocked == other
+        return super().__eq__(other)
+
+    def __or__(self, other):
+        if isinstance(other, (set, frozenset)):
+            return self.blocked | other
+        return NotImplemented
+
+    def __ror__(self, other):
+        if isinstance(other, (set, frozenset)):
+            return other | self.blocked
+        return NotImplemented
+
+
 def verify_migration_plan(
     report: dict[str, list[dict[str, object]]],
     upstream_ref: str,
-) -> set[str]:
+) -> MigrationPlanResult:
     """Compile protected selector migrations in a disposable worktree.
 
     This is intentionally before the real merge/restore/rm operations.  A failed
@@ -481,8 +515,9 @@ def verify_migration_plan(
     }
     candidates = {theme: units for theme, units in candidates.items() if units}
     if not candidates:
-        return set()
+        return MigrationPlanResult(set(), {})
     blocked: set[str] = set()
+    proven: dict[str, dict[str, object]] = {}
     root = Path.cwd()
     base = git("merge-base", "HEAD", upstream_ref).strip()
     with tempfile.TemporaryDirectory(prefix="nox-sync-preflight-") as directory:
@@ -492,6 +527,19 @@ def verify_migration_plan(
             if Path("local.properties").exists():
                 shutil.copy("local.properties", sandbox / "local.properties")
             for theme, units in candidates.items():
+                subprocess.run(
+                    ["git", "-C", str(sandbox), "reset", "--hard", "HEAD"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    ["git", "-C", str(sandbox), "clean", "-fdq"],
+                    check=True,
+                )
+                if Path("local.properties").exists() and not (sandbox / "local.properties").exists():
+                    shutil.copy("local.properties", sandbox / "local.properties")
+
                 result = subprocess.run(
                     ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", f"lib-multisrc/{theme}"],
                     text=True,
@@ -500,49 +548,67 @@ def verify_migration_plan(
                     blocked.add(theme)
                     continue
                 rows_by_unit = {str(row["unit"]): row for row in report.get(theme, [])}
+                theme_failed = False
                 for unit in units:
-                    local = sandbox / unit / "build.gradle.kts"
                     upstream = _read_file_text(upstream_ref, f"{unit}/build.gradle.kts")
-                    if not local.exists() or upstream is None:
+                    if upstream is None:
                         blocked.add(theme)
+                        theme_failed = True
                         break
                     # This restore replaces the complete extension directory,
                     # so source equality alone is insufficient. Preserve any
                     # local Gradle, asset, or resource customization in the
                     # candidate and prove that reconciliation can build.
-                    if not rows_by_unit[unit]["unit_divergent"]:
+                    preserve = rows_by_unit[unit].get("protected", False) or rows_by_unit[unit].get("unit_divergent", False)
+                    if not preserve:
                         result = subprocess.run(
                             ["git", "-C", str(sandbox), "restore", f"--source={upstream_ref}", "--worktree", "--staged", "--", unit],
                         )
                         if result.returncode:
                             blocked.add(theme)
+                            theme_failed = True
                             break
+                    local = sandbox / unit / "build.gradle.kts"
+                    if not local.exists():
+                        blocked.add(theme)
+                        theme_failed = True
+                        break
                     target = structural_metadata(upstream_ref, unit)
                     if target is None:
                         blocked.add(theme)
+                        theme_failed = True
                         break
-                    apply_structural_metadata_to_path(local, target[0], target[1])
-                    # Structural file removals: delete files in unit that upstream removed vs base
-                    deleted = subprocess.run(
-                        ["git", "diff", "--name-only", "--diff-filter=D", base, upstream_ref, "--", unit],
-                        capture_output=True,
-                        text=True,
-                    ).stdout.splitlines()
-                    for df in deleted:
-                        if df.strip():
-                            (sandbox / df.strip()).unlink(missing_ok=True)
-                if theme in blocked:
+                    if preserve:
+                        apply_structural_metadata_to_path(local, target[0], target[1])
+                        # Structural file removals: delete files in unit that upstream removed vs base
+                        deleted = subprocess.run(
+                            ["git", "diff", "--name-only", "--diff-filter=D", base, upstream_ref, "--", unit],
+                            capture_output=True,
+                            text=True,
+                        ).stdout.splitlines()
+                        for df in deleted:
+                            if df.strip():
+                                (sandbox / df.strip()).unlink(missing_ok=True)
+                if theme_failed or theme in blocked:
                     continue
+                paths = [f"lib-multisrc/{theme}", *units]
+                subprocess.run(["git", "-C", str(sandbox), "add", "-A", "--", *paths], check=True)
+                tree = subprocess.run(["git", "-C", str(sandbox), "write-tree"], capture_output=True, text=True, check=True).stdout.strip()
                 # Metadata generation does not compile the protected source and
                 # therefore cannot prove a libVersion API migration is safe.
                 tasks = [f":{unit.replace('/', ':')}:assembleDebug" for unit in units]
                 result = subprocess.run([str(sandbox / "gradlew"), *tasks], cwd=sandbox, text=True)
                 if result.returncode:
                     blocked.add(theme)
+                    continue
+                if subprocess.run(["git", "-C", str(sandbox), "diff", "--quiet", tree, "--", *paths]).returncode:
+                    blocked.add(theme)
+                    continue
+                proven[theme] = {"tree": tree, "units": units}
         finally:
             os.chdir(root)
             git("worktree", "remove", "--force", str(sandbox), check=False)
-    return blocked
+    return MigrationPlanResult(blocked, proven)
 
 
 def deferred_state(report: dict[str, list[dict[str, object]]], blocked: set[str], upstream_ref: str) -> dict[str, dict[str, object]]:
@@ -838,6 +904,7 @@ def prove_protected_multisrc(
 def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref):
     """A source switching themes cannot migrate independently of either theme."""
     local, upstream = dependency_map(None), dependency_map(upstream_ref)
+    base_commit = git("merge-base", "HEAD", upstream_ref).strip()
     while True:
         blocked_units = {unit for theme in blocked for unit in local.get(theme, []) + upstream.get(theme, [])}
         affected = [theme for theme, candidate in proven.items() if blocked_units.intersection(candidate["units"])]
@@ -847,8 +914,10 @@ def propagate_multisrc_deferrals(proven, deferred, blocked, bases, upstream_ref)
             candidate = proven.pop(theme)
             blocked.add(theme)
             deferred[theme] = {
-                "patch_base": bases[theme], "upstream_ref": git("rev-parse", upstream_ref).strip(),
-                "units": candidate["units"], "reason": "dependent shared with deferred theme",
+                "patch_base": bases.get(theme, base_commit),
+                "upstream_ref": git("rev-parse", upstream_ref).strip(),
+                "units": candidate["units"],
+                "reason": "dependent shared with deferred theme",
             }
 
 
@@ -1213,6 +1282,7 @@ def _apply_units(
                 if bump_after_structural_change(unit, previous_versions.get(unit)):
                     git("add", "--", f"{unit}/build.gradle.kts")
 
+    bumped = []
     for theme, candidate in proven_multisrc.items():
         for unit in [f"lib-multisrc/{theme}", *candidate["units"]]:
             # This tree was built successfully with the upstream multisrc metadata
@@ -1220,12 +1290,19 @@ def _apply_units(
             # guard, which must not block an atomic structural migration.
             git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)
             git("restore", f"--source={candidate['tree']}", "--staged", "--worktree", "--", unit)
+            if unit.startswith("src/"):
+                validation_units.add(unit)
             if unit in previous_versions and bump_after_structural_change(unit, previous_versions[unit]):
                 git("add", "--", f"{unit}/build.gradle.kts")
+                current_info = effective_version_code(None, unit)
+                if current_info:
+                    bumped.append(f"{unit} -> versionCode={current_info.raw}")
 
     # Deferred themes may no longer appear in base..upstream after an ours merge.
     # Their protected extensions must still receive their proven selector migration.
     for unit in structural_units:
+        if unit in proven_paths:
+            continue
         if unit in protected_set:
             print(f"Protected Nox unit: preserving local {unit}")
             continue
@@ -1238,7 +1315,7 @@ def _apply_units(
                 f"upstream {upstream_info.name} / {upstream_info.android_code})",
             )
             continue
-        if unit in conflict_units or unit in proven_paths or unit in blocked_theme_extensions:
+        if unit in conflict_units or unit in blocked_theme_extensions:
             continue
         previous_info = effective_version_code(None, unit)
         changed = merge_structural_metadata(unit, upstream_ref)
@@ -1255,7 +1332,6 @@ def _apply_units(
             git("add", "--", f"{unit}/build.gradle.kts")
 
     # 2. Version Guard on all protected Nox units
-    bumped = []
     deferred_units = {str(unit) for entry in deferred.values() for unit in entry.get("units", [])}
     for unit in protected_units:
         if not path_exists(upstream_ref, unit):
@@ -1441,10 +1517,12 @@ def main() -> None:
         return
 
     proven, multisrc_deferred = prove_protected_multisrc(base, upstream_ref, protected_units, preflight_blocked)
-    blocked = preflight_blocked | set(multisrc_deferred) | verify_migration_plan(
+    verified_blocked, verified_proven = verify_migration_plan(
         {theme: rows for theme, rows in preflight.items() if theme not in preflight_blocked and theme not in protected_multisrc},
         upstream_ref,
     )
+    blocked = preflight_blocked | set(multisrc_deferred) | verified_blocked
+    proven.update(verified_proven)
     deferred = deferred_state(preflight, blocked, upstream_ref)
     deferred.update(multisrc_deferred)
     propagate_multisrc_deferrals(proven, deferred, blocked, protected_multisrc, upstream_ref)
