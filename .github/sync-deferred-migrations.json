@@ -1,0 +1,38 @@
+{
+  "themes": {
+    "gattsu": {
+      "units": [
+        "src/pt/hentaiseason",
+        "src/pt/hentaitokyo",
+        "src/pt/universohentai"
+      ],
+      "upstream_ref": "upstream/main"
+    },
+    "gigaviewer": {
+      "units": [
+        "src/ja/comicborder",
+        "src/ja/comicdays",
+        "src/ja/comicearthstar",
+        "src/ja/comicgardo",
+        "src/ja/comicyours",
+        "src/ja/comiplex",
+        "src/ja/ichicomi",
+        "src/ja/kuragebunch",
+        "src/ja/magcomi",
+        "src/ja/shonenjumpplus",
+        "src/ja/sundaywebevery",
+        "src/ja/tonarinoyoungjump",
+        "src/ja/zenon"
+      ],
+      "upstream_ref": "upstream/main"
+    },
+    "greenshit": {
+      "units": [
+        "src/pt/maidscan",
+        "src/pt/vegitoons",
+        "src/pt/verdinha"
+      ],
+      "upstream_ref": "upstream/main"
+    }
+  }
+}
