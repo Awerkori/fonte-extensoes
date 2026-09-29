@@ -1,8 +1,10 @@
 package eu.kanade.tachiyomi.multisrc.aurora
 
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -47,6 +49,9 @@ class ReaderTest {
         val gate = extractReader("1:I[5441,[],\"ReadingGateScreen\"]\n5:{\"returnTo\":\"/manga/series/54.2\"}\n", "text/x-component", chapterUrl)
         assertTrue(gate.gated)
         assertTrue(gate.urls.isEmpty())
+        val unlockClient = extractReader("1:I[5441,[],\"ReaderUnlockClient\"]\n5:{\"returnTo\":\"/manga/series/54.2\"}\n", "text/x-component", chapterUrl)
+        assertTrue(unlockClient.gated)
+        assertTrue(unlockClient.urls.isEmpty())
     }
 
     @Test
@@ -114,6 +119,53 @@ class ReaderTest {
             readerFailure("Fixture", "$chapterUrl?token=secret", 200, linkedMapOf("rsc" to 0, "html" to 0))
         }
         assertEquals("Aurora reader: Fixture $chapterUrl status=200 rsc=0, html=0", error.message)
+    }
+
+    @Test
+    fun gateStartPayloadParsesCorrectly() {
+        val json = """{"data":{"token":"37247fa8-d40d-457f-a784-500fe4a4f1f4","returnTo":"/manga/series/54.2","minWaitSeconds":10}}"""
+        val response = json.parseAs<GateResponse>()
+        assertEquals("37247fa8-d40d-457f-a784-500fe4a4f1f4", response.data.token)
+        assertEquals("/manga/series/54.2", response.data.returnTo)
+        assertEquals(10, response.data.minWaitSeconds)
+    }
+
+    @Test
+    fun gateStartHeadersIncludeOriginAndReferer() {
+        val base = Headers.headersOf("User-Agent", "TestAgent", "Cookie", "mnx_adulto=1")
+        val headers = buildGateStartHeaders(base, "https://reader.example", chapterUrl)
+        assertEquals("https://reader.example", headers["Origin"])
+        assertEquals(chapterUrl, headers["Referer"])
+        assertEquals("cors", headers["Sec-Fetch-Mode"])
+        assertEquals("empty", headers["Sec-Fetch-Dest"])
+        assertEquals("same-origin", headers["Sec-Fetch-Site"])
+        assertEquals("mnx_adulto=1", headers["Cookie"])
+    }
+
+    @Test
+    fun gateCallbackHeadersIncludeChapterReferer() {
+        val base = Headers.headersOf("User-Agent", "TestAgent")
+        val headers = buildGateCallbackHeaders(base, chapterUrl)
+        assertEquals(chapterUrl, headers["Referer"])
+        assertEquals("navigate", headers["Sec-Fetch-Mode"])
+        assertEquals("document", headers["Sec-Fetch-Dest"])
+        assertEquals("same-origin", headers["Sec-Fetch-Site"])
+    }
+
+    @Test
+    fun gateStartErrorIncludesStepAndStatus() {
+        val errorMsg = "Aurora reader gate start: $chapterUrl status=403 error={\"error\":\"Origem nao autorizada\"}"
+        assertTrue(errorMsg.contains("gate start"))
+        assertTrue(errorMsg.contains("status=403"))
+        assertTrue(errorMsg.contains("Origem nao autorizada"))
+    }
+
+    @Test
+    fun keyErrorIncludesStepAndStatus() {
+        val errorMsg = "Aurora reader key: $chapterUrl status=403 error={\"error\":\"unauthorized\"}"
+        assertTrue(errorMsg.contains("reader key"))
+        assertTrue(errorMsg.contains("status=403"))
+        assertTrue(errorMsg.contains("unauthorized"))
     }
 
     companion object {

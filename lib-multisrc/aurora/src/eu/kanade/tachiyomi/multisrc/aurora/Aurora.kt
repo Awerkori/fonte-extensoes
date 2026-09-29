@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.multisrc.aurora
 
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -19,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import kotlin.time.Duration.Companion.seconds
@@ -26,8 +28,29 @@ import kotlin.time.Duration.Companion.seconds
 @Source
 abstract class Aurora : KeiSource() {
 
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(3, 1.seconds)
-        .addCookie("mnx_adulto" to "1")
+    protected fun OkHttpClient.Builder.defaultClient(): OkHttpClient.Builder = rateLimit(
+        permits = 3,
+        period = 1.seconds,
+        shouldLimit = { url ->
+            !url.host.contains("snipercache") &&
+                !url.encodedPath.endsWith(".webp") &&
+                !url.encodedPath.endsWith(".jpg") &&
+                !url.encodedPath.endsWith(".png")
+        },
+    ).addCookie("mnx_adulto" to "1")
+
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = defaultClient()
+
+    override fun imageRequest(page: Page): Request = GET(
+        page.imageUrl!!,
+        headersBuilder()
+            .set("Referer", "$baseUrl/")
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "cross-site")
+            .build(),
+    )
 
     override fun Headers.Builder.configureHeaders() = set("Sec-Fetch-Dest", "document")
         .set("Sec-Fetch-Mode", "navigate")
@@ -113,6 +136,9 @@ abstract class Aurora : KeiSource() {
             val response = unlockReader(client, chapterUrl, readerHeaders(chapter, rsc = false), gateTiming)
             counts["gate"] = 1
             payload = read(response)
+            if (payload.urls.isEmpty()) {
+                payload = read(client.get(chapterUrl, readerHeaders(chapter, rsc = true), ensureSuccess = false))
+            }
         }
         if (payload.urls.isEmpty() && !payload.gated && status in 200..299) {
             payload = read(client.get(chapterUrl, readerHeaders(chapter, rsc = false), ensureSuccess = false))
@@ -120,7 +146,7 @@ abstract class Aurora : KeiSource() {
         if (payload.urls.isEmpty()) readerFailure(name, chapterUrl, status, counts)
 
         val urls = try {
-            decodePages(payload.urls, chapterUrl, ::getKey)
+            decodePages(payload.urls, chapterUrl) { params -> getKey(params, chapterUrl) }
         } catch (_: IllegalArgumentException) {
             readerFailure(name, chapterUrl, status, counts + ("decrypt" to 0))
         }
@@ -143,8 +169,19 @@ abstract class Aurora : KeiSource() {
         return builder.build()
     }
 
-    private suspend fun getKey(params: Pair<Int, Long>): String {
+    internal suspend fun getKey(params: Pair<Int, Long>, chapterUrl: String): String {
         val (v, e) = params
-        return client.get("$baseUrl/api/atfield/key?v=$v&e=$e").parseAs<KeyDto>().k
+        val keyHeaders = headersBuilder()
+            .set("Referer", chapterUrl)
+            .set("Sec-Fetch-Mode", "cors")
+            .set("Sec-Fetch-Dest", "empty")
+            .set("Sec-Fetch-Site", "same-origin")
+            .build()
+        val response = client.get("$baseUrl/api/atfield/key?v=$v&e=$e", keyHeaders, ensureSuccess = false)
+        if (!response.isSuccessful) {
+            val errorBody = response.body.string()
+            error("Aurora reader key: $chapterUrl status=${response.code} error=${errorBody.take(100)}")
+        }
+        return response.parseAs<KeyDto>().k
     }
 }

@@ -26,7 +26,7 @@ internal fun extractReader(body: String, contentType: String, chapterUrl: String
     } catch (_: SerializationException) {
         null
     }
-    return ReaderPayload(dto?.pages?.map { it.url }.orEmpty(), "ReadingGateScreen" in body, format)
+    return ReaderPayload(dto?.pages?.map { it.url }.orEmpty(), "ReadingGateScreen" in body || "ReaderUnlockClient" in body, format)
 }
 
 private val unrelatedImage = Regex("^(?:placeholder|loading|logo)(?:[._-]|$)", RegexOption.IGNORE_CASE)

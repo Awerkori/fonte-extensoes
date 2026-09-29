@@ -25,7 +25,7 @@ internal class ReaderOriginInterceptor(private val baseUrl: () -> String) : Inte
                 request.header("Referer", referer.onOrigin(target).toString())
             }
         }
-        if (original.method == "POST" && original.url.encodedPath == "/api/gate/start") {
+        if (original.method == "POST" && (original.url.encodedPath == "/api/gate/start" || original.url.encodedPath == "/api/reader/unlock")) {
             request.header("Origin", target.toString().removeSuffix("/"))
                 .header("Sec-Fetch-Site", "same-origin")
                 .header("Sec-Fetch-Mode", "cors")

@@ -38,12 +38,21 @@ class ReaderOriginTest {
                 .header("Referer", "https://old.example/manga/one-piece")
                 .post("{}".toRequestBody()).build(),
         ).execute().close()
+        client.newCall(
+            Request.Builder().url("https://old.example/api/reader/unlock")
+                .header("Referer", "https://old.example/manga/one-piece")
+                .post("{}".toRequestBody()).build(),
+        ).execute().close()
         client.newCall(Request.Builder().url("https://old.example/api/atfield/key?v=1&e=123").build()).execute().close()
         assertEquals("POST", seen[1].method)
         assertEquals("https://new.example/api/gate/start", seen[1].url.toString())
         assertEquals("https://new.example", seen[1].header("Origin"))
         assertEquals("https://new.example/manga/one-piece", seen[1].header("Referer"))
-        assertEquals("https://new.example/api/atfield/key?v=1&e=123", seen[2].url.toString())
+        assertEquals("POST", seen[2].method)
+        assertEquals("https://new.example/api/reader/unlock", seen[2].url.toString())
+        assertEquals("https://new.example", seen[2].header("Origin"))
+        assertEquals("https://new.example/manga/one-piece", seen[2].header("Referer"))
+        assertEquals("https://new.example/api/atfield/key?v=1&e=123", seen[3].url.toString())
     }
 
     @Test
