@@ -34,7 +34,6 @@ src/pt/mangadash
 src/pt/mangalivre
 src/pt/mangalivreblog
 src/pt/mangalivreorg
-src/pt/manganight
 src/pt/manganyx
 src/pt/mangaonline
 src/pt/mangaonlinegreen
