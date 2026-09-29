@@ -8,7 +8,7 @@
         "src/pt/hentaitokyo",
         "src/pt/universohentai"
       ],
-      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     },
     "gigaviewer": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -28,7 +28,7 @@
         "src/ja/tonarinoyoungjump",
         "src/ja/zenon"
       ],
-      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     },
     "greenshit": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -38,7 +38,26 @@
         "src/pt/vegitoons",
         "src/pt/verdinha"
       ],
-      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
+    },
+    "hentaihand": {
+      "units": [
+        "src/all/hentaihand",
+        "src/all/nhentaicom"
+      ],
+      "upstream_ref": "upstream/main"
+    },
+    "madtheme": {
+      "units": [
+        "src/en/kaliscancom"
+      ],
+      "upstream_ref": "upstream/main"
+    },
+    "spicytheme": {
+      "units": [
+        "src/es/spicyscan"
+      ],
+      "upstream_ref": "upstream/main"
     }
   }
 }
