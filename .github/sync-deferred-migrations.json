@@ -1,14 +1,18 @@
 {
   "themes": {
     "gattsu": {
+      "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
+      "reason": "incompatible dependent selector: src/pt/hentaiseason",
       "units": [
         "src/pt/hentaiseason",
         "src/pt/hentaitokyo",
         "src/pt/universohentai"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
     },
     "gigaviewer": {
+      "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
+      "reason": "unsupported structural migration",
       "units": [
         "src/ja/comicborder",
         "src/ja/comicdays",
@@ -24,15 +28,17 @@
         "src/ja/tonarinoyoungjump",
         "src/ja/zenon"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
     },
     "greenshit": {
+      "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
+      "reason": "incompatible dependent selector: src/pt/maidscan",
       "units": [
         "src/pt/maidscan",
         "src/pt/vegitoons",
         "src/pt/verdinha"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726"
     }
   }
 }
