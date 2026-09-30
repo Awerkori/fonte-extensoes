@@ -172,4 +172,100 @@ class PortalYaoiTest {
         assertEquals("capitulo-101", chapters[1].first)
         assertEquals("Capítulo 101", chapters[1].second)
     }
+
+    @Test
+    fun test8_parseRealChapter62() {
+        val file = java.io.File("/home/awerkori/.gemini/antigravity-cli/brain/bdc41adb-0e61-48bd-bbce-32993f2d158e/.system_generated/steps/6930/content.md")
+        if (!file.exists()) return
+        val doc = Jsoup.parse(file, "UTF-8", "https://portalyaoi.com/manga/2020/capitulo-62/")
+        val pages = PortalYaoi.parsePagesFromDocument(doc)
+        assertEquals(12, pages.size)
+        assertEquals("https://s3.us-east-005.backblazeb2.com/LERBL.COM/WP-manga/data/manga_6a7885d80cf60/capitulo-62/001.jpeg", pages[0].imageUrl)
+        assertEquals("https://s3.us-east-005.backblazeb2.com/LERBL.COM/WP-manga/data/manga_6a7885d80cf60/capitulo-62/012.jpeg", pages[11].imageUrl)
+    }
+
+    @Test
+    fun test9_decodePyVnode_withDefaultKey() {
+        val enc = "5e7141beb5274232770242904ba46b0bb13b141122345124f45442a427b75142b7779414b1b124c137313e01141234e1d14494c51590370e71245e540e2e374eb1217ec14e44b53efb52f17b0480a45b318be4717e5b3e1b9717a2cb5b6b6ec1"
+        val expected = "https://portalyaoi.com/wp-content/uploads/WP-manga/data/manga_670e75a4ceaed/capitulo-44/001.webp"
+        val decrypted = PortalYaoi.decodePyVnode(enc)
+        assertEquals(expected, decrypted)
+    }
+
+    @Test
+    fun test10_decodePyVnode_withExtractedKey() {
+        val customKey = "custom_vnode_test_key_0123456789"
+        val rawUrl = "https://portalyaoi.com/wp-content/uploads/ch44/sample.webp"
+
+        // Encrypt with customKey using the inverse of _py_hydrate:
+        // orig = (xored - 17 + 256) % 256  =>  xored = (orig + 17) % 256
+        // byteVal = xored ^ keyChar
+        val rawBytes = rawUrl.toByteArray(Charsets.UTF_8)
+        val klen = customKey.length
+        val hexChars = StringBuilder()
+        for (i in rawBytes.indices) {
+            val orig = rawBytes[i].toInt() and 0xFF
+            val xored = (orig + 17) % 256
+            val keyChar = customKey[i % klen].code
+            val byteVal = xored xor keyChar
+            hexChars.append(String.format("%02x", byteVal))
+        }
+        val encodedHex = hexChars.reverse().toString()
+
+        val html = """
+            <html>
+            <head>
+                <script>
+                    var __k = "$customKey";
+                </script>
+            </head>
+            <body></body>
+            </html>
+        """.trimIndent()
+        val doc = Jsoup.parse(html)
+        val extractedKey = PortalYaoi.extractVnodeKey(doc)
+        assertEquals(customKey, extractedKey)
+
+        val decrypted = PortalYaoi.decodePyVnode(encodedHex, extractedKey)
+        assertEquals(rawUrl, decrypted)
+    }
+
+    @Test
+    fun test11_parsePagesFromDocument_modernPyVnode() {
+        val enc1 = "5e7141beb5274232770242904ba46b0bb13b141122345124f45442a427b75142b7779414b1b124c137313e01141234e1d14494c51590370e71245e540e2e374eb1217ec14e44b53efb52f17b0480a45b318be4717e5b3e1b9717a2cb5b6b6ec1"
+        val enc2 = "5e7141beb5374232770242904ba46b0bb13b141122345124f45442a427b75142b7779414b1b124c137313e01141234e1d14494c51590370e71245e540e2e374eb1217ec14e44b53efb52f17b0480a45b318be4717e5b3e1b9717a2cb5b6b6ec1"
+
+        val html = """
+            <html>
+            <head>
+                <script>
+                    var __k = "${PortalYaoi.DEFAULT_VNODE_KEY}";
+                </script>
+            </head>
+            <body>
+                <div class="reading-content">
+                    <div class="page-break">
+                        <img class="wp-manga-chapter-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-py-vnode="$enc1" />
+                    </div>
+                    <div class="page-break">
+                        <img class="wp-manga-chapter-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-py-vnode="$enc2" />
+                    </div>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+        val doc = Jsoup.parse(html, "https://portalyaoi.com/manga/alpha-trauma/capitulo-44/")
+        val pages = PortalYaoi.parsePagesFromDocument(doc)
+
+        assertEquals(2, pages.size)
+        assertEquals("https://portalyaoi.com/wp-content/uploads/WP-manga/data/manga_670e75a4ceaed/capitulo-44/001.webp", pages[0].imageUrl)
+        assertEquals("https://portalyaoi.com/wp-content/uploads/WP-manga/data/manga_670e75a4ceaed/capitulo-44/002.webp", pages[1].imageUrl)
+    }
+
+    @Test
+    fun test12_extractVnodeKey_fallbackWhenMissing() {
+        val doc = Jsoup.parse("<html><body><div>No script here</div></body></html>")
+        val key = PortalYaoi.extractVnodeKey(doc)
+        assertEquals(PortalYaoi.DEFAULT_VNODE_KEY, key)
+    }
 }
