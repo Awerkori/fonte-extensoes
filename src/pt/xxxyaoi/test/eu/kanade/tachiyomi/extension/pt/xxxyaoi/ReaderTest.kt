@@ -98,6 +98,23 @@ class ReaderTest {
         }
     }
 
+    @Test fun vhashReaderCoexistsWithUnusedCssOrDecoy() {
+        val vhashHtml = "<div class='reading-content'>" + urls.joinToString("") {
+            "<img class='wp-manga-chapter-img' data-vhash='${VhashReaderTest.encodeVhash(it)}'>"
+        } + "</div>"
+        val htmlWithUnusedCss = vhashHtml + "<script>getComputedStyle(); document.getElementById('none');</script>"
+        assertEquals(urls, Reader.extract(Jsoup.parse(htmlWithUnusedCss, "https://3xyaoi.com/bl/test/chapter/")))
+    }
+
+    @Test fun vhashReaderTakesPriorityOverMadaraDirectImages() {
+        val vhashPages = listOf("https://3xyaoi.com/chapter/01.jpg", "https://3xyaoi.com/chapter/02.jpg")
+        val html = "<div class='reading-content'>" +
+            vhashPages.joinToString("") { "<img class='wp-manga-chapter-img' data-vhash='${VhashReaderTest.encodeVhash(it)}' src='data:image/svg+xml;placeholder'>" } +
+            "</div>"
+        val doc = Jsoup.parse(html, "https://3xyaoi.com/bl/test/chapter/")
+        assertEquals(vhashPages, Reader.extract(doc, madara = { listOf("https://3xyaoi.com/wrong/01.jpg") }))
+    }
+
     @Test fun cssReaderStillRejectsActualWarningPayload() {
         assertThrows(Reader.BrowserRestricted::class.java) {
             read(cssFixture(listOf("https://3xyaoi.com/wp-content/uploads/warning_app.jpg?x=1")))

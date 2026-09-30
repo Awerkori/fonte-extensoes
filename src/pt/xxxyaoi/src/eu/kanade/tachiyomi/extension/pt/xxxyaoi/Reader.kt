@@ -44,7 +44,7 @@ internal object Reader {
     suspend fun load(document: Document, madara: () -> List<String> = { emptyList() }, fetchScript: suspend (String) -> String?): List<String> {
         // The current reader is self-contained. Do not probe unrelated scripts
         // when its encrypted payload is present but malformed.
-        if (AesGcmReader.present(document) || CssReader.present(document) || hasSecureReader(document)) return extract(document, madara)
+        if (VhashReader.present(document) || AesGcmReader.present(document) || CssReader.present(document) || hasSecureReader(document)) return extract(document, madara)
         val failure = try {
             return extract(document, madara)
         } catch (error: PagesNotFound) {
@@ -78,6 +78,7 @@ internal object Reader {
     }.distinct().sortedByDescending { it.contains("reader", true) || it.contains("chapter", true) }.take(64)
 
     fun extract(document: Document, madara: () -> List<String> = { emptyList() }, externalScripts: List<String> = emptyList()): List<String> {
+        if (VhashReader.present(document)) return VhashReader.extract(document)
         if (AesGcmReader.present(document)) return AesGcmReader.extract(document)
         // The new CSS/data-d reader coexists with an RC4 decoy; prioritize its actual payload.
         if (CssReader.present(document)) return CssReader.extract(document)
@@ -280,19 +281,18 @@ internal object Reader {
             !noise.containsMatchIn(img.className() + " " + img.id() + " " + img.attr("alt")) &&
             listOf("width", "height").none { img.attr(it).toIntOrNull()?.let { size -> size in 1..64 } == true }
     }.flatMap { img ->
-        val attrs = listOf("data-xsec", "data-src", "data-lazy-src", "data-original", "data-srcset", "srcset", "src") +
+        val attrs = listOf("data-vhash", "data-xsec", "data-src", "data-lazy-src", "data-original", "data-srcset", "srcset", "src") +
             img.attributes().filter { it.key.startsWith("data-") }.map { it.key }
         // Keep alternatives together; normalization chooses one usable URL per image.
         listOfNotNull(
             attrs.firstNotNullOfOrNull { attr ->
                 val raw = img.attr(attr).trim()
-                val url = if (attr == "data-xsec") {
-                    raw.reversed()
-                } else if (attr.endsWith("srcset")) {
-                    srcsetEntry.findAll(raw).lastOrNull()?.groupValues?.get(1) ?: raw.substringBefore(' ').trimEnd(',')
-                } else {
-                    raw
-                }
+                val url = when {
+                    attr == "data-vhash" -> VhashReader.decodeUrl(raw)
+                    attr == "data-xsec" -> raw.reversed()
+                    attr.endsWith("srcset") -> srcsetEntry.findAll(raw).lastOrNull()?.groupValues?.get(1) ?: raw.substringBefore(' ').trimEnd(',')
+                    else -> raw
+                } ?: return@firstNotNullOfOrNull null
                 normalize(listOf(url), img.ownerDocument() ?: return@firstNotNullOfOrNull null).firstOrNull()
             },
         )
