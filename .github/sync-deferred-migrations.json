@@ -41,23 +41,29 @@
       "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     },
     "hentaihand": {
+      "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
+      "reason": "incompatible dependent selector: src/all/hentaihand",
       "units": [
         "src/all/hentaihand",
         "src/all/nhentaicom"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     },
     "madtheme": {
+      "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
+      "reason": "unsupported structural migration",
       "units": [
         "src/en/kaliscancom"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     },
     "spicytheme": {
+      "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
+      "reason": "unsupported structural migration",
       "units": [
         "src/es/spicyscan"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22"
     }
   }
 }
