@@ -21,6 +21,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -221,7 +222,8 @@ internal class ChapterDto(
 
 @Serializable
 internal class PagesDto(
-    private val chapter: ChapterPagesDto? = null,
+    val chapter: ChapterPagesDto? = null,
+    val protection: ProtectionDto? = null,
 ) {
     fun toPages(apiBaseUrl: HttpUrl): List<Page> = (chapter?.pages ?: emptyList()).mapIndexed { index, path ->
         Page(
@@ -233,6 +235,34 @@ internal class PagesDto(
 
 @Serializable
 internal class ChapterPagesDto(val pages: List<String> = emptyList())
+
+@Serializable
+internal class ProtectionDto(
+    val enabled: Boolean = false,
+    val internalScan: Boolean = false,
+    val mode: String = "",
+    val transport: TransportDescriptorDto? = null,
+)
+
+@Serializable
+internal class TransportDescriptorDto(
+    val mode: String = "",
+    val serverKey: String = "",
+    val requestProof: String = "",
+)
+
+private val WINDOW_LIMIT_REGEX = Regex(""""a"\s*:\s*(\d+)""")
+
+internal fun extractWindowLimit(pageUrl: String): Int? {
+    val g = pageUrl.toHttpUrl().queryParameter("g") ?: return null
+    val payloadBase64 = g.substringBefore('.')
+    val jsonString = try {
+        payloadBase64.decodeBase64Url().toString(Charsets.UTF_8)
+    } catch (_: Exception) {
+        return null
+    }
+    return WINDOW_LIMIT_REGEX.find(jsonString)?.groupValues?.get(1)?.toIntOrNull()
+}
 
 @Serializable
 internal class MediaGrantDto(

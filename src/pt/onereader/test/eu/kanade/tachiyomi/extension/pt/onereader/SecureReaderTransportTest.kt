@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.onereader
 
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -72,6 +73,43 @@ class SecureReaderTransportTest {
         }
 
         assertArrayEquals(image, Orx4Decoder.decode("ORX4".toByteArray() + encrypted, key, encode(nonce)))
+    }
+
+    @Test
+    fun extractsWindowLimitFromGrantToken() {
+        val windowedPayload = encode("{\"v\":4,\"w\":\"test\",\"p\":1,\"a\":6,\"s\":0}".toByteArray())
+        val windowedUrl = "https://onereader.net/api/reader/works/test/chapters/1/pages/1?g=$windowedPayload.sig"
+        assertEquals(6, extractWindowLimit(windowedUrl))
+
+        val nonWindowedPayload = encode("{\"v\":3,\"w\":\"test\",\"u\":\"abc\"}".toByteArray())
+        val nonWindowedUrl = "https://onereader.net/api/reader/works/test/chapters/1/pages/1?g=$nonWindowedPayload.sig"
+        assertEquals(null, extractWindowLimit(nonWindowedUrl))
+
+        assertEquals(null, extractWindowLimit("https://onereader.net/api/reader/works/test/chapters/1/pages/1"))
+    }
+
+    @Test
+    fun generatesRequestProofWhenConfigured() {
+        val transport = SecureReaderTransport.create()
+        val serverPair = KeyPairGenerator.getInstance("EC").apply {
+            initialize(ECGenParameterSpec(CURVE_NAME))
+        }.generateKeyPair()
+        val descriptor = TransportDescriptorDto(
+            mode = "ecdh-p256-aesgcm-v1",
+            serverKey = encode(pointToRaw(serverPair.public as ECPublicKey)),
+            requestProof = "hmac-sha256-v1",
+        )
+
+        val urlBefore = "https://onereader.net/api/reader/works/test/chapters/1/pages/1?g=grant1".toHttpUrl()
+        assertEquals(emptyMap<String, String>(), transport.buildProofHeaders(urlBefore))
+
+        transport.configure(descriptor)
+        val headers = transport.buildProofHeaders(urlBefore)
+
+        assertEquals(3, headers.size)
+        assert(headers.containsKey("X-OneReader-Proof-Ts"))
+        assert(headers.containsKey("X-OneReader-Proof-Nonce"))
+        assert(headers.containsKey("X-OneReader-Proof"))
     }
 
     private fun rawToPublic(raw: ByteArray): ECPublicKey {

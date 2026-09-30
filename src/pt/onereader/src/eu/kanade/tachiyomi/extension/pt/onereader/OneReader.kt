@@ -17,6 +17,7 @@ import keiyoushi.utils.toJsonElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonElement
 import okhttp3.CacheControl
 import okhttp3.Headers
@@ -30,10 +31,6 @@ import java.util.concurrent.ConcurrentHashMap
 
 @Source
 abstract class OneReader : KeiSource() {
-
-    // Key by canonical OkHttp URL so a host that rehydrates a Page object cannot
-    // accidentally lose a signed query parameter while looking up its local key.
-    private val mediaGrants = ConcurrentHashMap<HttpUrl, MediaGrant>()
 
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
         rateLimit(3)
@@ -175,21 +172,111 @@ abstract class OneReader : KeiSource() {
             .set("X-OneReader-Client-Key", secureTransport.clientKey)
             .set("X-OneReader-Key-Transport", KEY_TRANSPORT)
             .build()
-        val pages = client.get(
-            apiUrl("api", "reader", "works", mangaKey, "chapters", chapterNumber),
+        val manifestUrl = apiUrl("api", "reader", "works", mangaKey, "chapters", chapterNumber)
+        val initialManifest = client.get(
+            manifestUrl,
             readerHeaders,
             cacheControl = CacheControl.FORCE_NETWORK,
-        )
-            .parseAs<PagesDto>()
-            .toPages(baseUrl.toHttpUrl())
-        pages.map { page ->
-            async {
-                val pageUrl = page.imageUrl ?: throw IOException("URL da página ausente no manifesto OneReader")
-                page to authorizeMedia(pageUrl, readerHeaders, secureTransport)
+        ).parseAs<PagesDto>()
+
+        secureTransport.configure(initialManifest.protection?.transport)
+
+        val pageUrls = (initialManifest.chapter?.pages ?: emptyList()).map { path ->
+            requireNotNull(baseUrl.toHttpUrl().resolve(path)).toString()
+        }.toMutableList()
+
+        if (pageUrls.isEmpty()) return@coroutineScope emptyList()
+
+        val results = arrayOfNulls<Page>(pageUrls.size)
+        var currentIndex = 0
+
+        while (currentIndex < pageUrls.size) {
+            val windowLimit = extractWindowLimit(pageUrls[currentIndex]) ?: pageUrls.size
+            val windowEnd = minOf(windowLimit, pageUrls.size).coerceAtLeast(currentIndex + 1)
+
+            val batchIndices = currentIndex until windowEnd
+            val batchResults = batchIndices.map { index ->
+                async {
+                    val pageUrl = pageUrls[index]
+                    val grant = authorizeMedia(pageUrl, readerHeaders, secureTransport)
+                    Page(index, "", grant.url)
+                }
+            }.awaitAll()
+
+            for ((i, page) in batchResults.withIndex()) {
+                results[currentIndex + i] = page
+            }
+
+            currentIndex = windowEnd
+
+            if (currentIndex < pageUrls.size) {
+                val nextPageNumber = currentIndex + 1
+                val prevGrant = pageUrls[currentIndex - 1].toHttpUrl().queryParameter("g").orEmpty()
+                val refreshedManifest = advanceWindow(
+                    manifestUrl,
+                    prevGrant,
+                    nextPageNumber,
+                    readerHeaders,
+                    secureTransport,
+                )
+                val newPages = refreshedManifest.chapter?.pages?.map { path ->
+                    requireNotNull(baseUrl.toHttpUrl().resolve(path)).toString()
+                } ?: emptyList()
+                if (newPages.size == pageUrls.size) {
+                    for (k in currentIndex until pageUrls.size) {
+                        pageUrls[k] = newPages[k]
+                    }
+                }
             }
         }
-            .awaitAll()
-            .map { (page, grant) -> Page(page.index, page.url, grant.url) }
+
+        results.filterNotNull()
+    }
+
+    private suspend fun advanceWindow(
+        manifestUrl: HttpUrl,
+        previousGrant: String,
+        nextPageNumber: Int,
+        readerHeaders: Headers,
+        secureTransport: SecureReaderTransport,
+    ): PagesDto {
+        val refreshUrl = manifestUrl.newBuilder()
+            .addQueryParameter("_or_pg", previousGrant)
+            .addQueryParameter("_or_page", nextPageNumber.toString())
+            .build()
+
+        var lastError: Exception? = null
+        for (attempt in 0 until MAX_ADVANCE_ATTEMPTS) {
+            val response = client.get(
+                refreshUrl,
+                readerHeaders,
+                cacheControl = CacheControl.FORCE_NETWORK,
+                ensureSuccess = false,
+            )
+            if (response.isSuccessful) {
+                val refreshed = response.parseAs<PagesDto>()
+                response.close()
+                secureTransport.configure(refreshed.protection?.transport)
+                return refreshed
+            }
+
+            val statusCode = response.code
+            val bodyString = response.body.string()
+            val retryAfter = response.header("Retry-After")?.toLongOrNull() ?: DEFAULT_RETRY_AFTER_SECONDS
+            response.close()
+
+            val isWindowWait = statusCode == 429 && bodyString.contains("READER_PAGE_WINDOW_WAIT")
+            if (isWindowWait && attempt < MAX_ADVANCE_ATTEMPTS - 1) {
+                delay(maxOf(750L, retryAfter * 1000L))
+                continue
+            }
+
+            val detail = bodyString.replace(Regex("[\\r\\n\\t]+"), " ").take(MAX_ERROR_BODY_LENGTH)
+            lastError = IOException("Falha ao avançar janela de páginas: HTTP $statusCode: $detail")
+            break
+        }
+
+        throw lastError ?: IOException("Não foi possível liberar a próxima faixa de páginas")
     }
 
     private suspend fun authorizeMedia(
@@ -197,9 +284,17 @@ abstract class OneReader : KeiSource() {
         readerHeaders: Headers,
         secureTransport: SecureReaderTransport,
     ): MediaGrant {
-        val requestHeaders = readerHeaders.newBuilder().set("Accept", "application/vnd.onereader.media+json").build()
+        val httpUrl = pageUrl.toHttpUrl()
+        val proofHeaders = secureTransport.buildProofHeaders(httpUrl)
+        val requestHeaders = readerHeaders.newBuilder()
+            .set("Accept", "application/vnd.onereader.media+json")
+            .apply {
+                proofHeaders.forEach { (name, value) -> set(name, value) }
+            }
+            .build()
+
         val response = client.get(
-            pageUrl.toHttpUrl(),
+            httpUrl,
             requestHeaders,
             cacheControl = CacheControl.FORCE_NETWORK,
             ensureSuccess = false,
@@ -211,10 +306,17 @@ abstract class OneReader : KeiSource() {
         }
 
         val grant = response.parseAs<MediaGrantDto>()
-        if (!grant.ok || grant.mode !in SUPPORTED_MEDIA_MODES) throw IOException("Autorização de mídia inválida")
+        response.close()
+        if (!grant.ok || grant.mode !in SUPPORTED_MEDIA_MODES) {
+            throw IOException("Autorização de mídia inválida")
+        }
         val keyBytes = grant.keyWrap?.let(secureTransport::unwrap)
-        if (grant.mode == MODE_AES_GCM_V4 && keyBytes == null) throw IOException("Chave ORX4 ausente")
-        if (grant.mode == MODE_XOR_PREFIX_V3 && grant.key.isBlank()) throw IOException("Chave ORX3 ausente")
+        if (grant.mode == MODE_AES_GCM_V4 && keyBytes == null) {
+            throw IOException("Chave ORX4 ausente")
+        }
+        if (grant.mode == MODE_XOR_PREFIX_V3 && grant.key.isBlank()) {
+            throw IOException("Chave ORX3 ausente")
+        }
         val mediaGrant = MediaGrant(grant.url, grant.key, keyBytes, grant.contentType)
         mediaGrants[grant.url.toHttpUrl()] = mediaGrant
         return mediaGrant
@@ -254,12 +356,15 @@ abstract class OneReader : KeiSource() {
         private const val PAGE_SIZE = 24
         private const val HOME_LIMIT = 60
         private const val MAX_ERROR_BODY_LENGTH = 500
+        private const val MAX_ADVANCE_ATTEMPTS = 4
+        private const val DEFAULT_RETRY_AFTER_SECONDS = 3L
         private const val KEY_TRANSPORT = "ecdh-p256-aesgcm-v1"
         private const val MODE_XOR_PREFIX_V3 = "xor-prefix-v3"
         private const val MODE_AES_GCM_V4 = "aes-gcm-v4"
         private val SUPPORTED_MEDIA_MODES = setOf(MODE_XOR_PREFIX_V3, MODE_AES_GCM_V4)
         private val ORX3_MAGIC = byteArrayOf(0x4f, 0x52, 0x58, 0x33)
         private val ORX4_MAGIC = byteArrayOf(0x4f, 0x52, 0x58, 0x34)
+        private val mediaGrants = ConcurrentHashMap<HttpUrl, MediaGrant>()
     }
 }
 
