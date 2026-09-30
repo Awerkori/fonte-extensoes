@@ -28,6 +28,7 @@ import okhttp3.OkHttpClient
 import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 @Source
 abstract class OneReader : KeiSource() {
@@ -173,13 +174,7 @@ abstract class OneReader : KeiSource() {
             .set("X-OneReader-Key-Transport", KEY_TRANSPORT)
             .build()
         val manifestUrl = apiUrl("api", "reader", "works", mangaKey, "chapters", chapterNumber)
-        val initialManifest = client.get(
-            manifestUrl,
-            readerHeaders,
-            cacheControl = CacheControl.FORCE_NETWORK,
-        ).parseAs<PagesDto>()
-
-        secureTransport.configure(initialManifest.protection?.transport)
+        val initialManifest = fetchInitialManifest(manifestUrl, readerHeaders, secureTransport)
 
         val pageUrls = (initialManifest.chapter?.pages ?: emptyList()).map { path ->
             requireNotNull(baseUrl.toHttpUrl().resolve(path)).toString()
@@ -233,6 +228,51 @@ abstract class OneReader : KeiSource() {
         results.filterNotNull()
     }
 
+    private suspend fun fetchInitialManifest(
+        manifestUrl: HttpUrl,
+        readerHeaders: Headers,
+        secureTransport: SecureReaderTransport,
+    ): PagesDto {
+        var lastError: Exception? = null
+        for (attempt in 0 until MAX_ADVANCE_ATTEMPTS) {
+            val response = client.get(
+                manifestUrl,
+                readerHeaders,
+                cacheControl = CacheControl.FORCE_NETWORK,
+                ensureSuccess = false,
+            )
+            if (response.isSuccessful) {
+                val manifest = response.parseAs<PagesDto>()
+                response.close()
+                secureTransport.configure(manifest.protection?.transport)
+                return manifest
+            }
+
+            val statusCode = response.code
+            val bodyString = response.body.string()
+            val retryAfterHeader = response.header("Retry-After")?.toLongOrNull()
+            response.close()
+
+            val isRateLimited = statusCode == 429 && bodyString.contains("READER_RATE_LIMITED")
+            if (isRateLimited && attempt < MAX_ADVANCE_ATTEMPTS - 1) {
+                val baseWaitMs = if (retryAfterHeader != null) {
+                    retryAfterHeader * 1000L
+                } else {
+                    (DEFAULT_RETRY_AFTER_SECONDS + attempt * 2L) * 1000L
+                }
+                val jitter = Random.nextLong(100L, 500L)
+                delay(baseWaitMs + jitter)
+                continue
+            }
+
+            val detail = bodyString.replace(Regex("[\\r\\n\\t]+"), " ").take(MAX_ERROR_BODY_LENGTH)
+            lastError = IOException("Falha ao obter manifesto do capítulo: HTTP $statusCode: $detail")
+            break
+        }
+
+        throw lastError ?: IOException("Não foi possível obter o manifesto inicial do capítulo")
+    }
+
     private suspend fun advanceWindow(
         manifestUrl: HttpUrl,
         previousGrant: String,
@@ -262,12 +302,26 @@ abstract class OneReader : KeiSource() {
 
             val statusCode = response.code
             val bodyString = response.body.string()
-            val retryAfter = response.header("Retry-After")?.toLongOrNull() ?: DEFAULT_RETRY_AFTER_SECONDS
+            val retryAfterHeader = response.header("Retry-After")?.toLongOrNull()
             response.close()
 
             val isWindowWait = statusCode == 429 && bodyString.contains("READER_PAGE_WINDOW_WAIT")
+            val isRateLimited = statusCode == 429 && bodyString.contains("READER_RATE_LIMITED")
+
             if (isWindowWait && attempt < MAX_ADVANCE_ATTEMPTS - 1) {
-                delay(maxOf(750L, retryAfter * 1000L))
+                val waitSeconds = retryAfterHeader ?: DEFAULT_RETRY_AFTER_SECONDS
+                delay(maxOf(750L, waitSeconds * 1000L))
+                continue
+            }
+
+            if (isRateLimited && attempt < MAX_ADVANCE_ATTEMPTS - 1) {
+                val baseWaitMs = if (retryAfterHeader != null) {
+                    retryAfterHeader * 1000L
+                } else {
+                    (DEFAULT_RETRY_AFTER_SECONDS + attempt * 2L) * 1000L
+                }
+                val jitter = Random.nextLong(100L, 500L)
+                delay(baseWaitMs + jitter)
                 continue
             }
 
@@ -293,33 +347,55 @@ abstract class OneReader : KeiSource() {
             }
             .build()
 
-        val response = client.get(
-            httpUrl,
-            requestHeaders,
-            cacheControl = CacheControl.FORCE_NETWORK,
-            ensureSuccess = false,
-        )
-        if (!response.isSuccessful) {
-            val detail = response.body.string().replace(Regex("[\\r\\n\\t]+"), " ").take(MAX_ERROR_BODY_LENGTH)
+        var lastError: Exception? = null
+        for (attempt in 0 until 3) {
+            val response = client.get(
+                httpUrl,
+                requestHeaders,
+                cacheControl = CacheControl.FORCE_NETWORK,
+                ensureSuccess = false,
+            )
+            if (response.isSuccessful) {
+                val grant = response.parseAs<MediaGrantDto>()
+                response.close()
+                if (!grant.ok || grant.mode !in SUPPORTED_MEDIA_MODES) {
+                    throw IOException("Autorização de mídia inválida")
+                }
+                val keyBytes = grant.keyWrap?.let(secureTransport::unwrap)
+                if (grant.mode == MODE_AES_GCM_V4 && keyBytes == null) {
+                    throw IOException("Chave ORX4 ausente")
+                }
+                if (grant.mode == MODE_XOR_PREFIX_V3 && grant.key.isBlank()) {
+                    throw IOException("Chave ORX3 ausente")
+                }
+                val mediaGrant = MediaGrant(grant.url, grant.key, keyBytes, grant.contentType)
+                mediaGrants[grant.url.toHttpUrl()] = mediaGrant
+                return mediaGrant
+            }
+
+            val code = response.code
+            val body = response.body.string()
+            val retryAfterHeader = response.header("Retry-After")?.toLongOrNull()
             response.close()
-            throw IOException("Falha ao autorizar mídia: HTTP ${response.code}: $detail")
+
+            val isRateLimited = code == 429 && body.contains("READER_RATE_LIMITED")
+            if (isRateLimited && attempt < 2) {
+                val baseWaitMs = if (retryAfterHeader != null) {
+                    retryAfterHeader * 1000L
+                } else {
+                    (DEFAULT_RETRY_AFTER_SECONDS + attempt * 2L) * 1000L
+                }
+                val jitter = Random.nextLong(100L, 500L)
+                delay(baseWaitMs + jitter)
+                continue
+            }
+
+            val detail = body.replace(Regex("[\\r\\n\\t]+"), " ").take(MAX_ERROR_BODY_LENGTH)
+            lastError = IOException("Falha ao autorizar mídia: HTTP $code: $detail")
+            break
         }
 
-        val grant = response.parseAs<MediaGrantDto>()
-        response.close()
-        if (!grant.ok || grant.mode !in SUPPORTED_MEDIA_MODES) {
-            throw IOException("Autorização de mídia inválida")
-        }
-        val keyBytes = grant.keyWrap?.let(secureTransport::unwrap)
-        if (grant.mode == MODE_AES_GCM_V4 && keyBytes == null) {
-            throw IOException("Chave ORX4 ausente")
-        }
-        if (grant.mode == MODE_XOR_PREFIX_V3 && grant.key.isBlank()) {
-            throw IOException("Chave ORX3 ausente")
-        }
-        val mediaGrant = MediaGrant(grant.url, grant.key, keyBytes, grant.contentType)
-        mediaGrants[grant.url.toHttpUrl()] = mediaGrant
-        return mediaGrant
+        throw lastError ?: IOException("Falha ao autorizar mídia da página")
     }
 
     override val supportsFilterFetching get() = true

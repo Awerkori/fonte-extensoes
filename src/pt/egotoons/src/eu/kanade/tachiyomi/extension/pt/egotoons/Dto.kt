@@ -5,6 +5,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.Jsoup
 import kotlin.time.Instant
@@ -68,15 +70,18 @@ class ChapterDetailsDto(
 
 @Serializable
 class ChapterDto(
-    @SerialName("obra_id") private val mangaId: Int,
-    @SerialName("numero") private val number: String,
-    @SerialName("numero_key") private val numberKey: String? = null,
-    @SerialName("titulo") private val title: String? = null,
-    @SerialName("nome") private val name: String? = null,
-    @SerialName("total_paginas") private val totalPages: Int = 0,
-    @SerialName("page_url_template") private val pageUrlTemplate: String? = null,
-    @SerialName("paginas") private val pages: List<String> = emptyList(),
-    @SerialName("criado_em") private val createdAt: String? = null,
+    @SerialName("obra_id") val mangaId: Int,
+    @SerialName("numero") val number: String,
+    @SerialName("numero_key") val numberKey: String? = null,
+    @SerialName("titulo") val title: String? = null,
+    @SerialName("nome") val name: String? = null,
+    @SerialName("total_paginas") val totalPages: Int = 0,
+    @SerialName("page_url_template") val pageUrlTemplate: String? = null,
+    @SerialName("paginas") val pages: List<String> = emptyList(),
+    @SerialName("criado_em") val createdAt: String? = null,
+    val id: Long? = null,
+    @SerialName("manifest_url") val manifestUrl: String? = null,
+    @SerialName("first_page_url") val firstPageUrl: String? = null,
 ) {
     fun toSChapter() = SChapter.create().apply {
         val slug = numberKey ?: number.removeSuffix(".00").removeSuffix(".0")
@@ -86,9 +91,12 @@ class ChapterDto(
             ?: "Capítulo $slug"
         chapter_number = number.toFloatOrNull() ?: -1F
         date_upload = createdAt?.let(Instant::parseOrNull)?.toEpochMilliseconds() ?: 0L
+        id?.let {
+            memo = buildJsonObject { put("id", it.toString()) }
+        }
     }
 
-    fun toPageList(baseUrl: String): List<Page> {
+    fun toPageList(baseUrl: String, chapterUrl: String = ""): List<Page> {
         val urls = pages.ifEmpty {
             pageUrlTemplate?.let { template ->
                 (0 until totalPages).map { template.replace("{index}", it.toString()) }
@@ -96,10 +104,35 @@ class ChapterDto(
         }
         val siteUrl = baseUrl.toHttpUrl()
         return urls.mapIndexed { index, url ->
-            Page(index, imageUrl = requireNotNull(siteUrl.resolve(url)).toString())
+            Page(index, url = chapterUrl, imageUrl = requireNotNull(siteUrl.resolve(url)).toString())
         }
     }
 }
+
+@Serializable
+class ChapterManifestDto(
+    @SerialName("sucesso") val success: Boolean = true,
+    @SerialName("totalPages") val totalPages: Int = 0,
+    @SerialName("offset") val offset: Int = 0,
+    @SerialName("limit") val limit: Int = 24,
+    @SerialName("nextOffset") val nextOffset: Int? = null,
+    @SerialName("pages") val pages: List<ManifestPageDto> = emptyList(),
+) {
+    fun toPageList(apiBaseUrl: String, chapterUrl: String = ""): List<Page> {
+        val base = apiBaseUrl.toHttpUrl()
+        return pages.sortedBy { it.index }.mapIndexed { i, p ->
+            val resolvedUrl = base.resolve(p.url)?.toString() ?: p.url
+            Page(p.index.takeIf { it >= 0 } ?: i, url = chapterUrl, imageUrl = resolvedUrl)
+        }
+    }
+}
+
+@Serializable
+class ManifestPageDto(
+    val index: Int = 0,
+    val url: String,
+    @SerialName("contentType") val contentType: String? = null,
+)
 
 @Serializable
 class FilterData(

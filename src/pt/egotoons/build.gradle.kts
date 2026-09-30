@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Ego Toons"
-    versionCode = 9
+    versionCode = 10
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -15,4 +15,20 @@ keiyoushi {
         baseUrl = "https://egotoons.com"
         versionId = 3
     }
+}
+
+dependencies {
+    testImplementation(libs.junit)
+    testImplementation(libs.bundles.common)
+    testImplementation(libs.tachiyomi.lib.v16)
+}
+
+android {
+    sourceSets.named("test") {
+        kotlin.directories.add("test")
+    }
+}
+
+tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") }.configureEach {
+    enabled = false
 }
