@@ -4,42 +4,46 @@ import android.content.SharedPreferences
 import android.util.Base64
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import kotlin.random.Random
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class NexusToons :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
     override val supportsLatest = true
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    override val client = network.client.newBuilder()
-        .addInterceptor(NexusDecrypt.createInterceptor())
-        .rateLimit(3, 1.seconds)
-        .build()
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
+        addInterceptor(NexusDecrypt.createInterceptor())
+        rateLimit(3, 1.seconds)
+    }
 
     private val apiHeaders by lazy {
         headers.newBuilder()
-            .add("Accept", "application/json")
-            .add("Referer", "$baseUrl/")
+            .set("Accept", "application/json")
+            .set("Accept-Encoding", "identity")
+            .set("Referer", "$baseUrl/")
             .build()
     }
 
@@ -94,7 +98,7 @@ abstract class NexusToons :
 
     // ==================== Popular ==========================
 
-    override fun popularMangaRequest(page: Int): Request {
+    override suspend fun getPopularManga(page: Int): MangasPage {
         val url = "$baseUrl/api/mangas".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", "50")
@@ -102,11 +106,7 @@ abstract class NexusToons :
             .apply { if (onlyNsfw) addQueryParameter("onlyNsfw", "true") }
             .addQueryParameter("sortBy", "views")
             .build()
-        return GET(url, apiHeaders)
-    }
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<MangaListResponse>()
+        val result = client.get(url, apiHeaders).parseAs<MangaListResponse>()
         val mangas = result.data.orEmpty().map { it.toSManga() }
         val hasNextPage = result.page < result.pages
         return MangasPage(mangas, hasNextPage)
@@ -114,7 +114,7 @@ abstract class NexusToons :
 
     // ==================== Latest ==========================
 
-    override fun latestUpdatesRequest(page: Int): Request {
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = "$baseUrl/api/mangas".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", "50")
@@ -122,14 +122,15 @@ abstract class NexusToons :
             .apply { if (onlyNsfw) addQueryParameter("onlyNsfw", "true") }
             .addQueryParameter("sortBy", "lastChapterAt")
             .build()
-        return GET(url, apiHeaders)
+        val result = client.get(url, apiHeaders).parseAs<MangaListResponse>()
+        val mangas = result.data.orEmpty().map { it.toSManga() }
+        val hasNextPage = result.page < result.pages
+        return MangasPage(mangas, hasNextPage)
     }
-
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // ==================== Search ==========================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val url = "$baseUrl/api/mangas".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", "30")
@@ -193,43 +194,41 @@ abstract class NexusToons :
             url.addQueryParameter("themes", themeList.joinToString(","))
         }
 
-        return GET(url.build(), apiHeaders)
+        val result = client.get(url.build(), apiHeaders).parseAs<MangaListResponse>()
+        val mangas = result.data.orEmpty().map { it.toSManga() }
+        val hasNextPage = result.page < result.pages
+        return MangasPage(mangas, hasNextPage)
     }
 
-    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val slug = getMangaSlug(url.toString())
+        return client.get("$baseUrl/api/manga/$slug", apiHeaders).parseAs<MangaDetailsDto>().toSManga()
+    }
 
-    // ==================== Details =======================
+    // ==================== Details & Chapters =======================
 
     private fun getMangaSlug(url: String) = url.substringAfter("/manga/").trimEnd('/')
 
-    override fun mangaDetailsRequest(manga: SManga): Request {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
         val slug = getMangaSlug(manga.url)
-        return GET("$baseUrl/api/manga/$slug", apiHeaders)
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga = response.parseAs<MangaDetailsDto>().toSManga()
-
-    // ==================== Chapter =======================
-
-    override fun chapterListRequest(manga: SManga): Request {
-        val slug = getMangaSlug(manga.url)
-        return GET("$baseUrl/api/manga/$slug", apiHeaders)
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val manga = response.parseAs<MangaDetailsDto>()
-        return manga.chapters.orEmpty().map { it.toSChapter(manga.slug) }
+        val dto = client.get("$baseUrl/api/manga/$slug", apiHeaders).parseAs<MangaDetailsDto>()
+        return SMangaUpdate(
+            manga = if (fetchDetails) dto.toSManga() else manga,
+            chapters = if (fetchChapters) dto.chapters.orEmpty().map { it.toSChapter(dto.slug) } else chapters,
+        )
     }
 
     // ==================== Page ==========================
 
-    override fun pageListRequest(chapter: SChapter): Request {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.url.substringAfter("/read/").substringBefore("/")
-        return GET("$baseUrl/api/read/$chapterId", apiHeaders)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val readResponse = response.parseAs<ReadResponse>()
+        val readResponse = client.get("$baseUrl/api/read/$chapterId", apiHeaders).parseAs<ReadResponse>()
         val pages = readResponse.pages
         if (pages.first().imageUrl != null) {
             return pages.mapIndexed { index, page ->
@@ -247,18 +246,20 @@ abstract class NexusToons :
         }
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
     override fun imageRequest(page: Page): Request {
-        val headers = headersBuilder()
+        val imageHeaders = headers.newBuilder()
             .set("Referer", "$baseUrl/")
             .build()
-        return GET(page.imageUrl!!, headers)
+        return Request.Builder()
+            .url(page.imageUrl!!)
+            .headers(imageHeaders)
+            .get()
+            .build()
     }
 
     // ==================== Filters ==========================
 
-    override fun getFilterList() = FilterList(
+    override fun getFilterList(data: JsonElement?) = FilterList(
         SelectFilter("Ordenar Por", "sortBy", sortList),
         SelectFilter("Ordem", "sortOrder", orderList),
         SelectFilter("Modo de Categoria", "categoryMode", categoryModeList),
