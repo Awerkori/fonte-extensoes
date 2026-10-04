@@ -8,27 +8,34 @@
         "src/pt/hentaitokyo",
         "src/pt/universohentai"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     },
     "gigaviewer": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
       "reason": "unsupported structural migration",
       "units": [
+        "src/ja/comicaction",
         "src/ja/comicborder",
         "src/ja/comicdays",
         "src/ja/comicearthstar",
         "src/ja/comicgardo",
+        "src/ja/comicogyaaa",
+        "src/ja/comicseasons",
+        "src/ja/comictrail",
         "src/ja/comicyours",
         "src/ja/comiplex",
+        "src/ja/feelweb",
         "src/ja/ichicomi",
         "src/ja/kuragebunch",
         "src/ja/magcomi",
+        "src/ja/mangatimesquare",
+        "src/ja/ourfeel",
         "src/ja/shonenjumpplus",
         "src/ja/sundaywebevery",
         "src/ja/tonarinoyoungjump",
         "src/ja/zenon"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     },
     "greenshit": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -38,16 +45,16 @@
         "src/pt/vegitoons",
         "src/pt/verdinha"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     },
     "hentaihand": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
-      "reason": "incompatible dependent selector: src/all/hentaihand",
+      "reason": "functional conflict: lib-multisrc/hentaihand/src/eu/kanade/tachiyomi/multisrc/hentaihand/HentaiHand.kt",
       "units": [
         "src/all/hentaihand",
         "src/all/nhentaicom"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     },
     "madtheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -55,7 +62,7 @@
       "units": [
         "src/en/kaliscancom"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     },
     "spicytheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -63,7 +70,7 @@
       "units": [
         "src/es/spicyscan"
       ],
-      "upstream_ref": "4c8cda759ae7f9948fecacb5eec2b47b011ccf51"
+      "upstream_ref": "ce0c3b46989df8224bbf8bff72b76b07ba957648"
     }
   }
 }
