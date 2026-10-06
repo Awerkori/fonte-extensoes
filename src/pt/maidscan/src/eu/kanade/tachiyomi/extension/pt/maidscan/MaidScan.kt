@@ -5,9 +5,9 @@ import keiyoushi.annotation.Source
 
 @Source
 abstract class MaidScan : GreenShit() {
-    override val apiUrl = "https://api.verdinha.wtf"
-    override val cdnUrl = "https://cdn.verdinha.wtf"
-    override val cdnApiUrl = "https://api.verdinha.wtf/cdn"
+    override val apiUrl = "https://api2.empreguetes.wtf"
+    override val cdnUrl = "https://cdn.empreguetes.wtf"
+    override val cdnApiUrl = "https://api2.empreguetes.wtf/cdn"
     override val scanId = "3"
 
     override val defaultGenreId = "4"

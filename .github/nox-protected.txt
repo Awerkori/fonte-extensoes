@@ -73,3 +73,4 @@ src/pt/yomumangas
 src/pt/zinnes
 src/pt/karikari
 src/pt/onereader
+src/pt/maidscan
