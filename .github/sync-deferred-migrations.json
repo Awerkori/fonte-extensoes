@@ -1,5 +1,12 @@
 {
   "themes": {
+    "clipstudioreader": {
+      "units": [
+        "src/ja/comicfesta",
+        "src/ja/firecross"
+      ],
+      "upstream_ref": "upstream/main"
+    },
     "gattsu": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
       "reason": "incompatible dependent selector: src/pt/hentaiseason",
@@ -8,7 +15,7 @@
         "src/pt/hentaitokyo",
         "src/pt/universohentai"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "gigaviewer": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -35,7 +42,7 @@
         "src/ja/tonarinoyoungjump",
         "src/ja/zenon"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "greenshit": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -45,7 +52,7 @@
         "src/pt/vegitoons",
         "src/pt/verdinha"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "hentaihand": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -54,7 +61,7 @@
         "src/all/hentaihand",
         "src/all/nhentaicom"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "madtheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -62,7 +69,7 @@
       "units": [
         "src/en/kaliscancom"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "spicytheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -70,7 +77,7 @@
       "units": [
         "src/es/spicyscan"
       ],
-      "upstream_ref": "ac40914c93fde9464914deaccd27de4e43bb009d"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     }
   }
 }
