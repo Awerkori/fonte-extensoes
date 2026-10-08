@@ -1,11 +1,13 @@
 {
   "themes": {
     "clipstudioreader": {
+      "patch_base": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022",
+      "reason": "unsupported structural migration",
       "units": [
         "src/ja/comicfesta",
         "src/ja/firecross"
       ],
-      "upstream_ref": "upstream/main"
+      "upstream_ref": "63ac848765afc2ac2eb8d4f8f1d65203b2f13022"
     },
     "gattsu": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
