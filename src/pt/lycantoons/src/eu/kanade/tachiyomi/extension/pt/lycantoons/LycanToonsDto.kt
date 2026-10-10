@@ -18,8 +18,26 @@ class PopularResponse(
 }
 
 @Serializable
+class RankingRowDto(
+    val title: String,
+    private val slug: String,
+    private val coverUrl: String? = null,
+    private val genre: String? = null,
+) {
+    fun toSManga() = SManga.create().apply {
+        title = this@RankingRowDto.title
+        url = "/series/$slug"
+        thumbnail_url = coverUrl
+        genre = this@RankingRowDto.genre?.takeIf { it.isNotBlank() }
+            ?.let { tagMapping[it] ?: it }
+        status = SManga.UNKNOWN
+        initialized = false
+    }
+}
+
+@Serializable
 class SeriesDto(
-    private val title: String,
+    val title: String,
     private val slug: String,
     private val coverUrl: String? = null,
     private val author: String? = null,
@@ -73,6 +91,7 @@ class ChapterListDto(
 
 @Serializable
 class ChapterDto(
+    private val id: Long? = null,
     private val numero: JsonElement,
     private val createdAt: String? = null,
     private val titulo: String? = null,
@@ -80,11 +99,16 @@ class ChapterDto(
     fun toSChapter(slug: String) = SChapter.create().apply {
         val numberString = numero.jsonPrimitive.content
         name = if (!titulo.isNullOrBlank()) "Capítulo $numberString - $titulo" else "Capítulo $numberString"
-        url = "/series/$slug/$numberString"
+        url = if (id != null) "/series/$slug/$numberString?capituloId=$id" else "/series/$slug/$numberString"
         date_upload = Instant.tryParse(createdAt)
         chapter_number = numberString.toFloatOrNull() ?: -1f
     }
 }
+
+@Serializable
+class ChapterPagesDto(
+    val pages: List<String> = emptyList(),
+)
 
 @Serializable
 class PageList(
