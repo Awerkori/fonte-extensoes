@@ -18,7 +18,7 @@ jobs:
   sync:
     name: Sync upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -36,4 +36,77 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Sync upstream
-        run: python .github/scripts/sync-upstream.py --push
+        run: |
+          MAX_ATTEMPTS=3
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "::group::Sync upstream — Tentativa $attempt de $MAX_ATTEMPTS"
+            SYNC_LOG="$(mktemp)"
+
+            set +e
+            python .github/scripts/sync-upstream.py --push 2>&1 | tee "$SYNC_LOG"
+            EXIT_CODE="${PIPESTATUS[0]}"
+            set -e
+
+            echo "::endgroup::"
+
+            if [ "$EXIT_CODE" -eq 0 ]; then
+              echo "Sincronização concluída com sucesso na tentativa $attempt."
+              rm -f "$SYNC_LOG"
+              exit 0
+            fi
+
+            echo "Tentativa $attempt falhou com código de saída $EXIT_CODE."
+
+            # Determina se a falha é elegível para recuperação controlada
+            RETRY_DECISION="NO_RETRY: Falha não elegível para repetição automática"
+
+            if grep -q "Push origin/main: PASS" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Tentativa já publicada em origin/main"
+            elif grep -q -E "origin/main advanced during sync|HEAD is not based on the fetched origin/main|Updates were rejected because the remote contains work that you do not have locally|\[rejected\].*fetch first|\[rejected\].*non-fast-forward" "$SYNC_LOG"; then
+              RETRY_DECISION="RETRY: origin/main avançou durante a sincronização"
+            elif grep -q -E "(^e: .*:|[[:space:]]Compilation error[[:space:]])" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Falha real de compilação"
+            elif grep -q "Structural compatibility validation failed:" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Incompatibilidade estrutural multisrc"
+            elif grep -q "Local project dependency validation failed:" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Dependência de projeto local ausente"
+            elif grep -q "Structural libVersion downgrade blocked" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Downgrade de libVersion bloqueado"
+            elif grep -q "Unproven protected multisrc:" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Multisrc protegido não comprovado"
+            elif grep -q -E "Permission to .* denied|fatal: Authentication failed|Authentication failed|fatal: could not read Username|status code:?[[:space:]]*(401|403)|Received status code (401|403)" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Falha de autenticação"
+            elif grep -q -E "Plugin \[id: '.*'\] was not found|Script compilation error|status code:?[[:space:]]*404|Received status code 404" "$SYNC_LOG"; then
+              RETRY_DECISION="NO_RETRY: Erro permanente de configuração ou dependência inexistente"
+            elif grep -q -E "Could not download|Could not get resource|Could not GET|Could not HEAD|Could not resolve all files for configuration|Could not resolve dependencies|Downloading https?://" "$SYNC_LOG" && \
+                 grep -q -E "Received status code (429|500|502|503|504)|status code:?[[:space:]]*(429|500|502|503|504)|(429|500|502|503|504) (Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)" "$SYNC_LOG"; then
+              RETRY_DECISION="RETRY: Falha temporária no download de dependências"
+            fi
+
+            rm -f "$SYNC_LOG"
+
+            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+              echo "Limite de $MAX_ATTEMPTS tentativas atingido. Abortando execução."
+              exit "$EXIT_CODE"
+            fi
+
+            case "$RETRY_DECISION" in
+              RETRY:*)
+                echo "Recuperação permitida: $RETRY_DECISION"
+                echo "Restaurando estado limpo do runner e sincronizando origin/main..."
+                ./gradlew --stop 2>/dev/null || true
+                git merge --abort 2>/dev/null || true
+                git fetch origin main
+                git checkout -B main origin/main
+                git reset --hard origin/main
+                git clean -ffdx
+                git worktree prune 2>/dev/null || true
+                echo "Aguardando 10 segundos antes da próxima tentativa..."
+                sleep 10
+                ;;
+              *)
+                echo "Falha não elegível para nova tentativa: $RETRY_DECISION"
+                exit "$EXIT_CODE"
+                ;;
+            esac
+          done
