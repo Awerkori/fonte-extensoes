@@ -13,7 +13,10 @@ import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPublicKeySpec
+import java.text.SimpleDateFormat
 import java.util.Base64
+import java.util.Locale
+import java.util.TimeZone
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
@@ -46,9 +49,13 @@ internal class SecureReaderTransport internal constructor(private val keyPair: K
         configuredServerKey = serverKey
     }
 
+    fun updateServerTimeFromHeader(dateHeader: String?) {
+        Companion.updateServerTimeFromHeader(dateHeader)
+    }
+
     fun buildProofHeaders(pageUrl: HttpUrl): Map<String, String> {
         val key = proofKey ?: return emptyMap()
-        val timestamp = System.currentTimeMillis().toString()
+        val timestamp = (System.currentTimeMillis() + globalServerTimeOffset).toString()
         val nonceBytes = ByteArray(16).apply { secureRandom.nextBytes(this) }
         val nonce = nonceBytes.encodeBase64Url()
         val grant = pageUrl.queryParameter("g").orEmpty()
@@ -127,6 +134,25 @@ internal class SecureReaderTransport internal constructor(private val keyPair: K
         private const val PROOF_MODE = "hmac-sha256-v1"
         private val PREFIX = "oneReader-keywrap-ecdh-p256-v1\n".toByteArray(Charsets.UTF_8)
         private val secureRandom = SecureRandom()
+
+        @Volatile
+        var globalServerTimeOffset: Long = 0L
+
+        fun updateServerTimeFromHeader(dateHeader: String?) {
+            if (dateHeader.isNullOrBlank()) return
+            val serverTime = parseHttpDate(dateHeader) ?: return
+            val localNow = System.currentTimeMillis()
+            globalServerTimeOffset = serverTime - localNow
+        }
+
+        private fun parseHttpDate(dateStr: String): Long? = try {
+            val format = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("GMT")
+            }
+            format.parse(dateStr)?.time
+        } catch (_: Exception) {
+            null
+        }
 
         fun create(): SecureReaderTransport {
             val pair = KeyPairGenerator.getInstance("EC").apply {

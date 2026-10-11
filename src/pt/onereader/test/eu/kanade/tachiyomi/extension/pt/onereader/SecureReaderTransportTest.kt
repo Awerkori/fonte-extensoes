@@ -112,6 +112,30 @@ class SecureReaderTransportTest {
         assert(headers.containsKey("X-OneReader-Proof"))
     }
 
+    @Test
+    fun adjustsProofTimestampUsingServerDateHeader() {
+        val transport = SecureReaderTransport.create()
+        val serverPair = KeyPairGenerator.getInstance("EC").apply {
+            initialize(ECGenParameterSpec(CURVE_NAME))
+        }.generateKeyPair()
+        val descriptor = TransportDescriptorDto(
+            mode = "ecdh-p256-aesgcm-v1",
+            serverKey = encode(pointToRaw(serverPair.public as ECPublicKey)),
+            requestProof = "hmac-sha256-v1",
+        )
+        transport.configure(descriptor)
+
+        SecureReaderTransport.updateServerTimeFromHeader("Sat, 10 Oct 2026 22:00:00 GMT")
+        val pageUrl = "https://onereader.net/api/reader/works/test/chapters/1/pages/1?g=grant1".toHttpUrl()
+        val headers = transport.buildProofHeaders(pageUrl)
+        val ts = headers["X-OneReader-Proof-Ts"]?.toLongOrNull()
+        org.junit.Assert.assertNotNull(ts)
+        val diff = Math.abs(ts!! - 1791669600000L)
+        org.junit.Assert.assertTrue("Timestamp diff $diff should be < 5000ms", diff < 5000L)
+
+        SecureReaderTransport.globalServerTimeOffset = 0L
+    }
+
     private fun rawToPublic(raw: ByteArray): ECPublicKey {
         val parameters = AlgorithmParameters.getInstance("EC").apply {
             init(ECGenParameterSpec(CURVE_NAME))
