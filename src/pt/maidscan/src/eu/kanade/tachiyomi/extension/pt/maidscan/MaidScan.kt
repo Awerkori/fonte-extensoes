@@ -11,20 +11,4 @@ abstract class MaidScan : GreenShit() {
     override val scanId = "3"
 
     override val defaultGenreId = "4"
-
-    override val formatsList = arrayOf(
-        Pair("Todos", ""),
-        Pair("Manhwa", "16"),
-        Pair("Novel", "17"),
-    )
-
-    override val statusList = arrayOf(
-        Pair("Todos", ""),
-        Pair("Cancelado", "13"),
-        Pair("Completo", "12"),
-        Pair("Em Andamento", "10"),
-        Pair("Hiato", "11"),
-    )
-
-    override val tagsList = emptyArray<Pair<String, String>>()
 }

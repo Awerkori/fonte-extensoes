@@ -1,82 +1,37 @@
 package eu.kanade.tachiyomi.extension.pt.bakai
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservable
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
-import keiyoushi.network.rateLimit
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.tryParse
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
-import org.jsoup.nodes.Element
-import rx.Observable
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import org.jsoup.nodes.Document
+import kotlin.time.Instant
 
 @Source
-abstract class Bakai : HttpSource() {
+abstract class Bakai : KeiSource() {
 
-    override val supportsLatest = true
-
-    override val client = network.client.newBuilder()
-        .addInterceptor(BakaiCloudflareInterceptor(headers["User-Agent"]))
-        .rateLimit(1) { it.host != "img.bakai.org" }
-        .build()
-
-    override fun headersBuilder() = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
-
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
-    }
+    override fun okhttp3.OkHttpClient.Builder.configureClient() = addInterceptor(BakaiCloudflareInterceptor())
 
     // ============================== Popular ===============================
 
-    override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val document = client.get(baseUrl).asJsoup()
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-
-        // Primary: carousel widget "mostViewedArticlesItem"
-        val items = document.select("li.mostViewedArticlesItem")
-        val mangas = items.mapNotNull { element ->
-            val a = element.selectFirst("h3.ipsTruncate a") ?: return@mapNotNull null
-            extractManga(a, element)
-        }.toMutableList()
-
-        // Fallback: find the "Mais Lidos" section and collect hentai links
-        if (mangas.isEmpty()) {
-            val allElements = document.allElements.toList()
-            var maisLidosEl: Element? = null
-            for (el in allElements) {
-                if (el.ownText().contains("Mais Lidos", ignoreCase = true)) {
-                    maisLidosEl = el
-                    break
-                }
-            }
-            if (maisLidosEl != null) {
-                // Walk up to 7 siblings looking for a block with hentai links
-                var candidate: Element? = maisLidosEl
-                var containerEl: Element? = null
-                var steps = 0
-                while (candidate != null && steps < 7) {
-                    if (candidate.select("a[href*=/hentai/]").size >= 2) {
-                        containerEl = candidate
-                        break
-                    }
-                    candidate = candidate.parent()
-                    steps++
-                }
-                val container = containerEl ?: maisLidosEl
-                mangas.addAll(extractMangasFromHentaiLinks(container))
+        val mangas = document.select("[data-blockid^=app_tools_taMostViewedRecords] [id$=_week_panel] li.ipsData__item").map { element ->
+            SManga.create().apply {
+                setUrlWithoutDomain(element.selectFirst("a.ipsLinkPanel")!!.attr("href"))
+                val img = element.selectFirst(".ipsData__image img")
+                title = img?.attr("alt").orEmpty()
+                thumbnail_url = img?.attr("abs:src")
             }
         }
 
@@ -85,221 +40,116 @@ abstract class Bakai : HttpSource() {
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = if (page == 1) "$baseUrl/home/" else "$baseUrl/home/page/$page/"
-        return GET(url, headers)
-    }
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url = if (page == 1) {
+            "$baseUrl/home/"
+        } else {
+            "$baseUrl/home/page/$page/"
+        }
+        val document = client.get(url).asJsoup()
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-
-        val items = document.select(
-            "section.ipsCmsEntries.ipsCmsEntries--image.ipsCmsEntries--3 > article.ipsCmsEntries__item",
-        )
-        val mangas = items.mapNotNull { element ->
-            val a = element.selectFirst("h2.ipsTitle a") ?: return@mapNotNull null
-            extractManga(a, element)?.apply {
-                title = a.text().trim().ifBlank { title }
+        val mangas = document.select("article.ipsCmsEntries__item").map { element ->
+            val a = element.selectFirst(".ipsCmsEntries__header h2 > a")!!
+            SManga.create().apply {
+                title = a.text()
+                setUrlWithoutDomain(a.attr("href"))
+                thumbnail_url = element.selectFirst(".ipsCmsEntries__thumb img")?.attr("abs:src")
             }
-        }.toMutableList()
+        }
 
-        val hasNextPage = document.selectFirst(
-            "li.ipsPagination_next:not(.ipsPagination_inactive) > a, a[rel=next]",
-        ) != null
-
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(mangas, document.hasNextPage())
     }
 
     // =============================== Search ===============================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/srch/".toHttpUrl().newBuilder()
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = "$baseUrl/search/".toHttpUrl().newBuilder()
             .addQueryParameter("q", query)
             .addQueryParameter("page", page.toString())
             .addQueryParameter("quick", "1")
+            .addQueryParameter("type", "cms_records1")
             .addQueryParameter("search_and_or", "and")
             .addQueryParameter("sortby", "relevancy")
             .build()
-        return GET(url, headers)
-    }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-
-        val mangas = document
-            .select("ol[data-role=resultsContents] > li.ipsStreamItem, .ipsStreamItem, article.ipsCmsEntries__item")
-            .filter {
-                it.selectFirst(
-                    "span.ipsStreamItem_contentType i.fa-file-text, " +
-                        "span.ipsStreamItem__contentType i.fa-file-text, " +
-                        "div.ipsCmsEntries__thumb, " +
-                        "header.ipsCmsEntries__header",
-                ) != null
-            }
-            .mapNotNull { element ->
-                val a = element.selectFirst(
-                    "h2.ipsStreamItem_title a, h2.ipsStreamItem__title a, h2.ipsTitle a, header a",
-                ) ?: return@mapNotNull null
-
-                val imgNode = element.selectFirst(
-                    "span.ipsThumb img, img.ipsStream_image, img.ipsStreamItem__image, div.ipsCmsEntries__thumb img",
-                )
-                val thumb = if (imgNode != null) {
-                    resolveImageUrl(imgNode)
-                } else {
-                    element.selectFirst("span.ipsThumb")?.attr("abs:data-background-src")
-                }
-
-                SManga.create().apply {
-                    title = a.text().trim()
-                    setUrlWithoutDomain(a.attr("href"))
-                    thumbnail_url = thumb
-                }
-            }
-
-        val hasNextPage = document.selectFirst(
-            "li.ipsPagination__next:not(.ipsPagination__inactive) > a, " +
-                "li.ipsPagination_next:not(.ipsPagination_inactive) > a",
-        ) != null
-
-        return MangasPage(mangas, hasNextPage)
-    }
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = client.newCall(searchMangaRequest(page, query, filters)).asObservable().map { response ->
+        val response = client.get(url, ensureSuccess = false)
         if (response.code == 429) {
             response.close()
             throw Exception("Wait 1 second before retrying or login to speed up")
         }
-        searchMangaParse(response)
+        val document = response.asJsoup()
+
+        // Only keep "Hentai" posts themselves (not reviews/comments/videos)
+        val mangas = document.select("li.ipsStreamItem:has(.ipsStreamItem__header[data-ips-hook=itemHeader])")
+            .filter { it.selectFirst(".ipsStreamItem__summary i.fa-file-text") != null }
+            .map { element ->
+                val a = element.selectFirst(".ipsStreamItem__title a")!!
+                SManga.create().apply {
+                    title = a.text()
+                    setUrlWithoutDomain(a.attr("href"))
+                    thumbnail_url = element.selectFirst(".ipsStreamItem__content-thumb img")?.attr("abs:src")
+                }
+            }
+
+        return MangasPage(mangas, document.hasNextPage())
     }
+
+    private fun Document.hasNextPage() = selectFirst("li.ipsPagination__next:not(.ipsPagination__inactive) > a") != null
 
     // =========================== Manga Details ============================
 
-    override fun mangaDetailsParse(response: Response): SManga {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val response = client.get(getMangaUrl(manga))
+        val finalUrl = response.request.url.toString()
         val document = response.asJsoup()
 
-        return SManga.create().apply {
-            title = document.selectFirst("h1.ipsType_pageTitle span.ipsContained")?.text() ?: ""
-            thumbnail_url = document.selectFirst("div.cCmsRecord_image img")?.attr("abs:src")
+        fun info(label: String) = document.select(".mangaInfoBox__row:has(.mangaInfoBox__label:contains($label)) .mangaInfoBox__value a")
+            .map { it.text() }
 
-            author = document.selectFirst("p:has(strong:contains(Artist:))")
-                ?.text()?.substringAfter("Artist:")?.trim()
+        val updatedManga = manga.apply {
+            title = document.selectFirst("h1")?.text() ?: title
+            thumbnail_url = document.selectFirst(".mangaInfoBox__cover img")?.attr("abs:src")
+            author = info("Artista").joinToString().ifEmpty { null }
+            genre = (info("Tipo") + info("Cor") + info("Parody") + document.select(".mangaGenres__item a").map { it.text() })
+                .distinct()
+                .joinToString()
+            description = document.selectFirst("article:not(.ipsEntry) div[data-role=commentContent]")?.text()?.takeIf { it != "-" }
 
-            val type = document.selectFirst("p:has(strong:contains(Type:))")
-                ?.text()?.substringAfter("Type:")?.trim()
-            val color = document.selectFirst("p:has(strong:contains(Color:))")
-                ?.text()?.substringAfter("Color:")?.trim()
-            val tagsStr = document.selectFirst("p:has(strong:contains(Tags:))")
-                ?.text()?.substringAfter("Tags:")?.trim()
-            val parody = document.selectFirst("p:has(strong:contains(Parody:))")
-                ?.text()?.substringAfter("Parody:")?.trim()
-
-            genre = listOfNotNull(type, color, parody, tagsStr)
-                .flatMap { it.split(",") }
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .joinToString(", ")
-
-            description = document.selectFirst("section.ipsType_richText")?.text()
-                ?.takeIf { it != "-" }
-
+            // Site behaves mainly as a gallery
             status = SManga.COMPLETED
             update_strategy = UpdateStrategy.ONLY_FETCH_ONCE
         }
-    }
 
-    // ============================== Chapters ==============================
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-
+        // Single post gallery structure
         val chapter = SChapter.create().apply {
-            name = document.selectFirst("h1.ipsType_pageTitle span.ipsContained")?.text() ?: "Chapter"
-            setUrlWithoutDomain(response.request.url.toString())
+            name = document.selectFirst("h1")?.text() ?: "Chapter"
+            setUrlWithoutDomain(finalUrl)
 
             val dateStr = document.selectFirst("time")?.attr("datetime")
-            if (!dateStr.isNullOrBlank()) {
-                try {
-                    date_upload = dateFormat.parse(dateStr)?.time ?: 0L
-                } catch (_: Exception) {}
+            if (dateStr != null) {
+                date_upload = Instant.tryParse(dateStr)
             }
         }
 
-        return listOf(chapter)
+        return SMangaUpdate(updatedManga, listOf(chapter))
     }
 
     // =============================== Pages ================================
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val seen = HashSet<String>()
-        val urls = mutableListOf<String>()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter)).asJsoup()
 
-        document.select(
-            "div.mangaReaderImages img, img.mangaReaderImage, " +
-                "div.ipsGrid.ipsGrid_collapsePhone img, div.ipsPhotoFrame img, " +
-                "section.ipsRichText img",
-        ).forEach { img ->
-            val url = resolveImageUrl(img)
-            if (url.isNotBlank() && seen.add(url)) {
-                urls.add(url)
-            }
-        }
-
-        return urls.mapIndexed { i, url -> Page(i, imageUrl = url) }
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    // ============================== Helpers ===============================
-
-    /** Mirrors the `a(Element)` helper in the reference APK. */
-    private fun resolveImageUrl(img: Element): String {
-        var url = img.attr("abs:data-src")
-        if (url.isEmpty()) url = img.attr("abs:data-lazy-src")
-        if (url.isEmpty()) url = img.attr("abs:data-cfsrc")
-        if (url.isEmpty()) {
-            val srcset = img.attr("abs:srcset").trim()
-            url = srcset.substringBefore(",").trim().substringBefore(" ")
-        }
-        if (url.isEmpty()) url = img.attr("abs:src")
-        return url
-    }
-
-    /** Mirrors the `c(Element, Element)` helper: extracts SManga from an anchor + container. */
-    private fun extractManga(anchor: Element, container: Element): SManga? {
-        val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
-
-        val img = anchor.selectFirst("img")
-            ?: anchor.parent()?.selectFirst("img")
-            ?: container.selectFirst("img")
-
-        val title = sequenceOf(
-            anchor.attr("title"),
-            anchor.attr("aria-label"),
-            anchor.selectFirst("[title]")?.attr("title"),
-            img?.attr("alt"),
-            anchor.text(),
-            container.selectFirst("h1, h2, h3, h4")?.text(),
-        ).filterNotNull().firstOrNull { it.isNotBlank() } ?: return null
-
-        val thumb = img?.let { resolveImageUrl(it) }?.takeIf { it.isNotBlank() } ?: return null
-
-        return SManga.create().apply {
-            this.title = title
-            setUrlWithoutDomain(href)
-            thumbnail_url = thumb
-        }
-    }
-
-    /** Mirrors the `b(Element)` helper: collects mangas from hentai links. */
-    private fun extractMangasFromHentaiLinks(container: Element): List<SManga> {
-        val seen = HashSet<String>()
-        return container.select("a[href*=/hentai/]").mapNotNull { a ->
-            val href = a.attr("href").substringBefore("#").substringBefore("?").trimEnd('/')
-            if (href.isBlank() || !seen.add(href)) return@mapNotNull null
-            val parent = a.parent()?.parent() ?: a.parent() ?: a
-            extractManga(a, parent)
+        // The reader image class has been renamed several times
+        // (mangaReaderImage -> mangaReaderImaage -> mangaReaderV2Image),
+        // so match the stable prefix instead of the exact class.
+        return document.select("img[class*=mangaReader]").mapIndexed { i, img ->
+            val url = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }
+            Page(i, imageUrl = url)
         }
     }
 }

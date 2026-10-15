@@ -2,180 +2,130 @@ package eu.kanade.tachiyomi.extension.pt.manhastro
 
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.firstInstance
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.tryParse
+import keiyoushi.utils.tryParseDateTime
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Response
 import okhttp3.brotli.BrotliInterceptor
-import uy.kohesive.injekt.api.get
-import java.text.SimpleDateFormat
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class Manhastro :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
     private val apiUrl = "https://api2.manhastro.net"
 
-    override val supportsLatest = true
-
     private val preferences by getPreferencesLazy()
 
-    override val client: OkHttpClient = network.client.newBuilder()
-        .connectTimeout(30.seconds)
-        .readTimeout(30.seconds)
-        .apply {
-            val index = networkInterceptors().indexOfFirst { it is BrotliInterceptor }
-            if (index >= 0) interceptors().add(networkInterceptors().removeAt(index))
-        }
-        .rateLimit(2)
-        .build()
-
-    // dataClient removed
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        connectTimeout(30.seconds)
+        readTimeout(30.seconds)
+        val index = networkInterceptors().indexOfFirst { it is BrotliInterceptor }
+        if (index >= 0) interceptors().add(networkInterceptors().removeAt(index))
+        rateLimit(2)
+    }
 
     // ============================== Popular ==============================
 
-    override fun popularMangaRequest(page: Int) = GET("$apiUrl/dados?sort=views&order=desc&limit=100&page=$page", headers)
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val result = client.get("$apiUrl/rank/diario")
+            .parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
-        val mangas = result.data.map { it.toSManga() }
-
-        val hasNextPage = result.data.size >= 20
-
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(result.data.map { it.toSManga() }, false)
     }
 
     // ============================== Latest ==============================
 
-    override fun latestUpdatesRequest(page: Int): okhttp3.Request = GET("$apiUrl/lancamentos?p=$page", headers)
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val result = client.get("$apiUrl/lancamentos")
+            .parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val result = response.parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
-
-        val mangas = result.data.map { it.toSManga() }
-
-        val hasNextPage = result.data.size >= 100
-
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(result.data.distinctBy { it.mangaId }.map { it.toSManga() }, false)
     }
 
     // ============================== Search ==============================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): okhttp3.Request {
-        val url = "$apiUrl/dados".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = "$apiUrl/dados".toHttpUrl().newBuilder().apply {
+            addQueryParameter("page", page.toString())
+            if (query.isNotBlank()) addQueryParameter("nome", query)
 
-        if (query.isNotBlank()) {
-            url.addQueryParameter("nome", query)
-        }
+            val sort = filters.firstInstance<SortFilter>()
+            addQueryParameter("sort", sort.selected)
+            addQueryParameter("order", sort.order)
 
-        var sortOption = "views"
-        var sortOrder = "desc"
+            filters.firstInstance<TypeFilter>().state.filter { it.state }.map { it.value }
+                .takeIf { it.isNotEmpty() }
+                ?.let { addQueryParameter("categoria", it.joinToString(",")) }
+            filters.firstInstance<GenreFilter>().state.filter { it.state }.map { it.value }
+                .takeIf { it.isNotEmpty() }
+                ?.let { addQueryParameter("genero", it.joinToString(",")) }
+        }.build()
 
-        filters.forEach { filter ->
-            when (filter) {
-                is SortFilter -> {
-                    when (filter.selected) {
-                        "popular" -> {
-                            sortOption = "views"
-                            sortOrder = "desc"
-                        }
-                        "recent" -> {
-                            sortOption = "ultimo_capitulo"
-                            sortOrder = "desc"
-                        }
-                        "alphabetical" -> {
-                            sortOption = "titulo"
-                            sortOrder = "asc"
-                        }
-                        "chapters" -> {
-                            sortOption = "capitulos"
-                            sortOrder = "desc"
-                        }
-                    }
-                }
-                is TypeFilter -> {
-                    val types = filter.state.filter { it.state }.map { it.value }
-                    if (types.isNotEmpty()) {
-                        url.addQueryParameter("categoria", types.joinToString(","))
-                    }
-                }
-                is GenreFilter -> {
-                    val genres = filter.state.filter { it.state }.map { it.value }
-                    if (genres.isNotEmpty()) {
-                        url.addQueryParameter("generos", genres.joinToString(","))
-                    }
-                }
-                else -> {}
-            }
-        }
-
-        url.addQueryParameter("sort", sortOption)
-        url.addQueryParameter("order", sortOrder)
-        url.addQueryParameter("limit", "100")
-
-        return GET(url.build(), headers)
+        val result = client.get(url).parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
+        return MangasPage(result.data.map { it.toSManga() }, result.meta?.hasMore ?: false)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
-        val mangas = result.data.map { it.toSManga() }
-
-        val meta = result.meta
-        val hasNextPage = meta?.hasMore ?: false
-
-        return MangasPage(mangas, hasNextPage)
-    }
-
-    private fun String.normalize(): String = java.text.Normalizer.normalize(this, java.text.Normalizer.Form.NFD)
-        .replace(Regex("[\\p{InCombiningDiacriticalMarks}]"), "")
-
-    override fun getFilterList() = getFilters()
+    override fun getFilterList(data: JsonElement?) = getFilters()
 
     // ============================== Details ==============================
 
-    override fun mangaDetailsRequest(manga: SManga): okhttp3.Request {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate = coroutineScope {
         val mangaId = manga.url.substringAfterLast("/")
-        return GET("$apiUrl/dados?manga_id=$mangaId", headers)
-    }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val result = response.parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
-        val mangaDto = result.data.firstOrNull() ?: throw Exception("Manga not found")
-        return mangaDto.toSManga()
+        val details = async {
+            if (fetchDetails) {
+                client.get("$apiUrl/dados?manga_id=$mangaId")
+                    .parseAs<ApiResponse<List<MangaDto>>>(transform = ::cleanJsonResponse)
+                    .data.firstOrNull()?.toSManga()
+                    ?: throw Exception("Manga not found")
+            } else {
+                manga
+            }
+        }
+        val chapterList = async {
+            if (fetchChapters) fetchChapterList(mangaId) else chapters
+        }
+
+        SMangaUpdate(details.await(), chapterList.await())
     }
 
     // ============================== Chapters ==============================
 
-    override fun chapterListRequest(manga: SManga): okhttp3.Request {
-        val mangaId = manga.url.substringAfterLast("/")
-        return GET("$apiUrl/dados/$mangaId", headers)
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val result = response.parseAs<ApiResponse<List<ChapterDto>>>(transform = ::cleanJsonResponse)
+    private suspend fun fetchChapterList(mangaId: String): List<SChapter> {
+        val result = client.get("$apiUrl/dados/$mangaId")
+            .parseAs<ApiResponse<List<ChapterDto>>>(transform = ::cleanJsonResponse)
 
         return result.data.map { chapter ->
             SChapter.create().apply {
                 url = "/capitulo/${chapter.capituloId}"
                 name = chapter.capituloNome
                 chapter_number = extractChapterNumber(chapter.capituloNome)
-                date_upload = DATE_FORMAT.tryParse(chapter.capituloData)
+                date_upload = DATE_FORMAT.tryParseDateTime(chapter.capituloData)
             }
         }.sortedByDescending { it.chapter_number }
     }
@@ -188,18 +138,15 @@ abstract class Manhastro :
 
     // ============================== Pages ==============================
 
-    override fun pageListRequest(chapter: SChapter) = GET("$apiUrl/paginas/${chapter.url.substringAfterLast("/")}", headers)
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val result = client.get("$apiUrl/paginas/${chapter.url.substringAfterLast("/")}")
+            .parseAs<PagesResponse>(transform = ::cleanJsonResponse)
+        val chapterData = result.data.chapter ?: return emptyList()
 
-    override fun pageListParse(response: Response): List<Page> {
-        val result = response.parseAs<PagesResponse>(transform = ::cleanJsonResponse)
-        val chapter = result.data.chapter ?: return emptyList()
-
-        return chapter.data.mapIndexed { i, filename ->
-            Page(i, imageUrl = "${chapter.baseUrl}/${chapter.hash}/$filename")
+        return chapterData.data.mapIndexed { i, filename ->
+            Page(i, imageUrl = "${chapterData.baseUrl}/${chapterData.hash}/$filename")
         }
     }
-
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
     // ============================== URLs ==============================
 
@@ -231,7 +178,11 @@ abstract class Manhastro :
         description = displayDescription
         genre = generos.joinToString()
         thumbnail_url = thumbnailUrl
-        status = SManga.UNKNOWN
+        status = when (this@toSManga.status) {
+            "on-going" -> SManga.ONGOING
+            "end" -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
     }
 
     private val useEnglishTitle: Boolean
@@ -248,8 +199,7 @@ abstract class Manhastro :
     }
 
     companion object {
-        private val DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT)
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-M-d H:mm:ss", Locale.ROOT)
         private const val ENGLISH_TITLE_PREF = "englishTitlePref"
-        private const val PER_PAGE = 30
     }
 }

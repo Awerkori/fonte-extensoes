@@ -1,10 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.kuromangas
 
-import android.util.Log
-import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -12,120 +9,90 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.network.rateLimit
-import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonRequestBody
-import kotlinx.serialization.json.JsonObject
-import okhttp3.Cookie
-import okhttp3.CookieJar
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
 
 @Source
 abstract class KuroMangas :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
-    override val supportsLatest = true
-
-    private val preferences by getPreferencesLazy()
-
-    private val apiUrl = "$baseUrl/api"
+    private val apiUrl get() = "$baseUrl/api"
 
     private val cdnUrl = "https://cdn.kuromangas.com"
 
-    private val authLock = Any()
-
-    @Volatile
-    private var authSession: AuthSession? = null
-
-    private val authClient by lazy {
-        network.client.newBuilder()
-            .cookieJar(CookieJar.NO_COOKIES)
-            .build()
-    }
-
-    private val decryptor by lazy {
-        KuroMangasDecryptor(baseUrl, authClient, ::authenticateRequest, ::relogin)
-    }
-
-    override val client: OkHttpClient by lazy {
-
-        authClient.newBuilder()
-            .apply {
-                addInterceptor { chain ->
-                    val session = getValidSession() ?: throw IOException(LOGIN_REQUIRED_MESSAGE)
-                    return@addInterceptor chain.proceed(chain.request().withAuth(session))
-                }
-
-                addInterceptor(decryptor.vSecureInterceptor())
-            }
-            .rateLimit(2)
-            .build()
-    }
-
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .add("Accept", "application/json, text/plain, */*")
-        .add("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
-        .add("Referer", "$baseUrl/catalogo")
-        .add("Sec-Fetch-Dest", "empty")
-        .add("Sec-Fetch-Mode", "cors")
-        .add("Sec-Fetch-Site", "same-origin")
-
-    private val dateFormat by lazy {
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor { chain ->
+            if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
+            return@addInterceptor chain.proceed(chain.request())
         }
+
+        addInterceptor(
+            KuroMangasDecryptor(
+                baseUrl,
+                network.client,
+                ::login,
+            ).vSecureInterceptor(),
+        )
+    }
+
+    override fun Headers.Builder.configureHeaders() = apply {
+        set("Accept", "application/json, text/plain, */*")
+        set("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
+        set("Referer", "$baseUrl/catalogo")
+        set("Sec-Fetch-Dest", "empty")
+        set("Sec-Fetch-Mode", "cors")
+        set("Sec-Fetch-Site", "same-origin")
     }
 
     // ============================= Popular ================================
 
-    override fun popularMangaRequest(page: Int): Request {
-        val url = "$apiUrl/mangas".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("limit", PAGE_LIMIT.toString())
-            .addQueryParameter("sort", "view_count")
-            .addQueryParameter("order", "DESC")
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<MangaListResponse>()
-        val mangas = result.data.map { it.toSManga(cdnUrl) }
-        return MangasPage(mangas, result.pagination.hasNextPage())
-    }
+    override suspend fun getPopularManga(page: Int) = getSearchMangaList(page, "", FilterList())
 
     // ============================= Latest =================================
 
-    override fun latestUpdatesRequest(page: Int): Request {
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = "$apiUrl/chapters/recent".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", PAGE_LIMIT.toString())
             .addQueryParameter("days", "30")
             .build()
-        return GET(url, headers)
-    }
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val result = response.parseAs<LatestResponse>()
+        val result = client.get(url).parseAs<LatestResponse>()
         val mangas = result.data.map { it.toSManga(cdnUrl) }
         return MangasPage(mangas, result.pagination.hasNextPage())
     }
 
     // ============================= Search =================================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        url.pathSegments.getOrNull(1)?.toIntOrNull() ?: return null
+        return fetchMangaUpdate(
+            SManga.create().apply { this.url = url.encodedPath },
+            emptyList(),
+            true,
+            false,
+        ).manga
+    }
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val url = "$apiUrl/mangas".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
             .addQueryParameter("limit", PAGE_LIMIT.toString())
@@ -138,89 +105,78 @@ abstract class KuroMangas :
             url.addQueryParameter("sort", filter.selectedSort)
             url.addQueryParameter("order", filter.selectedOrder)
         } ?: run {
-            url.addQueryParameter("sort", "created_at")
+            url.addQueryParameter("sort", "view_count")
             url.addQueryParameter("order", "DESC")
         }
 
-        return GET(url.build(), headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<MangaListResponse>()
+        val result = client.get(url.build()).parseAs<MangaListResponse>()
         val mangas = result.data.map { it.toSManga(cdnUrl) }
         return MangasPage(mangas, result.pagination.hasNextPage())
     }
 
-    // ============================= Details ================================
+    // =========================== MangaUpdate ==============================
 
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        val mangaId = manga.url.substringAfterLast("/")
-        return GET("$apiUrl/mangas/$mangaId", headers)
-    }
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ) = coroutineScope {
+        val mangaId = manga.url.substringAfterLast("/").toInt()
+        val mangaUrl = "$apiUrl/mangas/$mangaId"
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val result = response.parseAs<MangaDetailsResponse>()
-        return result.manga.toSManga(cdnUrl)
-    }
-
-    // ============================= Chapters ===============================
-
-    override fun chapterListRequest(manga: SManga): Request {
-        val mangaId = manga.url.substringAfterLast("/")
-        return chapterPageRequest(mangaId, 1)
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val mangaId = response.request.url.pathSegments
-            .windowed(size = 2)
-            .firstOrNull { it.first() == "mangas" }
-            ?.last()
-            ?.toIntOrNull()
-            ?: return emptyList()
-
-        val firstPage = response.parseAs<ChapterListResponse>()
-        val allChapters = collectChapterPages(firstPage) { page ->
-            client.newCall(chapterPageRequest(mangaId.toString(), page)).execute().use { nextResponse ->
-                nextResponse.parseAs<ChapterListResponse>()
+        val updatedManga = async {
+            if (fetchDetails) {
+                client.get(mangaUrl)
+                    .parseAs<MangaDetailsResponse>()
+                    .manga.toSManga(cdnUrl)
+            } else {
+                manga
             }
         }
 
-        return allChapters
-            .map { it.toSChapter(mangaId, dateFormat) }
+        val updatedChapters = async {
+            if (fetchChapters) {
+                val firstPage = fetchChapterPage(mangaUrl, 1)
+                val extra = (2..(firstPage.pagination.totalPages ?: 0)).map { page ->
+                    async { fetchChapterPage(mangaUrl, page).chapters }
+                }
+                (firstPage.chapters + extra.awaitAll().flatten())
+                    .map { it.toSChapter(mangaId) }
+                    .sortedByDescending { it.chapter_number }
+            } else {
+                chapters
+            }
+        }
+
+        SMangaUpdate(updatedManga.await(), updatedChapters.await())
     }
 
-    private fun chapterPageRequest(mangaId: String, page: Int): Request {
-        val url = "$apiUrl/mangas/$mangaId/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("limit", CHAPTER_PAGE_LIMIT.toString())
-            .addQueryParameter("order", "desc")
-            .build()
-        return GET(url, headers)
+    private suspend fun fetchChapterPage(mangaUrl: String, page: Int) = client.get(
+        "$mangaUrl/chapters?limit=$CHAPTERS_LIMIT&page=$page",
+    ).parseAs<ChaptersResponse>()
+
+    // ============================ Related =================================
+
+    override val supportsRelatedMangas = true
+
+    override suspend fun fetchRelatedMangaList(manga: SManga) = manga.url.substringAfterLast("/").let { mangaId ->
+        client.get("$apiUrl/mangas/$mangaId/similar")
+            .parseAs<SimilarResponse>().data.map { it.toSManga(cdnUrl) }
     }
 
     // ============================= Pages ==================================
 
-    override fun pageListRequest(chapter: SChapter): Request {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.url.substringAfterLast("/")
-        return GET("$apiUrl/chapters/$chapterId", headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val chapterResponse = response.parseAs<ChapterPagesResponse>()
+        val chapterResponse = client.get(
+            "$apiUrl/chapters/$chapterId",
+        ).parseAs<ChapterPagesResponse>()
         return chapterResponse.pages.mapIndexed { index, pageUrl ->
             val fixedUrl = pageUrl.replaceFirst("^/uploads/".toRegex(), "/")
             val imageUrl = if (fixedUrl.startsWith("http")) fixedUrl else "$cdnUrl$fixedUrl"
             Page(index, imageUrl = imageUrl)
         }
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    override fun imageRequest(page: Page): Request {
-        val newHeaders = headersBuilder()
-            .set("Referer", "$baseUrl/")
-            .build()
-        return GET(page.imageUrl!!, newHeaders)
     }
 
     // ============================= Utils ==================================
@@ -240,129 +196,36 @@ abstract class KuroMangas :
 
     // ============================= Auth ===================================
 
-    private fun getValidSession(): AuthSession? = synchronized(authLock) {
-        val webViewSession = getWebViewSession()
-        if (webViewSession != null) {
-            if (validateSession(webViewSession)) {
-                authSession = webViewSession
-                Log.d(LOG_TAG, "KURO_AUTH_SOURCE=webview")
-                return@synchronized webViewSession
-            }
-            removeWebViewSession()
-            authSession = null
-        }
-
-        loginWithPreferences()?.also {
-            authSession = it
-            Log.d(LOG_TAG, "KURO_AUTH_SOURCE=password")
-            return@synchronized it
-        }
-
-        Log.d(LOG_TAG, "KURO_AUTH_SOURCE=none")
-        null
+    private fun checkLogin(): Boolean {
+        if (hasSession()) return true
+        return login()
     }
 
-    private fun relogin(): Boolean = synchronized(authLock) {
-        authSession = null
-        getValidSession() != null
-    }
-
-    private fun validateSession(session: AuthSession): Boolean {
-        val request = GET("$apiUrl/users/me/profile", headers).withAuth(session)
-        return authClient.newCall(request).execute().use { response ->
-            Log.d(LOG_TAG, "KURO_AUTH_CHECK_STATUS=${response.code}")
-            when {
-                response.isSuccessful -> runCatching {
-                    val body = response.parseAs<JsonObject>()
-                    "_v_secure" in body || "profile" in body
-                }.getOrDefault(false)
-                response.code == 401 || response.code == 403 -> false
-                else -> throw IOException("Falha ao validar a sessão da KuroMangas (${response.code}).")
-            }
-        }
-    }
-
-    private fun getWebViewSession(): AuthSession? {
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.flush()
-
-        val cookieHeaders = listOf("https://kuromangas.com", baseUrl)
-            .distinct()
-            .asSequence()
-            .mapNotNull(cookieManager::getCookie)
-        val sessionCookie = cookieHeaders.mapNotNull { extractCookie(it, SESSION_COOKIE) }.firstOrNull()
-        val clientToken = cookieHeaders.mapNotNull { extractCookie(it, CLIENT_TOKEN_COOKIE) }.firstOrNull()
-        val session = if (sessionCookie != null && clientToken != null) {
-            AuthSession(sessionCookie, clientToken)
-        } else {
-            null
-        }
-        Log.d(LOG_TAG, "KURO_WEBVIEW_COOKIE_FOUND=${session != null}")
-        return session
-    }
-
-    private fun extractCookie(cookieHeader: String, name: String): String? = cookieHeader
-        .split(';')
-        .asSequence()
-        .map(String::trim)
-        .firstOrNull { it.substringBefore('=') == name }
-        ?.substringAfter('=', "")
-        ?.takeIf(String::isNotEmpty)
+    // The site rejects requests carrying a session without its matching token.
+    private fun hasSession(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null && client.getCookie(baseUrl, TOKEN_COOKIE) != null
 
     // Implicit set-cookie: kuro_session + _kn
-    private fun loginWithPreferences(): AuthSession? {
+    private fun login(): Boolean {
         val email = preferences.getString(PREF_EMAIL, "") ?: ""
         val password = preferences.getString(PREF_PASSWORD, "") ?: ""
-        if (email.isEmpty() || password.isEmpty()) return null
+        if (email.isEmpty() || password.isEmpty()) {
+            return false
+        }
 
-        val requestBody = LoginRequestDto(email, password, rememberMe = true).toJsonRequestBody()
+        val payload = buildJsonObject {
+            put("email", email)
+            put("password", password)
+        }.toString()
+        val requestBody = payload.toRequestBody(JSON_MEDIA_TYPE)
         val request = POST("$apiUrl/auth/login", headers, requestBody)
-        val newSession = runCatching {
-            authClient.newCall(request).execute().use { response ->
-                val responseCookies = response.headers("Set-Cookie")
-                    .mapNotNull { Cookie.parse(response.request.url, it) }
-                val sessionCookie = responseCookies.firstOrNull { it.name == SESSION_COOKIE && it.value.isNotEmpty() }?.value
-                val clientToken = responseCookies.firstOrNull { it.name == CLIENT_TOKEN_COOKIE && it.value.isNotEmpty() }?.value
-                val hasJsonBody = runCatching {
-                    response.parseAs<JsonObject>()
-                    true
-                }.getOrDefault(false)
-                if (
-                    response.isSuccessful &&
-                    hasJsonBody &&
-                    sessionCookie != null &&
-                    clientToken != null
-                ) {
-                    AuthSession(sessionCookie, clientToken)
-                } else {
-                    null
-                }
-            }
-        }.getOrNull() ?: return null
+        network.client.newCall(request).execute().close()
 
-        if (!validateSession(newSession)) return null
-
-        CookieManager.getInstance().apply {
-            setCookie(baseUrl, "$SESSION_COOKIE=${newSession.sessionCookie}; Path=/; Secure; HttpOnly")
-            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=${newSession.clientToken}; Path=/; Secure")
-            flush()
-        }
-        return newSession
+        return hasSession()
     }
-
-    private fun removeWebViewSession() {
-        CookieManager.getInstance().apply {
-            setCookie(baseUrl, "$SESSION_COOKIE=; Max-Age=0; Path=/; Secure")
-            setCookie(baseUrl, "$SESSION_COOKIE=; Max-Age=0; Domain=${baseUrl.toHttpUrl().host}; Path=/; Secure")
-            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=; Max-Age=0; Path=/; Secure")
-            setCookie(baseUrl, "$CLIENT_TOKEN_COOKIE=; Max-Age=0; Domain=${baseUrl.toHttpUrl().host}; Path=/; Secure")
-            flush()
-        }
-    }
-
-    private fun authenticateRequest(request: Request): Request = authSession?.let(request::withAuth) ?: request
 
     // ============================= Preferences ============================
+
+    private val preferences = getPreferences()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val warning = "⚠️ Os dados inseridos nesta seção serão usados somente para realizar o login na fonte"
@@ -391,38 +254,19 @@ abstract class KuroMangas :
         }.let(screen::addPreference)
     }
 
-    override fun getFilterList() = getFilters()
+    override fun getFilterList(data: JsonElement?) = getFilters()
 
-    companion object {
-        private const val PAGE_LIMIT = 24
-        private const val CHAPTER_PAGE_LIMIT = 60
-        private const val API_HOST = "beta.kuromangas.com"
-        private const val PREF_EMAIL = "kuromangas_email"
-        private const val PREF_PASSWORD = "kuromangas_password"
-        private const val SESSION_COOKIE = "kuro_session"
-        private const val CLIENT_TOKEN_COOKIE = "_kn"
-        private const val LOG_TAG = "KuroMangas"
-        private const val LOGIN_REQUIRED_MESSAGE = "Faça login no WebView ou insira email e senha nas configurações e tente novamente."
+    private companion object {
+        const val PAGE_LIMIT = 24
+        const val CHAPTERS_LIMIT = 60
+        const val PREF_EMAIL = "kuromangas_email"
+        const val PREF_PASSWORD = "kuromangas_password"
+        const val SESSION_COOKIE = "kuro_session"
+        const val LOGIN_REQUIRED_MESSAGE = "Faça login no WebView ou insira email e senha nas configurações e tente novamente."
+        val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }
 }
 
-private class AuthSession(
-    val sessionCookie: String,
-    val clientToken: String,
-)
+fun OkHttpClient.getCookies(baseUrl: String) = cookieJar.loadForRequest(baseUrl.toHttpUrl())
 
-private fun Request.withAuth(session: AuthSession): Request {
-    val cookies = header("Cookie").orEmpty()
-        .split(';')
-        .map(String::trim)
-        .filter {
-            it.isNotEmpty() && it.substringBefore('=') !in setOf("kuro_session", "_kn")
-        }
-        .plus("kuro_session=${session.sessionCookie}")
-        .plus("_kn=${session.clientToken}")
-        .joinToString("; ")
-    return newBuilder()
-        .header("Cookie", cookies)
-        .header("X-Client-Token", session.clientToken)
-        .build()
-}
+fun OkHttpClient.getCookie(baseUrl: String, cookie: String): String? = getCookies(baseUrl).firstOrNull { it.name == cookie }?.value?.takeUnless { it.isEmpty() }

@@ -1,154 +1,96 @@
 package eu.kanade.tachiyomi.extension.pt.argosscan
 
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import java.text.SimpleDateFormat
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.time.Duration
-import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
+import kotlin.time.Instant
+import java.time.Instant as JInstant
 
 @Serializable
-class ProjectResponseDto(
-    private val items: List<ProjectDto> = emptyList(),
+class Projects(
+    val items: List<Project> = emptyList(),
 ) {
-    fun allItems(): List<ProjectDto> = items
-
-    fun toSMangaList(query: String = "", ids: Set<String> = emptySet()): List<SManga> = items.filter { ids.isEmpty() || it.id in ids }
-        .filter { it.type?.equals("Novel", ignoreCase = true) != true }
-        .filter { query.isBlank() || it.title.contains(query, ignoreCase = true) }
-        .map { it.toSManga() }
-
-    fun toSMangaById(ids: Set<String>, includeNovels: Boolean = true): Map<String, SManga> = items
-        .filter { it.id in ids && (includeNovels || !it.type.equals("Novel", ignoreCase = true)) }
-        .associate { it.id to it.toSManga() }
+    fun toMangasPage(query: String = ""): MangasPage {
+        val mangas = items.filter { it.title.contains(query, ignoreCase = true) }
+            .map { it.toSManga() }
+        return MangasPage(mangas, false)
+    }
 }
 
 @Serializable
-class ProjectDto(
+class Project(
     val id: String,
     val title: String,
     val slug: String,
     val type: String? = null,
     private val description: String? = null,
-    val status: String? = null,
+    private val status: String? = null,
     @SerialName("cover_latest_url") private val coverLatestUrl: String? = null,
     @SerialName("updated_at") private val updatedAt: String? = null,
     @SerialName("created_at") private val createdAt: String? = null,
-    private val authors: List<AuthorDto> = emptyList(),
-    private val tags: List<TagDto> = emptyList(),
+    private val authors: List<Author> = emptyList(),
+    private val tags: List<Tag> = emptyList(),
 ) {
-    fun latestUpdateInstant(): Instant? = updatedAt.parseInstant() ?: createdAt.parseInstant()
+    fun latestUpdateInstant(): JInstant? = updatedAt.parseInstant() ?: createdAt.parseInstant()
 
     fun toSManga() = SManga.create().apply {
         url = "/manga/$slug"
-        title = this@ProjectDto.title
+        title = this@Project.title
         thumbnail_url = coverLatestUrl
-        description = this@ProjectDto.description
-        status = when (this@ProjectDto.status?.lowercase()) {
+        description = this@Project.description
+        status = when (this@Project.status?.lowercase()) {
             "completo" -> SManga.COMPLETED
             "em lançamento" -> SManga.ONGOING
             "em pausa" -> SManga.ON_HIATUS
+            "cancelado" -> SManga.CANCELLED
             else -> SManga.UNKNOWN
         }
-        // Fixed: The API returns the roles in English ("Author", "Artist"), not just Portuguese
-        author = authors.filter { it.role.equals("Author", true) || it.role.equals("autor", true) }
+        author = authors.filter { it.role == null || it.role == "author" }
             .joinToString { it.name }
             .takeIf { it.isNotBlank() }
-        artist = authors.filter { it.role.equals("Artist", true) || it.role.equals("artista", true) }
+        artist = authors.filter { it.role == "artist" }
             .joinToString { it.name }
             .takeIf { it.isNotBlank() }
         genre = tags.joinToString { it.name }.takeIf { it.isNotBlank() }
+        memo = buildJsonObject { put("projectId", id) }
     }
 }
 
-private fun String?.parseInstant(): Instant? = runCatching {
+private fun String?.parseInstant(): JInstant? = runCatching {
     this?.let { OffsetDateTime.parse(it, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant() }
 }.getOrNull()
 
 @Serializable
-class AuthorDto(
+class Author(
     val name: String,
     val role: String? = null,
 )
 
 @Serializable
-class TagDto(
+class Tag(
     val name: String,
 )
 
 @Serializable
-class ChapterResponseDto(
-    private val items: List<ChapterDto> = emptyList(),
+class Chapters(
+    private val items: List<Chapter> = emptyList(),
 ) {
-    fun itemCount(): Int = items.size
-
-    fun sortedForLatest(): List<ChapterDto> = items.sortedByDescending { it.publishedInstant() }
-
-    fun dedupedProjectIds(): List<String> = items.asSequence()
-        .filter { it.status?.equals("published", ignoreCase = true) != false }
-        .sortedByDescending { it.publishedInstant() }
-        .mapNotNull { it.projectId }
-        .distinct()
-        .toList()
-
-    fun projectIdsPage(page: Int, pageSize: Int): List<String> = items.asSequence()
-        .filter { it.status?.equals("published", ignoreCase = true) != false }
-        .sortedByDescending { it.publishedInstant() }
-        .mapNotNull { it.projectId }
-        .distinct()
-        .drop((page - 1) * pageSize)
-        .take(pageSize)
-        .toList()
-
-    fun hasNextPage(page: Int, pageSize: Int): Boolean = items.asSequence()
-        .filter { it.status?.equals("published", ignoreCase = true) != false }
-        .sortedByDescending { it.publishedInstant() }
-        .mapNotNull { it.projectId }
-        .distinct()
-        .drop(page * pageSize)
-        .iterator()
-        .hasNext()
-
-    fun toSChapterList(projectId: String, dateFormat: SimpleDateFormat): List<SChapter> = items.sortedWith(compareByDescending<ChapterDto> { it.volumeNumber }.thenByDescending { it.chapterNumber })
-        .map { it.toSChapter(projectId, dateFormat) }
-
-    fun getImagesForChapter(chapterId: String): List<Page> {
-        val chapter = items.find { it.id == chapterId }
-            ?: throw Exception("Capítulo não encontrado.")
-        return chapter.images?.mapIndexed { i, img ->
-            Page(i, imageUrl = img.fileUrl)
-        } ?: emptyList()
-    }
-}
-
-private fun ChapterDto.publishedInstant(): Instant = sequenceOf(publishedAt, createdAt)
-    .filterNotNull()
-    .mapNotNull { value ->
-        runCatching {
-            OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant()
-        }.getOrNull()
-    }
-    .firstOrNull() ?: Instant.MIN
-
-private class ChapterDateInfo(val kind: String)
-
-private fun ChapterDto.dateInfo(): ChapterDateInfo {
-    if (publishedAt != null && runCatching { OffsetDateTime.parse(publishedAt, DateTimeFormatter.ISO_OFFSET_DATE_TIME) }.isSuccess) {
-        return ChapterDateInfo("published")
-    }
-    if (createdAt != null && runCatching { OffsetDateTime.parse(createdAt, DateTimeFormatter.ISO_OFFSET_DATE_TIME) }.isSuccess) {
-        return ChapterDateInfo("created")
-    }
-    return ChapterDateInfo("invalid")
+    fun toSChapterList(projectId: String): List<SChapter> = items
+        .sortedWith(compareByDescending<Chapter> { it.volumeNumber }.thenByDescending { it.chapterNumber })
+        .map { it.toSChapter(projectId) }
 }
 
 @Serializable
-class ChapterDto(
+class Chapter(
     val id: String = "",
     @SerialName("project_id") val projectId: String? = null,
     private val title: String? = null,
@@ -156,20 +98,19 @@ class ChapterDto(
     private val path: String? = null,
     private val content: String? = null,
     val status: String? = null,
-    @SerialName("published_revision_id") private val publishedRevisionId: String? = null,
     @SerialName("chapter_number") val chapterNumber: Float? = null,
     @SerialName("volume_number") val volumeNumber: Int? = null,
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("scheduled_at") val scheduledAt: String? = null,
     @SerialName("published_at") val publishedAt: String? = null,
-    val images: List<ImageDto>? = null,
+    val images: List<Image>? = null,
 ) {
     fun isNovelText(): Boolean = type?.let { value ->
         value.contains("novel", ignoreCase = true) || value.contains("text", ignoreCase = true)
     } == true
 
-    fun vipMessage(now: Instant = Instant.now()): String {
-        val release = scheduledAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+    fun vipMessage(now: JInstant = JInstant.now()): String {
+        val release = scheduledAt?.let { runCatching { JInstant.parse(it) }.getOrNull() }
         val remaining = release?.let { Duration.between(now, it) }?.takeIf { !it.isNegative && !it.isZero }
         return if (remaining == null) {
             "🔒 Capítulo temporariamente exclusivo para VIP."
@@ -180,18 +121,17 @@ class ChapterDto(
 
     fun toPages(): List<Page> = images?.takeIf { it.isNotEmpty() }?.mapIndexed { index, image ->
         Page(index, imageUrl = image.fileUrl)
-    } ?: throw IllegalStateException("Capítulo não possui páginas disponíveis no endpoint individual.")
-    fun toSChapter(projectId: String, dateFormat: SimpleDateFormat) = SChapter.create().apply {
+    } ?: throw IllegalStateException("Capítulo não possui páginas disponíveis.")
+
+    fun toSChapter(projectId: String) = SChapter.create().apply {
         url = "$id|$projectId"
         name = buildString {
             if (volumeNumber != null) append("Vol. $volumeNumber ")
             append("Cap. ")
             append(chapterNumber?.toString()?.removeSuffix(".0") ?: "0")
-            if (!this@ChapterDto.title.isNullOrBlank()) append(" - ${this@ChapterDto.title}")
+            if (!this@Chapter.title.isNullOrBlank()) append(" - ${this@Chapter.title}")
         }.trim()
-        date_upload = createdAt?.substringBefore(".")?.let {
-            dateFormat.tryParse(it)
-        } ?: 0L
+        date_upload = (publishedAt ?: createdAt)?.let { Instant.tryParse(it) } ?: 0L
     }
 }
 
@@ -208,6 +148,6 @@ private fun Duration.toCountdown(): String {
 }
 
 @Serializable
-class ImageDto(
+class Image(
     @SerialName("file_url") val fileUrl: String,
 )

@@ -253,7 +253,8 @@ def merge_in_progress() -> bool:
 
 
 def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int, int, int, int, int, int] | None:
-    """If upstream publication version >= local publication version, bump local raw versionCode.
+    """If upstream publication version >= local publication version or upstream libVersion is newer,
+    bump local raw versionCode and upgrade libVersion if needed.
 
     Returns (loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw) if bumped, None otherwise.
     Only rewrites the file on disk; caller must `git add` it.
@@ -272,23 +273,97 @@ def bump_version_code_if_needed(unit: str, upstream_ref: str) -> tuple[int, int,
     loc_raw, loc_base, loc_eff, _ = local_info
     up_raw, up_base, up_eff, _ = upstream_info
 
-    if upstream_info.android_code < local_info.android_code:
-        return None
-    if local_info.lib != upstream_info.lib:
-        print(f"Version guard: deferred {unit}; libVersion migration required "
-              f"({local_info.name} -> {upstream_info.name}), preserving Nox code and version")
+    is_lib_upgrade = lib_version_key(upstream_info.lib) > lib_version_key(local_info.lib)
+
+    if not is_lib_upgrade and upstream_info.android_code < local_info.android_code:
         return None
 
-    desired_effective = up_eff + 1
+    desired_effective = max(up_eff + 1, loc_eff + 1)
     new_raw = desired_effective - loc_base
 
     gradle_path = f"{unit}/build.gradle.kts"
     local_file = Path(gradle_path)
     local_text = local_file.read_text()
-    new_text = _VERSION_CODE_RE.sub(lambda m: f"{m.group(1)}{new_raw}", local_text)
+    if is_lib_upgrade:
+        if _LIB_VERSION_RE.search(local_text):
+            local_text = _LIB_VERSION_RE.sub(f'libVersion = "{upstream_info.lib}"', local_text, count=1)
+        else:
+            marker = re.search(r"(?m)^(\s*)source\s*\{", local_text)
+            if marker:
+                indent = marker.group(1)
+                local_text = local_text[:marker.start()] + f'{indent}libVersion = "{upstream_info.lib}"\n' + local_text[marker.start():]
+        print(f"Version guard: upgraded {unit} libVersion {local_info.lib} -> {upstream_info.lib}")
+
+    new_text = _VERSION_CODE_RE.sub(lambda m: f"{m.group(1)}{new_raw}", local_text, count=1)
     local_file.write_text(new_text)
 
     return loc_raw, loc_base, loc_eff, up_raw, up_base, up_eff, new_raw
+
+
+def validate_no_lib_lag(upstream_ref: str, ignored_units: set[str] | None = None) -> list[str]:
+    """Ensure no local extension is lagging behind upstream's libVersion.
+
+    If upstream is on a newer libVersion (e.g. 1.6 vs 1.4), Nox must not stay on the older libVersion.
+    Returns a list of error strings for any lagging units.
+    """
+    ignored = ignored_units or set()
+    errors = []
+    for gradle_path in sorted(Path("src").glob("*/*/build.gradle.kts")):
+        unit = "/".join(gradle_path.parts[:3])
+        if unit in ignored:
+            continue
+        if not path_exists(upstream_ref, f"{unit}/build.gradle.kts"):
+            continue
+        local_info = effective_version_code(None, unit)
+        upstream_info = effective_version_code(upstream_ref, unit)
+        if local_info is None or upstream_info is None:
+            continue
+        if lib_version_key(local_info.lib) < lib_version_key(upstream_info.lib):
+            errors.append(
+                f"P0_LIB_MIGRATION_PENDING: {unit} (local {local_info.lib} < upstream {upstream_info.lib})"
+            )
+    return errors
+
+
+def classify_extension_sync_state(
+    unit: str,
+    upstream_ref: str,
+    base: str | None = None,
+    protected: list[str] | None = None,
+) -> str:
+    """Classify the sync status of an extension according to Project Nox rules."""
+    if protected is None:
+        protected = get_protected_nox_units(base or "HEAD", upstream_ref)
+    is_protected = unit in set(protected)
+
+    if not path_exists(upstream_ref, f"{unit}/build.gradle.kts"):
+        return "NOX_EXCLUSIVE" if is_protected else "UPSTREAM_REMOVED"
+
+    local_info = effective_version_code(None, unit)
+    upstream_info = effective_version_code(upstream_ref, unit)
+    if local_info is None or upstream_info is None:
+        return "UNKNOWN"
+
+    if lib_version_key(local_info.lib) < lib_version_key(upstream_info.lib):
+        return "P0_LIB_MIGRATION_PENDING"
+
+    base_ref = base or git("merge-base", "HEAD", upstream_ref).strip()
+    upstream_has_changes = subprocess.run(
+        ["git", "diff", "--quiet", base_ref, upstream_ref, "--", unit],
+    ).returncode != 0
+
+    if is_protected:
+        if upstream_has_changes and upstream_info.android_code >= local_info.android_code:
+            return "PROTECTED_UPDATE_PENDING"
+        if local_info.android_code > upstream_info.android_code:
+            return "NOX_AHEAD"
+        return "SYNCED"
+
+    if upstream_info.android_code > local_info.android_code or upstream_has_changes:
+        return "UPSTREAM_AHEAD"
+    if local_info.android_code > upstream_info.android_code:
+        return "NOX_AHEAD"
+    return "SYNCED"
 
 
 def structural_metadata(ref: str | None, unit: str) -> tuple[str | None, str | None] | None:
@@ -1349,6 +1424,8 @@ def _apply_units(
             print(f"Version guard: bumped {unit} (versionCode {loc_raw} -> {new_raw})")
         else:
             print(f"Version guard: {unit} unchanged")
+        if merge_structural_metadata(unit, upstream_ref):
+            git("add", "--", f"{unit}/build.gradle.kts")
 
     if write_deferred_migrations(deferred):
         git("add", "--", str(DEFERRED_MIGRATIONS_FILE))
@@ -1367,6 +1444,14 @@ def _apply_units(
     if errors:
         print("Structural compatibility validation failed:")
         for error in errors:
+            print(f"  - {error}")
+        git("merge", "--abort", check=False)
+        sys.exit(1)
+
+    lib_lag_errors = validate_no_lib_lag(upstream_ref, ignored_units=blocked_theme_extensions | deferred_units)
+    if lib_lag_errors:
+        print("P0 libVersion validation failed (Nox lagging behind upstream):")
+        for error in lib_lag_errors:
             print(f"  - {error}")
         git("merge", "--abort", check=False)
         sys.exit(1)

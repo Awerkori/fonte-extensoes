@@ -817,12 +817,13 @@ class PublicationVersionTest(unittest.TestCase):
         upstream = self.version("1.4", 99)
         self.assertEqual(self.compare(local, upstream), (local, upstream))
 
-    def test_protected_old_library_does_not_encode_migration_in_raw_version(self):
+    def test_protected_old_library_upgrades_lib_and_bumps_monotonically(self):
         with patch.object(sync_upstream, "effective_version_code", side_effect=[
             self.version("1.4", 2), self.version("1.6", 1),
-        ]), patch.object(Path, "write_text") as write:
-            self.assertIsNone(sync_upstream.bump_version_code_if_needed(self.unit, "upstream"))
-            write.assert_not_called()
+        ]), patch.object(Path, "read_text", return_value='libVersion = "1.4"\nversionCode = 2\n'), patch.object(Path, "write_text") as write:
+            res = sync_upstream.bump_version_code_if_needed(self.unit, "upstream")
+            self.assertEqual(res, (2, 0, 2, 1, 0, 1, 3))
+            write.assert_called_once_with('libVersion = "1.6"\nversionCode = 3\n')
 
     def test_validation_compiles_kotlin_not_just_metadata(self):
         with patch.object(Path, "exists", return_value=True), patch.object(
@@ -998,7 +999,8 @@ class StandaloneMigrationTest(GitFixture):
 
         self.assertEqual(Path(f"{unit}/assets/config.json").read_text(), "Nox customization\n")
         self.assertEqual(Path(f"{unit}/src/Source.kt").read_text(), "shared old source\n")
-        self.assertIn('libVersion = "1.4"', Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertIn('libVersion = "1.6"', Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertIn("versionCode = 2", Path(f"{unit}/build.gradle.kts").read_text())
 
     def test_nonprotected_outside_source_customization_is_preserved_on_reconciliation(self):
         unit = "src/ja/cycomi"
@@ -1085,12 +1087,12 @@ class StandaloneMigrationTest(GitFixture):
         unit = self.migration_history(protected=True)
         self.assertFalse(sync_upstream.unit_matches_upstream_history(unit, "upstream"))
         self.assertEqual(sync_upstream.unprotected_structural_migrations([unit], [unit], "upstream"), set())
-        before = Path(f"{unit}/build.gradle.kts").read_text()
         with patch.object(sync_upstream, "validate_affected_builds"), patch.object(
             sync_upstream, "has_staged_changes", return_value=False,
         ), patch.object(sync_upstream, "merge_in_progress", return_value=False):
             sync_upstream.apply_units("upstream", [unit], {unit}, [unit], [], set(), {})
-        self.assertEqual(Path(f"{unit}/build.gradle.kts").read_text(), before)
+        self.assertIn('libVersion = "1.6"', Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertIn("versionCode = 3", Path(f"{unit}/build.gradle.kts").read_text())
         self.assertEqual(Path(f"{unit}/src/Source.kt").read_text(), "custom Nox implementation\n")
 
     def test_api_compile_failure_aborts_before_commit(self):
@@ -1573,6 +1575,175 @@ class BladeToonsRegressionTest(GitFixture):
 
         # 6. Tree is clean and committed
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+class SyncScenariosTest(GitFixture):
+    def test_scenario_a_nox_1_4_upstream_1_6_migrates(self):
+        unit = "src/pt/normal"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "old 1.4\n")
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "new 1.6\n")
+        self.commit("upstream 1.6")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "new 1.6\n")
+        self.assertIn('libVersion = "1.6"', Path(f"{unit}/build.gradle.kts").read_text())
+
+    def test_scenario_b_nox_protected_1_4_upstream_1_6_preserves_patch(self):
+        unit = "src/pt/protectedsrc"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 10\n')
+        self.write(f"{unit}/Source.kt", "custom Nox patch\n")
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 5\n')
+        self.write(f"{unit}/Source.kt", "upstream 1.6 source\n")
+        self.commit("upstream 1.6")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], {unit}, [unit], [], set(), {})
+
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "custom Nox patch\n")
+        gradle_content = Path(f"{unit}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.6"', gradle_content)
+        # Monotonic: max(up_eff + 1, loc_eff + 1) = max(5+1, 10+1) = 11
+        self.assertIn("versionCode = 11", gradle_content)
+
+    def test_scenario_c_monotonic_version_bump_equal_code(self):
+        unit = "src/pt/monotests"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 50\n')
+        base = self.commit("base at 50")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 51\n')
+        self.commit("upstream at 51")
+        self.git("checkout", "-q", "-B", "nox", base)
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 51\n')
+        self.commit("nox at 51")
+
+        res = sync_upstream.bump_version_code_if_needed(unit, "upstream")
+        self.assertIsNotNone(res)
+        # raw becomes at least 52
+        _, _, _, _, _, _, new_raw = res
+        self.assertEqual(new_raw, 52)
+        self.assertIn("versionCode = 52", Path(f"{unit}/build.gradle.kts").read_text())
+
+    def test_scenario_d_p0_lib_migration_pending_flagged_by_guard(self):
+        unit = "src/pt/lagging"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 1\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.commit("upstream 1.6")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        errors = sync_upstream.validate_no_lib_lag("upstream")
+        self.assertTrue(any("P0_LIB_MIGRATION_PENDING" in e and unit in e for e in errors))
+
+    def test_scenario_e_upstream_removed_not_treated_as_1_6_migration(self):
+        unit = "src/pt/deleted"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 1\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.git("rm", "-r", unit)
+        self.commit("upstream without deleted unit")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "UPSTREAM_REMOVED")
+
+    def test_scenario_f_no_upstream_changes_no_bump(self):
+        unit = "src/pt/unchanged"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 10\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        pending = sync_upstream.pending_sync_units([unit], [unit], "upstream")
+        self.assertEqual(pending, [])
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "SYNCED")
+
+    def test_scenario_g_upstream_advances_lib_only_detected_even_if_upstream_vc_lower(self):
+        unit = "src/pt/libupgrade"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 10\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.commit("upstream 1.6 raw 1")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        res = sync_upstream.bump_version_code_if_needed(unit, "upstream")
+        self.assertIsNotNone(res)
+        # raw becomes max(1+1, 10+1) = 11
+        _, _, _, _, _, _, new_raw = res
+        self.assertEqual(new_raw, 11)
+        content = Path(f"{unit}/build.gradle.kts").read_text()
+        self.assertIn('libVersion = "1.6"', content)
+        self.assertIn("versionCode = 11", content)
+
+    def test_scenario_h_nox_ahead_monotonic_bump_on_upstream_catchup(self):
+        unit = "src/pt/ahead"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 30\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 20\n')
+        self.commit("upstream 20")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        # When upstream is behind, no bump
+        self.assertIsNone(sync_upstream.bump_version_code_if_needed(unit, "upstream"))
+
+        # When upstream advances to 30 (matches Nox)
+        self.git("checkout", "-q", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 30\n')
+        self.commit("upstream catch up to 30")
+        self.git("checkout", "-q", "nox")
+
+        res = sync_upstream.bump_version_code_if_needed(unit, "upstream")
+        self.assertIsNotNone(res)
+        self.assertEqual(res[6], 31)
+
+    def test_scenario_i_classify_sync_state_guard_states(self):
+        unit = "src/pt/statecheck"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.4"\nversionCode = 1\n')
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.commit("upstream 1.6")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "P0_LIB_MIGRATION_PENDING")
+
+    def test_scenario_j_protected_receives_structural_metadata_update(self):
+        unit = "src/pt/themetest"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write("lib-multisrc/oldtheme/build.gradle.kts", 'libVersion = "1.4"\n')
+        self.write("lib-multisrc/newtheme/build.gradle.kts", 'libVersion = "1.6"\n')
+        self.write(f"{unit}/build.gradle.kts", 'theme = "oldtheme"\nlibVersion = "1.4"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "custom patch\n")
+        base = self.commit("base")
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'theme = "newtheme"\nlibVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "upstream new\n")
+        self.commit("upstream new theme")
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], {unit}, [unit], [], set(), {})
+
+        content = Path(f"{unit}/build.gradle.kts").read_text()
+        self.assertIn('theme = "newtheme"', content)
+        self.assertIn('libVersion = "1.6"', content)
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "custom patch\n")
 
 
 class BuildMatrixTest(unittest.TestCase):

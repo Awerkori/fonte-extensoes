@@ -13,33 +13,31 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.string
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.Cookie
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import rx.Observable
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.Executors
 
 @Source
 abstract class ArgosScan :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
     private val apiUrl = "https://api.argoscomics.online"
@@ -50,18 +48,12 @@ abstract class ArgosScan :
 
     override val supportsLatest = true
 
-    private val dateFormat by lazy {
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }
-    }
-
-    private val authInterceptor = Interceptor { chain ->
+    override fun OkHttpClient.Builder.configureClient() = addInterceptor { chain ->
         val request = chain.request()
 
         if (request.url.host.startsWith("api.")) {
             syncSession()
-            val cookies = network.client.cookieJar.loadForRequest(request.url)
+            val cookies = client.cookieJar.loadForRequest(request.url)
             val hasAuth = cookies.any { it.name == "session" && it.value.isNotEmpty() }
 
             if (!hasAuth) {
@@ -79,10 +71,6 @@ abstract class ArgosScan :
 
         response
     }
-
-    override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor(authInterceptor)
-        .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         lateinit var action: Preference
@@ -157,7 +145,7 @@ abstract class ArgosScan :
         val value = cookieValue(siteUrl) ?: cookieValue(apiUrl) ?: return false
         listOf(siteUrl, apiUrl).forEach { url ->
             Cookie.parse(url.toHttpUrl(), "session=$value; Domain=${url.toHttpUrl().host}; Path=/")?.let {
-                network.client.cookieJar.saveFromResponse(url.toHttpUrl(), listOf(it))
+                client.cookieJar.saveFromResponse(url.toHttpUrl(), listOf(it))
             }
         }
         CookieManager.getInstance().flush()
@@ -170,9 +158,10 @@ abstract class ArgosScan :
         sessionValidated = false
         if (!syncSession()) return false
         return runCatching {
-            client.newCall(GET("$apiUrl/projects", headers)).execute().use { response ->
-                response.code in 200..299
-            }
+            val response = client.newCall(okhttp3.Request.Builder().url("$apiUrl/projects").build()).execute()
+            val valid = response.code in 200..299
+            response.close()
+            valid
         }.getOrDefault(false).also { valid ->
             sessionValidated = valid
             if (!valid) clearSession()
@@ -192,7 +181,7 @@ abstract class ArgosScan :
             manager.setCookie(url, "session=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/")
             val httpUrl = url.toHttpUrl()
             val expired = Cookie.Builder().name("session").value("").domain(httpUrl.host).path("/").expiresAt(1L).build()
-            network.client.cookieJar.saveFromResponse(httpUrl, listOf(expired))
+            client.cookieJar.saveFromResponse(httpUrl, listOf(expired))
         }
         manager.flush()
     }
@@ -251,143 +240,91 @@ abstract class ArgosScan :
 
     // ============================== Popular ===============================
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = if (hasSession()) {
-        super.fetchPopularManga(page)
-    } else {
-        Observable.just(loginCardPage())
-    }
-
-    override fun popularMangaRequest(page: Int): Request = GET("$apiUrl/projects", headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
+    override suspend fun getPopularManga(page: Int): MangasPage {
         if (!hasSession()) return loginCardPage()
-        val mangas = response.parseAs<ProjectResponseDto>().toSMangaList()
-        return MangasPage(mangas, false)
+        return client.get("$apiUrl/projects").parseAs<Projects>().toMangasPage()
     }
 
     // =============================== Latest ===============================
 
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = if (!hasSession()) {
-        Observable.just(loginCardPage())
-    } else {
-        Observable.fromCallable { loadLatest(page) }
-    }
-
-    private fun loadLatest(page: Int): MangasPage {
-        val projects = client.newCall(GET("$apiUrl/projects", headers)).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("Falha ao buscar projetos.")
-            response.parseAs<ProjectResponseDto>().allItems()
-        }
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        if (!hasSession()) return loginCardPage()
+        val projects = client.get("$apiUrl/projects").parseAs<Projects>().items
             .filter { !it.type.equals("Novel", ignoreCase = true) }
-            .sortedWith(compareBy<ProjectDto> { it.latestUpdateInstant() == null }.thenByDescending { it.latestUpdateInstant() })
+            .sortedWith(compareBy<Project> { it.latestUpdateInstant() == null }.thenByDescending { it.latestUpdateInstant() })
         val offset = (page - 1) * LATEST_PAGE_SIZE
         val pageItems = projects.drop(offset).take(LATEST_PAGE_SIZE)
         val hasNext = projects.size > offset + LATEST_PAGE_SIZE
         return MangasPage(pageItems.map { it.toSManga() }, hasNext)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Latest uses projects endpoint.")
-
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
-
     // =============================== Search ===============================
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = if (hasSession()) {
-        super.fetchSearchManga(page, query, filters)
-    } else {
-        Observable.just(loginCardPage())
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        if (!hasSession()) return loginCardPage()
+        return client.get("$apiUrl/projects").parseAs<Projects>().toMangasPage(query)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$apiUrl/projects#${query.trim()}", headers)
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        if (!hasSession()) return loginCardPage()
-        val query = response.request.url.fragment ?: ""
-        val mangas = response.parseAs<ProjectResponseDto>().toSMangaList(query)
-        return MangasPage(mangas, false)
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val slug = url.pathSegments.getOrNull(1) ?: return null
+        return fetchDetails(slug).toSManga()
     }
 
     // =========================== Manga Details ============================
 
-    override fun fetchMangaDetails(manga: SManga): Observable<SManga> = if (manga.url == LOGIN_REQUIRED_URL) {
-        Observable.just(loginCardManga())
-    } else {
-        super.fetchMangaDetails(manga)
-    }
-
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url}"
-
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        if (manga.url == LOGIN_REQUIRED_URL) return GET("$baseUrl$LOGIN_REQUIRED_URL", headers)
-        val slug = manga.url.substringAfterLast("/")
-        return GET("$apiUrl/projects/slug/$slug", headers)
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga = if (response.request.url.encodedPath == LOGIN_REQUIRED_URL) loginCardManga() else response.parseAs<ProjectDto>().toSManga()
-
-    // ============================== Chapters ==============================
-
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        if (manga.url == LOGIN_REQUIRED_URL) return@fromCallable emptyList()
-        val slug = manga.url.substringAfterLast("/")
-
-        // 1. Fetch details first to extract the project ID
-        val detailsReq = GET("$apiUrl/projects/slug/$slug", headers)
-        val detailsRes = client.newCall(detailsReq).execute()
-
-        if (!detailsRes.isSuccessful) {
-            throw IOException("Falha ao buscar os detalhes do projeto.")
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        if (manga.url == LOGIN_REQUIRED_URL) {
+            return SMangaUpdate(loginCardManga(), emptyList())
         }
-        val projectDto = detailsRes.parseAs<ProjectDto>()
+        val slug = manga.url.substringAfterLast("/")
+        val projectId = manga.memo["projectId"]?.string
 
-        // 2. Fetch the chapters using the required project_id
-        val chaptersReq = GET("$apiUrl/chapters?kind=published&project_id=${projectDto.id}", headers)
-        val chaptersRes = client.newCall(chaptersReq).execute()
-
-        if (!chaptersRes.isSuccessful) {
-            throw IOException("Falha ao buscar os capítulos.")
+        if (projectId == null) {
+            val project = fetchDetails(slug)
+            return SMangaUpdate(
+                project.toSManga(),
+                if (fetchChapters) fetchChapters(project.id) else chapters,
+            )
         }
-
-        chaptersRes.parseAs<ChapterResponseDto>().toSChapterList(projectDto.id, dateFormat)
+        return coroutineScope {
+            val updatedManga = async {
+                if (fetchDetails) fetchDetails(slug).toSManga() else manga
+            }
+            val updatedChapters = async {
+                if (fetchChapters) fetchChapters(projectId) else chapters
+            }
+            SMangaUpdate(updatedManga.await(), updatedChapters.await())
+        }
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException("Not used.")
+    private suspend fun fetchDetails(slug: String): Project = client.get("$apiUrl/projects/slug/$slug").parseAs<Project>()
+
+    private suspend fun fetchChapters(projectId: String): List<SChapter> = client.get("$apiUrl/chapters?kind=published&project_id=$projectId")
+        .parseAs<Chapters>()
+        .toSChapterList(projectId)
 
     // =============================== Pages ================================
 
-    override fun pageListRequest(chapter: SChapter): Request {
-        val parts = chapter.url.split("|")
-        val chapterId = parts[0]
-        return GET("$apiUrl/chapters/$chapterId", headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        if (response.code == 423) {
-            val chapter = runCatching {
-                response.peekBody(Long.MAX_VALUE).string().parseAs<ChapterDto>()
-            }.getOrDefault(ChapterDto())
-            throw IOException(chapter.vipMessage())
-        }
-        return response.parseAs<ChapterDto>().toPages()
-    }
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.url.substringBefore("|")
-        client.newCall(GET("$apiUrl/chapters/$chapterId", headers)).execute().use { response ->
-            if (response.code == 423) {
-                val dto = runCatching {
-                    response.peekBody(Long.MAX_VALUE).string().parseAs<ChapterDto>()
-                }.getOrDefault(ChapterDto())
-                throw IOException(dto.vipMessage())
-            }
-            if (!response.isSuccessful) throw IOException("Falha ao carregar o capítulo (${response.code}).")
-            val dto = response.parseAs<ChapterDto>()
-            if (dto.isNovelText()) throw IOException(NOVEL_MESSAGE)
-            dto.toPages()
+        val response = client.get("$apiUrl/chapters/$chapterId", ensureSuccess = false)
+        if (response.code == 423) {
+            val dto = runCatching {
+                response.parseAs<Chapter>()
+            }.getOrDefault(Chapter(id = chapterId))
+            throw IOException(dto.vipMessage())
         }
+        if (!response.isSuccessful) throw IOException("Falha ao carregar o capítulo (${response.code}).")
+        val dto = response.parseAs<Chapter>()
+        if (dto.isNovelText()) throw IOException(NOVEL_MESSAGE)
+        return dto.toPages()
     }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
 
     private fun loginCardPage() = MangasPage(listOf(loginCardManga()), false)
 
@@ -397,12 +334,12 @@ abstract class ArgosScan :
         description = "A Argos Scan exige login com o Discord. Abra as configurações da fonte, toque em \"Conectar à Argos Scan\", faça o login e depois atualize a fonte."
     }
 
-    private companion object {
-        const val LATEST_PAGE_SIZE = 50
-        const val LOGIN_REQUIRED_URL = "/__argos_login_required__"
-        const val PREF_CONNECT = "argos_connect"
-        const val PREF_STATUS = "argos_session_status"
-        const val PREF_LOGOUT = "argos_logout"
-        const val NOVEL_MESSAGE = "📖 Este conteúdo é uma novel. A extensão Argos Scan suporta apenas capítulos em imagem. Leia este capítulo pelo WebView/site oficial."
+    companion object {
+        private const val LATEST_PAGE_SIZE = 50
+        private const val LOGIN_REQUIRED_URL = "/__argos_login_required__"
+        private const val PREF_CONNECT = "argos_connect"
+        private const val PREF_STATUS = "argos_session_status"
+        private const val PREF_LOGOUT = "argos_logout"
+        private const val NOVEL_MESSAGE = "📖 Este conteúdo é uma novel. A extensão Argos Scan suporta apenas capítulos em imagem. Leia este capítulo pelo WebView/site oficial."
     }
 }

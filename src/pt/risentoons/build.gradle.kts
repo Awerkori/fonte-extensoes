@@ -6,9 +6,10 @@ plugins {
 
 keiyoushi {
     name = "Risentoons"
-    versionCode = 3
-    contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    versionCode = 4
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.6"
+
     source {
         lang = "pt-BR"
         baseUrl = "https://risentoons.xyz"

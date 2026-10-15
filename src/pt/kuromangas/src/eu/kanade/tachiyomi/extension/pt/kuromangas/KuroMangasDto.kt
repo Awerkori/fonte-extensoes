@@ -5,8 +5,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonNames
-import java.text.SimpleDateFormat
+import kotlin.time.Instant
 
 /**
  * Builds the thumbnail URL, removing /uploads/ prefix if present.
@@ -24,14 +23,7 @@ class SecureDto(
 )
 
 @Serializable
-class LoginRequestDto(
-    val email: String,
-    val password: String,
-    val rememberMe: Boolean,
-)
-
-@Serializable
-data class MangaListResponse(
+class MangaListResponse(
     val data: List<MangaDto>,
     val pagination: PaginationDto,
 )
@@ -40,14 +32,14 @@ data class MangaListResponse(
 class PaginationDto(
     val page: Int,
     val limit: Int,
-    @JsonNames("total_pages") val totalPages: Int? = null,
+    val totalPages: Int? = null,
     val hasNext: Boolean? = null,
 ) {
     fun hasNextPage(): Boolean = hasNext ?: (page < (totalPages ?: 1))
 }
 
 @Serializable
-data class MangaDto(
+class MangaDto(
     val id: Int,
     val title: String,
     val description: String? = null,
@@ -64,14 +56,14 @@ data class MangaDto(
         thumbnail_url = coverImage?.let { buildThumbnailUrl(cdnUrl, it) }
         description = buildString {
             this@MangaDto.description?.let { append(it) }
-            this@MangaDto.alternativeTitles?.takeIf { it.isNotEmpty() }?.let {
+            alternativeTitles?.takeIf { it.isNotEmpty() }?.let {
                 if (isNotEmpty()) append("\n\n")
                 append("Títulos alternativos: ${it.joinToString()}")
             }
         }.takeIf { it.isNotBlank() }
         author = this@MangaDto.author
         artist = this@MangaDto.artist
-        genre = this@MangaDto.genres?.joinToString()
+        genre = genres?.joinToString()
         status = when (this@MangaDto.status?.lowercase()) {
             "ongoing", "em andamento" -> SManga.ONGOING
             "completed", "completo" -> SManga.COMPLETED
@@ -83,25 +75,24 @@ data class MangaDto(
 }
 
 @Serializable
-data class MangaDetailsResponse(
+class MangaDetailsResponse(
     val manga: MangaDto,
-    val chapters: List<ChapterDto>,
 )
 
 @Serializable
-data class ChapterListResponse(
+class ChaptersResponse(
     val chapters: List<ChapterDto>,
     val pagination: PaginationDto,
 )
 
 @Serializable
-data class ChapterDto(
+class ChapterDto(
     val id: Int,
     val title: String? = null,
     @SerialName("chapter_number") val chapterNumber: String? = null,
     @SerialName("upload_date") val uploadDate: String? = null,
 ) {
-    fun toSChapter(mangaId: Int, dateFormat: SimpleDateFormat) = SChapter.create().apply {
+    fun toSChapter(mangaId: Int) = SChapter.create().apply {
         url = "/chapter/$mangaId/$id"
         name = buildString {
             chapterNumber?.toFloatOrNull()?.let { append("Capítulo ${it.toString().removeSuffix(".0")}") }
@@ -111,18 +102,18 @@ data class ChapterDto(
             }
         }.ifBlank { "Capítulo ${this@ChapterDto.id}" }
         chapter_number = this@ChapterDto.chapterNumber?.toFloatOrNull() ?: 0f
-        date_upload = uploadDate?.let { dateFormat.tryParse(it) } ?: 0L
+        date_upload = Instant.tryParse(uploadDate)
     }
 }
 
 @Serializable
-data class LatestResponse(
+class LatestResponse(
     val data: List<LatestMangaDto>,
     val pagination: PaginationDto,
 )
 
 @Serializable
-data class LatestMangaDto(
+class LatestMangaDto(
     @SerialName("manga_id") val mangaId: Int,
     @SerialName("manga_title") val mangaTitle: String,
     @SerialName("manga_cover") val mangaCover: String? = null,
@@ -137,37 +128,12 @@ data class LatestMangaDto(
 }
 
 @Serializable
-data class ChapterPagesResponse(
+class SimilarResponse(
+    val data: List<MangaDto>,
+)
+
+@Serializable
+class ChapterPagesResponse(
     val id: Int,
     val pages: List<String>,
 )
-
-internal fun collectChapterPages(
-    firstPage: ChapterListResponse,
-    fetchPage: (Int) -> ChapterListResponse?,
-): List<ChapterDto> {
-    val chapters = firstPage.chapters.toMutableList()
-    val seenIds = chapters.mapTo(mutableSetOf()) { it.id }
-    val seenPages = mutableSetOf(firstPage.pagination.page)
-    var currentPage = firstPage
-
-    while (seenPages.size < MAX_CHAPTER_PAGES) {
-        val nextPage = currentPage.pagination.page + 1
-        val totalPages = currentPage.pagination.totalPages
-        val hasNext = totalPages?.let { nextPage <= it }
-            ?: (currentPage.chapters.size >= currentPage.pagination.limit)
-        if (!hasNext || !seenPages.add(nextPage)) break
-
-        val page = fetchPage(nextPage) ?: break
-        if (page.pagination.page != nextPage || page.chapters.isEmpty()) break
-
-        val newChapters = page.chapters.filter { seenIds.add(it.id) }
-        if (newChapters.isEmpty()) break
-        chapters += page.chapters
-        currentPage = page
-    }
-
-    return chapters.distinctBy { it.id }
-}
-
-private const val MAX_CHAPTER_PAGES = 1_000

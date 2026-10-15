@@ -3,29 +3,32 @@ package eu.kanade.tachiyomi.extension.pt.hentaitokyo
 import eu.kanade.tachiyomi.multisrc.gattsu.Gattsu
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.SChapter
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.asJsoup
 import okhttp3.OkHttpClient
-import okhttp3.Response
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class HentaiTokyo : Gattsu() {
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val document = response.asJsoup()
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(1, 2.seconds)
+
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val path = if (page == 1) "" else "page/$page"
+        val document = client.get("$baseUrl/$path").asJsoup()
         val mangas = document.select("div.meio div.lista ul li")
             .mapNotNull { it.selectFirst("a[href^=$baseUrl]") }
             .distinctBy { it.attr("abs:href").substringBefore('?').trimEnd('/') }
-            .map { super.latestUpdatesFromElement(it) }
-        val hasNextPage = document.selectFirst("ul.paginacao li.next > a") != null
+            .map { latestUpdatesFromElement(it) }
+        val hasNextPage = document.selectFirst(latestUpdatesNextPageSelector() ?: "ul.paginacao li.next > a") != null
         return MangasPage(mangas, hasNextPage)
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
+    override fun chapterListParse(document: Document): List<SChapter> {
         val chapterLinks = document.select("div.meio div.post-box a, div.meio div.post-box button, div.meio div.post-box [data-href], div.meio div.post-box [data-url]")
             .filter { element ->
                 val href = chapterUrl(element).lowercase()
@@ -68,10 +71,6 @@ abstract class HentaiTokyo : Gattsu() {
             }
     }
 
-    override val client: OkHttpClient = super.client.newBuilder()
-        .rateLimit(1, 2.seconds)
-        .build()
-
     private companion object {
         val CHAPTER_NUMBER = Regex(
             "(?:cap[ií]tulo|chapter)\\s*([0-9]+(?:[.,][0-9]+)?)",
@@ -84,7 +83,7 @@ abstract class HentaiTokyo : Gattsu() {
             ?.replace(',', '.')
             ?.toFloatOrNull()
 
-        val ONCLICK_URL = Regex("['\\\"]([^'\\\"]+)['\\\"]")
+        val ONCLICK_URL = Regex("['\"]([^'\"]+)['\"]")
     }
 
     private fun chapterUrl(element: Element): String {

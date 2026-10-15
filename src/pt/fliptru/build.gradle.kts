@@ -5,13 +5,13 @@ plugins {
 }
 
 keiyoushi {
+    name = "Fliptru"
+    versionCode = 5
+    contentWarning = ContentWarning.NSFW
+    libVersion = "1.6"
+
     source {
-        name = "Fliptru"
         lang = "pt-BR"
         baseUrl = "https://fliptru.com.br"
     }
-    name = "Fliptru"
-    versionCode = 4
-    contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
 }

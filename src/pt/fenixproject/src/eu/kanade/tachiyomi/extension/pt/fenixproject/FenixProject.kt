@@ -1,319 +1,191 @@
 package eu.kanade.tachiyomi.extension.pt.fenixproject
 
-import android.util.Base64
-import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.lib.cryptoaes.CryptoAES
-import keiyoushi.network.rateLimit
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
-import keiyoushi.utils.decodeHex
-import keiyoushi.utils.getPreferencesLazy
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.tryParseDate
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 @Source
-abstract class FenixProject :
-    Madara(),
-    ConfigurableSource {
-    private val preferences by getPreferencesLazy()
+abstract class FenixProject : KeiSource() {
 
-    private val showAdultContent get() = preferences.getBoolean(ADULT_CONTENT_PREF, false)
+    override val supportsLatest = false
 
-    override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale("pt", "BR"))
-    override val client = super.client.newBuilder()
-        .rateLimit(3)
-        .addNetworkInterceptor { chain ->
-            val request = chain.request()
-            if (request.url.host != baseUrl.toHttpUrl().host) {
-                chain.proceed(request)
-            } else {
-                val cookies = request.header("Cookie").orEmpty()
-                    .split(';')
-                    .map(String::trim)
-                    .filter { it.isNotEmpty() && !it.startsWith("$ADULT_CONTENT_COOKIE=") }
-                val adultCookie = "$ADULT_CONTENT_COOKIE=${if (showAdultContent) "1" else "0"}"
-                chain.proceed(
-                    request.newBuilder()
-                        .header("Cookie", (cookies + adultCookie).joinToString("; "))
-                        .build(),
-                )
-            }
+    override suspend fun getPopularManga(page: Int): MangasPage = fetchListing("$baseUrl/manhwas?pagina=$page")
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = throw UnsupportedOperationException()
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        if (query.isNotBlank()) {
+            val url = "$baseUrl/pesquisar".toHttpUrl().newBuilder()
+                .addQueryParameter("q", query.trim())
+                .addQueryParameter("pagina", page.toString())
+                .build()
+            return fetchListing(url.toString())
         }
-        .build()
 
-    override val useNewChapterEndpoint = true
-
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-
-    override val chapterUrlSuffix = ""
-
-    private val chapterPreviews = ConcurrentHashMap<String, ChapterPreview>()
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        SwitchPreferenceCompat(screen.context).apply {
-            key = ADULT_CONTENT_PREF
-            title = "Mostrar conteúdo adulto"
-            summary = "Inclui obras +18 nos populares, nas últimas atualizações e na busca."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-    }
-
-    override fun popularMangaRequest(page: Int): Request = GET(baseUrl, headers)
-
-    override fun popularMangaParse(response: Response): MangasPage = MangasPage(
-        response.asJsoup().select("section").firstOrNull {
-            it.selectFirst("h2")?.text() == "Os Mais Lidos do Ninho"
-        }?.select("ol > li")?.mapNotNull(::fenixMangaFromElement).orEmpty(),
-        false,
-    )
-
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/?pagina=$page", headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = fenixMangaPage(response.asJsoup())
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/pesquisar".toHttpUrl().newBuilder()
-            .addQueryParameter("q", query)
-            .addQueryParameter("pagina", page.toString())
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage = fenixMangaPage(response.asJsoup())
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", headers)
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        cacheChapterPreview(document)
-        return SManga.create().apply {
-            title = document.selectFirst("#work-banner h1, h1")?.text()
-                ?: throw IllegalStateException("Fenix manga title is missing")
-            thumbnail_url = document.select("img[alt]")
-                .firstOrNull { it.attr("alt") == title }
-                ?.attr("abs:src")
-            author = document.metadata("Autor")
-            artist = document.metadata("Artista")
-            status = document.metadata("Status").toStatus()
-            genre = document.select("a[href*='genero=']").eachText().joinToString()
-            description = document.selectFirst("h2:matchesOwn(^Sinopse$) + p")?.text()
-        }
-    }
-
-    override fun chapterListRequest(manga: SManga): Request {
-        val preview = chapterPreviews[manga.url]
-        return if (preview != null && System.currentTimeMillis() - preview.createdAt < CHAPTER_PREVIEW_TTL) {
-            GET("$baseUrl${preview.readerUrl}", headers)
+        val genreId = filters.firstInstanceOrNull<Filters>()?.genreId
+        return if (genreId != null) {
+            fetchListing("$baseUrl/manhwas?genero=$genreId&pagina=$page")
         } else {
-            mangaDetailsRequest(manga)
+            fetchListing("$baseUrl/manhwas?pagina=$page")
         }
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        val readerLinks = document.select("[data-select-list] a[href*='/capitulo-']")
-        if (readerLinks.isNotEmpty()) {
-            val mangaUrl = readerLinks.firstOrNull()?.attr("href")?.substringBeforeLast("/capitulo-")
-                ?: return emptyList()
-            val dates = chapterPreviews[mangaUrl]?.dates.orEmpty()
-            return readerLinks.map { link ->
-                SChapter.create().apply {
-                    url = link.attr("href")
-                    name = link.text()
-                    date_upload = dates[url] ?: 0L
-                }
-            }
-        }
-        val visibleChapters = document.select("[id^=chapter-card-]").mapNotNull { card ->
-            val link = card.selectFirst("a[href*='/capitulo-']") ?: return@mapNotNull null
-            SChapter.create().apply {
-                url = link.attr("href")
-                name = card.selectFirst("span[title]")?.text() ?: link.text()
-                date_upload = parseChapterDate(card.selectFirst("span.text-xs")?.text())
-            }
-        }
-
-        val dates = visibleChapters.associateBy(SChapter::url)
-        val firstChapter = visibleChapters.firstOrNull() ?: return emptyList()
-        val chaptersDocument = client.newCall(GET("$baseUrl${firstChapter.url}", headers)).execute().use {
-            it.asJsoup()
-        }
-
-        return chaptersDocument.select("[data-select-list] a[href*='/capitulo-']")
-            .map { link ->
-                dates[link.attr("href")] ?: SChapter.create().apply {
-                    url = link.attr("href")
-                    name = link.text()
-                }
-            }
+    private suspend fun fetchListing(url: String): MangasPage {
+        val document = client.get(url).asJsoup()
+        val mangas = document.select("#works-grid > div").mapNotNull(::parseCard)
+        return MangasPage(mangas, document.selectFirst("a[rel=next]") != null)
     }
 
-    private fun fenixMangaPage(document: Document): MangasPage = MangasPage(
-        document.select("[id^=work-]").mapNotNull(::fenixMangaFromElement),
-        document.selectFirst("a[rel=next]") != null,
-    )
-
-    private fun fenixMangaFromElement(element: Element): SManga? {
-        val link = element.selectFirst("a[href^=/manga/]:not([href*=/capitulo-])") ?: return null
-        val title = element.selectFirst("h3")?.text()
-            ?: element.selectFirst("img[alt]")?.attr("alt")
+    private fun parseCard(card: Element): SManga? {
+        val link = card.selectFirst("a[href^='/manga/']") ?: return null
+        val slug = link.attr("href").removePrefix("/manga/").trim('/')
+        val title = card.selectFirst("h3")?.text()?.ifBlank { null }
+            ?: card.selectFirst("img")?.attr("alt")?.trim()?.ifBlank { null }
             ?: return null
+        if (slug.isBlank()) return null
         return SManga.create().apply {
-            url = link.attr("href")
+            url = slug
             this.title = title
-            thumbnail_url = element.selectFirst("img")?.attr("abs:src")
+            thumbnail_url = card.selectFirst("img")?.absUrl("src")
         }
     }
 
-    private fun Document.metadata(label: String): String? = select("dt")
-        .firstOrNull { it.text() == label }
-        ?.nextElementSibling()
-        ?.text()
-        ?.takeIf(String::isNotBlank)
-
-    private fun cacheChapterPreview(document: Document) {
-        val chapters = document.select("[id^=chapter-card-]").mapNotNull { card ->
-            val link = card.selectFirst("a[href*='/capitulo-']") ?: return@mapNotNull null
-            link.attr("href") to parseChapterDate(card.selectFirst("span.text-xs")?.text())
-        }
-        val readerUrl = chapters.firstOrNull()?.first ?: return
-        chapterPreviews[readerUrl.substringBeforeLast("/capitulo-")] = ChapterPreview(
-            readerUrl = readerUrl,
-            dates = chapters.toMap(),
-            createdAt = System.currentTimeMillis(),
-        )
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host || url.pathSegments.firstOrNull() != "manga") return null
+        val slug = url.pathSegments.getOrNull(1) ?: return null
+        return getMangaUpdate(
+            manga = SManga.create().apply { this.url = slug },
+            chapters = emptyList(),
+            fetchDetails = true,
+            fetchChapters = false,
+        ).manga
     }
 
-    private class ChapterPreview(
-        val readerUrl: String,
-        val dates: Map<String, Long>,
-        val createdAt: Long,
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga)).asJsoup()
+
+        val details = manga.apply {
+            document.selectFirst("main h1")?.text()?.let { title = it }
+            thumbnail_url = document.selectFirst("main img[alt]:not([alt=''])")?.absUrl("src")
+            val fields = document.detailFields()
+            author = fields["Autor"]?.takeUnless { it == "—" }
+            artist = fields["Artista"]?.takeUnless { it == "—" }
+            status = parseStatus(fields["Status"])
+            genre = document.select("a[href*='genero=']").joinToString { it.text() }.ifEmpty { null }
+            description = document.select("h2").firstOrNull { it.text() == "Sinopse" }
+                ?.nextElementSibling()?.text()
+        }
+
+        if (!fetchChapters) return SMangaUpdate(details, chapters)
+        return SMangaUpdate(details, parseChapters(document))
+    }
+
+    private fun Document.detailFields(): Map<String, String> = select("dl dt").associate { dt ->
+        dt.text() to (dt.nextElementSibling()?.text() ?: "")
+    }
+
+    private fun parseStatus(status: String?): Int {
+        val value = status?.lowercase().orEmpty()
+        return when {
+            "andamento" in value -> SManga.ONGOING
+            "conclu" in value -> SManga.COMPLETED
+            "hiato" in value -> SManga.ON_HIATUS
+            "cancel" in value -> SManga.CANCELLED
+            else -> SManga.UNKNOWN
+        }
+    }
+
+    private suspend fun parseChapters(document: Document): List<SChapter> {
+        val cards = document.select("div[id^='chapter-card-']")
+        // The detail page renders at most the 10 latest chapters; the full list is in the
+        // chapter page's selector.
+        if (cards.size < DETAIL_CHAPTER_LIMIT) return cards.mapNotNull(::parseDetailChapter)
+
+        val dates = cards.mapNotNull { card ->
+            val href = card.selectFirst("a[href*='/capitulo-']")?.attr("href") ?: return@mapNotNull null
+            val dateText = card.select("span").firstOrNull { DATE_REGEX.matches(it.text()) }?.text()
+            dateText?.let { href to DATE_FORMAT.tryParseDate(it, SITE_ZONE) }
+        }.toMap()
+
+        val latestChapterUrl = cards.first()?.selectFirst("a[href*='/capitulo-']")?.absUrl("href")
+            ?: return cards.mapNotNull(::parseDetailChapter)
+
+        val fullList = client.get(latestChapterUrl).asJsoup()
+            .select("#chapter-select-top a[href*='/capitulo-']")
+            .map { link ->
+                val href = link.attr("href")
+                val number = chapterNumber(href)
+                SChapter.create().apply {
+                    url = href
+                    name = link.text().ifBlank { number?.let { "Capítulo ${it.format()}" } ?: "Capítulo" }
+                    if (number != null) chapter_number = number
+                    date_upload = dates[href] ?: 0L
+                }
+            }
+
+        return (fullList.ifEmpty { cards.mapNotNull(::parseDetailChapter) })
+            .sortedByDescending { it.chapter_number }
+    }
+
+    private fun parseDetailChapter(card: Element): SChapter? {
+        val href = card.selectFirst("a[href*='/capitulo-']")?.attr("href") ?: return null
+        val number = chapterNumber(href)
+        val dateText = card.select("span").firstOrNull { DATE_REGEX.matches(it.text()) }?.text()
+        return SChapter.create().apply {
+            url = href
+            name = card.selectFirst("span[title]")?.text()?.ifBlank { null }
+                ?: number?.let { "Capítulo ${it.format()}" } ?: "Capítulo"
+            if (number != null) chapter_number = number
+            date_upload = DATE_FORMAT.tryParseDate(dateText, SITE_ZONE)
+        }
+    }
+
+    private fun chapterNumber(href: String): Float? = CHAPTER_NUMBER_REGEX.find(href)?.groupValues?.get(1)?.toFloatOrNull()
+
+    private fun Float.format(): String = toString().removeSuffix(".0")
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> = client.get(getChapterUrl(chapter)).asJsoup()
+        .select("img[alt^='Página ']")
+        .mapIndexed { index, img -> Page(index, imageUrl = img.absUrl("src")) }
+
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
+        Filter.Header("O gênero é ignorado ao buscar por texto"),
+        Filters(),
     )
 
-    private fun String?.toStatus(): Int = when (this?.lowercase()) {
-        "concluído", "concluido", "completo" -> SManga.COMPLETED
-        "em andamento" -> SManga.ONGOING
-        "hiato", "pausado" -> SManga.ON_HIATUS
-        "cancelado" -> SManga.CANCELLED
-        else -> SManga.UNKNOWN
-    }
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga/${manga.url}"
 
-    private companion object {
-        const val CHAPTER_PREVIEW_TTL = 2 * 60 * 1000L
-        const val ADULT_CONTENT_PREF = "pref_show_adult_content"
-        const val ADULT_CONTENT_COOKIE = "fenix_adult"
-    }
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
 
-    override fun pageListRequest(chapter: SChapter): Request {
-        val request = super.pageListRequest(chapter)
+    companion object {
+        private const val DETAIL_CHAPTER_LIMIT = 10
 
-        // Bypass LiteSpeed Cache to ensure the server returns the unoptimized HTML
-        // containing the raw image elements instead of stripped lazy-load placeholders.
-        val url = request.url.newBuilder()
-            .addQueryParameter("nocache", System.currentTimeMillis().toString())
-            .build()
-
-        return request.newBuilder()
-            .url(url)
-            .build()
-    }
-
-    override fun pageListParse(document: Document): List<Page> {
-        launchIO { countViews(document) }
-
-        document.select("#reader-pages img").mapIndexed { index, image ->
-            Page(index, document.location(), image.attr("abs:src"))
-        }.takeIf { it.isNotEmpty() }?.let { return it }
-
-        var chapterData: String? = null
-        var password: String? = null
-
-        val chapterDataRegex = Regex("""chapter_data\s*=\s*(?:'([^']*)'|"((?:\\"|[^"])*)")""")
-        val nonceRegex = Regex("""wpmangaprotectornonce\s*=\s*(?:'([^']*)'|"((?:\\"|[^"])*)")""")
-
-        fun extractData(text: String) {
-            if (chapterData == null) {
-                chapterDataRegex.find(text)?.let { match ->
-                    chapterData = match.groupValues[1].takeIf { it.isNotEmpty() }
-                        ?: match.groupValues[2].replace("\\\"", "\"")
-                }
-            }
-            if (password == null) {
-                nonceRegex.find(text)?.let { match ->
-                    password = match.groupValues[1].takeIf { it.isNotEmpty() }
-                        ?: match.groupValues[2].replace("\\\"", "\"")
-                }
-            }
-        }
-
-        // First check standard script element from Madara
-        val chapterProtector = document.selectFirst(chapterProtectorSelector)
-        if (chapterProtector != null) {
-            val chapterProtectorHtml = chapterProtector.attr("src")
-                .takeIf { it.startsWith("data:text/javascript;base64,") }
-                ?.substringAfter("data:text/javascript;base64,")
-                ?.let { Base64.decode(it, Base64.DEFAULT).toString(Charsets.UTF_8) }
-                ?: chapterProtector.html()
-
-            extractData(chapterProtectorHtml)
-        }
-
-        // Check raw HTML in case it's inline
-        extractData(document.html())
-
-        // If still missing, check LiteSpeed cache JS
-        if (chapterData == null || password == null) {
-            document.select("script[src*=/litespeed/js/]").forEach { script ->
-                if (chapterData != null && password != null) return@forEach
-                val litespeedScript = script.attr("abs:src")
-                try {
-                    val jsResponse = client.newCall(GET(litespeedScript, headers)).execute().body.string()
-                    extractData(jsResponse)
-                } catch (_: Exception) {
-                    // Ignore and continue fallback
-                }
-            }
-        }
-
-        if (chapterData != null && password != null) {
-            val chapterDataJson = json.parseToJsonElement(chapterData.replace("\\/", "/")).jsonObject
-            val unsaltedCiphertext = Base64.decode(
-                chapterDataJson["ct"]?.jsonPrimitive?.content ?: return emptyList(),
-                Base64.DEFAULT,
-            )
-            val salt = chapterDataJson["s"]?.jsonPrimitive?.content?.decodeHex() ?: return emptyList()
-            val ciphertext = salted + salt + unsaltedCiphertext
-
-            val rawImgArray = CryptoAES.decrypt(Base64.encodeToString(ciphertext, Base64.DEFAULT), password)
-            val imgArrayString = json.parseToJsonElement(rawImgArray).jsonPrimitive.content
-            val imgArray = json.parseToJsonElement(imgArrayString).jsonArray
-
-            return imgArray.mapIndexed { idx, it ->
-                Page(idx, document.location(), it.jsonPrimitive.content)
-            }
-        }
-
-        return document.select(pageListParseSelector).mapIndexed { index, element ->
-            val imageUrl = element.selectFirst("img")?.let { imageFromElement(it) }
-            Page(index, document.location(), imageUrl)
-        }
+        private val CHAPTER_NUMBER_REGEX = Regex("""capitulo-(\d+(?:\.\d+)?)""")
+        private val DATE_REGEX = Regex("""\d{2}/\d{2}/\d{4}""")
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ROOT)
+        private val SITE_ZONE = ZoneId.of("America/Sao_Paulo")
     }
 }

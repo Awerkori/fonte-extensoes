@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit
  * Intercepts 403/404 Cloudflare challenges and resolves them via WebView.
  * Mirrors the behaviour of the reference APK (class g / f).
  */
-class BakaiCloudflareInterceptor(private val userAgent: String?) : Interceptor {
+class BakaiCloudflareInterceptor(private val userAgent: String? = null) : Interceptor {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val cookieManager by lazy { CookieManager.getInstance() }

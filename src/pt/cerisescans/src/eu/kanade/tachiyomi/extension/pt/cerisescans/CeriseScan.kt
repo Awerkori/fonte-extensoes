@@ -1,196 +1,168 @@
 package eu.kanade.tachiyomi.extension.pt.cerisescans
 
-import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.source.KeiSource
 import keiyoushi.utils.parseAs
-import okhttp3.Headers
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
-import kotlin.time.Duration.Companion.seconds
 
 @Source
-abstract class CeriseScan : HttpSource() {
+abstract class CeriseScan : KeiSource() {
 
-    override val supportsLatest = true
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2)
 
-    private val apiUrl = "$baseUrl/api"
+    override suspend fun getPopularManga(page: Int): MangasPage = getComicList(page, sort = "views")
 
-    override val client: OkHttpClient = network.client.newBuilder()
-        .rateLimit(3, 2.seconds)
-        .build()
+    override suspend fun getLatestUpdates(page: Int): MangasPage = getComicList(page, sort = "recent")
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Accept", "application/json, text/plain, */*")
-        .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-        .set("Origin", baseUrl)
-        .set("Referer", "$baseUrl/")
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = getComicList(page, query = query, filters = filters)
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
-    }
-
-    // ============================= Popular ================================
-
-    override fun popularMangaRequest(page: Int): Request {
-        val url = "$apiUrl/comics".toHttpUrl().newBuilder()
-            .addQueryParameter("limit", POPULAR_LIMIT.toString())
-            .addQueryParameter("sort", POPULAR_SORT)
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<ComicListResponse>()
-        return result.toMangasPage(baseUrl, hasNextPage = false)
-    }
-
-    // ============================= Latest =================================
-
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = "$apiUrl/comics".toHttpUrl().newBuilder()
-            .addQueryParameter("limit", LATEST_LIMIT.toString())
-            .addQueryParameter("sort", LATEST_SORT)
-            .build()
-        return GET(url, headers)
-    }
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val result = response.parseAs<ComicListResponse>()
-        return result.toMangasPage(baseUrl, hasNextPage = false)
-    }
-
-    // ============================= Search =================================
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$apiUrl/comics".toHttpUrl().newBuilder()
+    private suspend fun getComicList(
+        page: Int,
+        sort: String? = null,
+        query: String = "",
+        filters: FilterList = FilterList(),
+    ): MangasPage {
+        val url = "$baseUrl/api/comics".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
-            .addQueryParameter("limit", SEARCH_LIMIT.toString())
-            .addQueryParameter("sort", filters.firstInstanceOrNull<SortFilter>()?.selected ?: POPULAR_SORT)
+            .addQueryParameter("limit", PAGE_SIZE.toString())
+
+        if (sort != null) {
+            url.addQueryParameter("sort", sort)
+        }
 
         if (query.isNotBlank()) {
             url.addQueryParameter("search", query)
         }
 
-        filters.firstInstanceOrNull<GenreFilter>()?.selected?.let {
-            url.addQueryParameter("genre", it)
+        filters.filterIsInstance<SelectFilter>().forEach { filter ->
+            filter.selected?.let { url.addQueryParameter(filter.parameter, it) }
         }
 
-        filters.firstInstanceOrNull<StatusFilter>()?.selected?.let {
-            url.addQueryParameter("status", it)
-        }
-
-        filters.firstInstanceOrNull<ScanFilter>()?.selected?.let {
-            url.addQueryParameter("scan", it)
-        }
-
-        return GET(url.build(), headers)
+        return client.get(url.build()).parseAs<ComicListDto>().toMangasPage(page, baseUrl)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val result = response.parseAs<ComicListResponse>()
-        val currentPage = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
-        return result.toMangasPage(baseUrl, currentPage)
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val fragment = url.fragment ?: return null
+        val slugOrId = MANGA_FRAGMENT_REGEX.matchEntire(fragment)?.groupValues?.get(1) ?: return null
+        return getComic(slugOrId).toSManga(baseUrl)
     }
 
-    // ============================= Details ================================
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/comics/${manga.ceriseSlug()}", headers)
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val result = response.parseAs<ComicDto>()
-        return result.toSManga(baseUrl, initialized = true)
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val comic = getComic(manga.url.toSlug())
+        return SMangaUpdate(comic.toSManga(baseUrl), comic.lastChapters.map { it.toSChapter() })
     }
 
-    // ============================= Chapters ===============================
-
-    override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val result = response.parseAs<ComicDto>()
-        return result.toSChapterList(dateFormat)
-    }
-
-    // ============================= Pages ==================================
-
-    override fun pageListRequest(chapter: SChapter): Request {
-        val url = "$apiUrl/chapter-images".toHttpUrl().newBuilder()
-
-        val chapterId = chapter.ceriseId()
-        if (chapterId != null) {
-            url.addQueryParameter("chapterId", chapterId)
-        } else {
-            url.addQueryParameter("path", chapter.url)
-        }
-
-        return GET(url.build(), headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> = response.parseAs<List<String>>().mapIndexed { index, imageUrl ->
-        val absoluteUrl = imageUrl.toAbsoluteUrl(baseUrl)
-        Page(index, url = absoluteUrl, imageUrl = absoluteUrl)
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    override fun imageRequest(page: Page): Request {
-        val imageUrl = page.imageUrl ?: throw IOException("URL da imagem ausente")
-        val imageHeaders = headersBuilder()
-            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-            .set("Referer", "$baseUrl/")
+    private suspend fun getComic(slugOrId: String): ComicDto {
+        val url = "$baseUrl/api/comics".toHttpUrl().newBuilder()
+            .addPathSegment(slugOrId)
             .build()
-
-        return GET(imageUrl, imageHeaders)
+        return client.get(url).parseAs<ComicDto>()
     }
 
-    // ============================= Filters ================================
-
-    override fun getFilterList(): FilterList = getFilters()
-
-    // ============================= Utils ==================================
-
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/comic/${manga.ceriseSlug()}"
-
-    override fun getChapterUrl(chapter: SChapter): String {
-        val url = chapter.url.ceriseUrl()
-        return "$baseUrl/${url.pathSegments.joinToString("/")}"
-    }
-
-    private fun SManga.ceriseSlug(): String = url.ceriseUrl().pathSegments.let { segments ->
-        when {
-            segments.firstOrNull() in SUPPORTED_WEB_PREFIXES && segments.size >= 2 -> segments[1]
-            segments.size >= 2 && segments[segments.lastIndex - 1] in SUPPORTED_WEB_PREFIXES -> segments.last()
-            else -> segments.lastOrNull().orEmpty()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val url = "$baseUrl/api/chapter-images".toHttpUrl().newBuilder()
+            .addQueryParameter("chapterId", chapter.url)
+            .build()
+        val siteUrl = baseUrl.toHttpUrl()
+        return client.get(url).parseAs<List<String>>().mapIndexed { index, path ->
+            Page(index, imageUrl = siteUrl.resolve(path)!!.toString())
         }
     }
 
-    private fun SChapter.ceriseId(): String? = url.ceriseUrl().queryParameter("id")
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
+        SelectFilter("Gênero", "genre", GENRES.map { it to it }),
+        SelectFilter("Status", "status", STATUSES),
+    )
 
-    private fun String.ceriseUrl() = when {
-        startsWith("http") -> this
-        startsWith("/") -> "$baseUrl$this"
-        else -> "$baseUrl/$this"
-    }.toHttpUrl()
+    private class SelectFilter(
+        name: String,
+        val parameter: String,
+        private val options: List<Pair<String, String>>,
+    ) : Filter.Select<String>(name, arrayOf("Todos") + options.map { it.first }) {
+        val selected: String? get() = if (state == 0) null else options[state - 1].second
+    }
+
+    override fun getHomeUrl(): String = "$baseUrl/#/library"
+
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/#/comic/${manga.url.toSlug()}"
+
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl/#/read/${chapter.url}"
+
+    // Library entries saved by the old Madara-based source have "/manga/<slug>/" as their URL.
+    private fun String.toSlug() = removePrefix("/manga/").removeSuffix("/")
 
     companion object {
-        private const val POPULAR_LIMIT = 50
-        private const val LATEST_LIMIT = 500
-        private const val SEARCH_LIMIT = 500
-        private const val POPULAR_SORT = "views"
-        private const val LATEST_SORT = "recent"
-        private val SUPPORTED_WEB_PREFIXES = setOf("comic", "manga")
+        private const val PAGE_SIZE = 50
+
+        private val MANGA_FRAGMENT_REGEX = Regex("""/(?:comic|obra)/([^/?]+)""")
+
+        private val STATUSES = listOf(
+            "Em Andamento" to "ongoing",
+            "Finalizado" to "completed",
+            "Hiato" to "hiatus",
+            "Dropado" to "dropped",
+            "Inativo" to "inactive",
+            "Cancelado" to "cancelled",
+        )
+
+        private val GENRES = listOf(
+            "Ação",
+            "Adulto",
+            "Apocalíptico",
+            "Artes Marciais",
+            "Aventura",
+            "BL",
+            "Comédia",
+            "Drama",
+            "Escolar",
+            "Esportes",
+            "Fantasia",
+            "Ficção Científica",
+            "Gore",
+            "Harem",
+            "Harém",
+            "Histórico",
+            "Horror",
+            "Isekai",
+            "Josei",
+            "Magia",
+            "Mistério",
+            "Psicológico",
+            "Reencarnação",
+            "Regressão",
+            "Romance",
+            "Sci-fi",
+            "Seinen",
+            "Shoujo",
+            "Shounen",
+            "Slice of Life",
+            "Smut",
+            "Sobrenatural",
+            "Suspense",
+            "Tragédia",
+            "Vida Escolar",
+            "Vingança",
+            "Webtoon",
+            "Yaoi",
+            "Yuri",
+        )
     }
 }
