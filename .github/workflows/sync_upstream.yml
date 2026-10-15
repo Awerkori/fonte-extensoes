@@ -3,10 +3,7 @@ name: Sync Upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 20 * * *"
-      timezone: "America/Sao_Paulo"
-    - cron: "17 21 * * *"
-      timezone: "America/Sao_Paulo"
+    - cron: "*/5 * * * *"
 
 concurrency:
   group: sync-upstream
