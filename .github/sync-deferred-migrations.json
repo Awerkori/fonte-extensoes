@@ -7,7 +7,7 @@
         "src/ja/comicfesta",
         "src/ja/firecross"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "gattsu": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -17,7 +17,7 @@
         "src/pt/hentaitokyo",
         "src/pt/universohentai"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "gigaviewer": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -44,7 +44,7 @@
         "src/ja/tonarinoyoungjump",
         "src/ja/zenon"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "greenshit": {
       "patch_base": "60bc15ec9c13b3a4302bc54ca7b9fa892fdae726",
@@ -54,7 +54,7 @@
         "src/pt/vegitoons",
         "src/pt/verdinha"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "hentaihand": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -63,7 +63,7 @@
         "src/all/hentaihand",
         "src/all/nhentaicom"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "madaralegacy": {
       "patch_base": "1319949ca9bc456908196e3ba2d104e94182c5d6",
@@ -76,7 +76,7 @@
         "src/pt/tiamanhwa",
         "src/tr/strayfansub"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "madtheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -84,7 +84,7 @@
       "units": [
         "src/en/kaliscancom"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     },
     "spicytheme": {
       "patch_base": "bdcf84f1c687e1074a1b3099daaf48f3f9d71e22",
@@ -92,7 +92,7 @@
       "units": [
         "src/es/spicyscan"
       ],
-      "upstream_ref": "780153a29642a57364e894bc0850c4e76619c7de"
+      "upstream_ref": "58fd63ffeee7631436425748c01c1a727b0b6703"
     }
   }
 }
