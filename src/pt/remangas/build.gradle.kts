@@ -5,14 +5,21 @@ plugins {
 }
 
 keiyoushi {
-    name = "NixManga"
-    versionCode = 56
-    contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    name = "Loobyt"
+    versionCode = 0
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.6"
 
     source {
         lang = "pt-BR"
-        baseUrl = "https://noxmangas.org"
+        baseUrl = "https://loobyt.org"
         id = 7462657023971681136
+    }
+
+    deeplink {
+        host("loobyt.org")
+        host("noxmangas.org")
+        path("/manga/..*")
+        path("/read/..*")
     }
 }

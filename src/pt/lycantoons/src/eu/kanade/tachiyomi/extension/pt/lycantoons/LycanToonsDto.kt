@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.pt.lycantoons
 
-import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
@@ -10,41 +9,17 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlin.time.Instant
 
 @Serializable
-class PopularResponse(
-    private val data: List<SeriesDto>,
-    private val pagination: PaginationDto? = null,
-) {
-    fun toMangasPage() = MangasPage(data.map { it.toSManga() }, pagination?.hasNext == true)
-}
-
-@Serializable
-class RankingRowDto(
-    val title: String,
-    private val slug: String,
-    private val coverUrl: String? = null,
-    private val genre: String? = null,
-) {
-    fun toSManga() = SManga.create().apply {
-        title = this@RankingRowDto.title
-        url = "/series/$slug"
-        thumbnail_url = coverUrl
-        genre = this@RankingRowDto.genre?.takeIf { it.isNotBlank() }
-            ?.let { tagMapping[it] ?: it }
-        status = SManga.UNKNOWN
-        initialized = false
-    }
-}
-
-@Serializable
 class SeriesDto(
     val title: String,
-    private val slug: String,
-    private val coverUrl: String? = null,
-    private val author: String? = null,
-    private val artist: String? = null,
-    private val description: String? = null,
-    private val genre: List<String>? = null,
-    private val status: String? = null,
+    val slug: String,
+    val coverUrl: String? = null,
+    val author: String? = null,
+    val artist: String? = null,
+    val description: String? = null,
+    val synopsis: String? = null,
+    val genre: List<String>? = null,
+    val status: String? = null,
+    val seriesType: String? = null,
 ) {
     fun toSManga() = SManga.create().apply {
         title = this@SeriesDto.title
@@ -55,51 +30,40 @@ class SeriesDto(
         genre = this@SeriesDto.genre?.takeIf { it.isNotEmpty() }
             ?.map { tagMapping[it] ?: it }
             ?.joinToString()
-        description = this@SeriesDto.description
+        description = this@SeriesDto.description ?: this@SeriesDto.synopsis
         status = parseStatus(this@SeriesDto.status)
         initialized = true
     }
 }
 
 @Serializable
-class PaginationDto(
-    val hasNext: Boolean? = null,
-)
-
-@Serializable
-class SearchRequestBody(
-    val limit: Int,
-    val page: Int,
-    val search: String,
-    val seriesType: String,
-    val status: String,
-    val tags: List<String>,
-)
-
-@Serializable
-class SearchResponse(
-    private val series: List<SeriesDto>,
+class RankingRowDto(
+    val title: String,
+    val slug: String,
+    val coverUrl: String? = null,
 ) {
-    fun toMangasPage() = MangasPage(series.map { it.toSManga() }, false)
+    fun toSManga() = SManga.create().apply {
+        title = this@RankingRowDto.title
+        url = "/series/$slug"
+        thumbnail_url = coverUrl
+        initialized = true
+    }
 }
 
 @Serializable
-class ChapterListDto(
-    val chapters: List<ChapterDto>,
-    val total: Int = 0,
-)
-
-@Serializable
 class ChapterDto(
-    private val id: Long? = null,
+    val id: Int? = null,
     private val numero: JsonElement,
     private val createdAt: String? = null,
-    private val titulo: String? = null,
+    private val pageCount: Int? = null,
 ) {
     fun toSChapter(slug: String) = SChapter.create().apply {
         val numberString = numero.jsonPrimitive.content
-        name = if (!titulo.isNullOrBlank()) "Capítulo $numberString - $titulo" else "Capítulo $numberString"
-        url = if (id != null) "/series/$slug/$numberString?capituloId=$id" else "/series/$slug/$numberString"
+        name = "Capítulo $numberString"
+        val capituloParam = id?.let { "capituloId=$it" }
+        val pagesParam = pageCount?.let { "pages=$it" }
+        val query = listOfNotNull(capituloParam, pagesParam).joinToString("&").let { if (it.isNotEmpty()) "?$it" else "" }
+        url = "/series/$slug/$numberString$query"
         date_upload = Instant.tryParse(createdAt)
         chapter_number = numberString.toFloatOrNull() ?: -1f
     }
@@ -108,11 +72,6 @@ class ChapterDto(
 @Serializable
 class ChapterPagesDto(
     val pages: List<String> = emptyList(),
-)
-
-@Serializable
-class PageList(
-    val imageUrls: List<String>,
 )
 
 private fun parseStatus(status: String?) = when (status?.lowercase()) {

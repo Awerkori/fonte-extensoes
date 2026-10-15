@@ -5,6 +5,8 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import java.text.Normalizer
 
 @Serializable
@@ -84,12 +86,48 @@ class ChapterReferenceDto(
 
 @Serializable
 class ReaderAccessResponseDto(
-    val chapter: ReaderChapterDto,
+    val chapter: ReaderChapterDto? = null,
+    val protectedPages: Boolean? = null,
+    val firstHandle: HandleDto? = null,
+    val grant: GrantDto? = null,
+    val pageCount: Int? = null,
 )
 
 @Serializable
 class ReaderChapterDto(
     val pages: List<String> = emptyList(),
+    val id: String? = null,
+    val number: String? = null,
+    val pageCount: Int? = null,
+    val mangaId: String? = null,
+)
+
+@Serializable
+class HandleDto(
+    val token: String,
+    val pageNumber: Int? = null,
+    val pageCount: Int? = null,
+)
+
+@Serializable
+class GrantDto(
+    val token: String,
+    val expiresAt: Long? = null,
+)
+
+@Serializable
+class PageResponseDto(
+    val imageUrl: String? = null,
+    val directImage: Boolean? = null,
+    val pageNumber: Int? = null,
+    val pageCount: Int? = null,
+    val nextHandle: HandleDto? = null,
+)
+
+@Serializable
+class ReaderAccessErrorDto(
+    val error: String? = null,
+    val requiresTurnstile: Boolean? = null,
 )
 
 @Serializable
@@ -102,6 +140,14 @@ class ChapterDto(
     fun toSChapter(slug: String, mangaId: String) = SChapter.create().apply {
         name = "Capítulo $number"
         date_upload = timestamp
-        url = "/$slug/$number#${ChapterReferenceDto(mangaId, id, pageCount).toJsonString()}"
+        val ref = ChapterReferenceDto(mangaId, id, pageCount)
+        url = "/$slug/$number#${ref.toJsonString()}"
+        memo = buildJsonObject {
+            put("mangaId", JsonPrimitive(mangaId))
+            put("chapterId", JsonPrimitive(id))
+            if (pageCount != null) {
+                put("pageCount", JsonPrimitive(pageCount))
+            }
+        }
     }
 }

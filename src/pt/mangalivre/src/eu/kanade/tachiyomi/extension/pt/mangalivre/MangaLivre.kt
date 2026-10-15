@@ -20,13 +20,21 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.WebViewTimeoutException
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
+import keiyoushi.utils.toJsonRequestBody
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -35,6 +43,7 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
@@ -52,7 +61,7 @@ abstract class MangaLivre :
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2, 1.seconds) { it.host == baseUrlHost }
         .addNetworkInterceptor { chain ->
             val req = chain.request()
-            val isCdn = req.url.host == CDN_HOST
+            val isCdn = req.url.host == CDN_HOST || req.url.host.endsWith("edgecompute.app")
             val pageIdx = req.header("X-Page-Index")
             val t0 = SystemClock.elapsedRealtime()
             val resp = chain.proceed(req)
@@ -60,10 +69,12 @@ abstract class MangaLivre :
             if (isCdn && pageIdx != null) {
                 if (pageIdx == "0") {
                     Log.d("ToonLivrePerf", "first_image_received page=0 code=${resp.code} duration=${t1 - t0}ms t=$t1")
-                    Handler(Looper.getMainLooper()).post {
-                        Choreographer.getInstance().postFrameCallback {
-                            val tVisible = SystemClock.elapsedRealtime()
-                            Log.d("ToonLivrePerf", "first_page_visible page=0 t=$tVisible")
+                    runCatching {
+                        Handler(Looper.getMainLooper()).post {
+                            Choreographer.getInstance().postFrameCallback {
+                                val tVisible = SystemClock.elapsedRealtime()
+                                Log.d("ToonLivrePerf", "first_page_visible page=0 t=$tVisible")
+                            }
                         }
                     }
                 }
@@ -171,12 +182,7 @@ abstract class MangaLivre :
 
     // ============================== Pages =======================================
 
-    private fun clearToonLivreCookies() {
-        Log.d("ToonLivrePerf", "clearing_cookies t=${SystemClock.elapsedRealtime()}")
-        val cm = CookieManager.getInstance()
-        cm.removeAllCookies(null)
-        cm.flush()
-    }
+    private val verificationMutex = Mutex()
 
     private fun normalizeCacheKey(url: String): String {
         val httpUrl = (if (url.startsWith("http")) url else "$baseUrl$url").toHttpUrlOrNull()
@@ -210,8 +216,11 @@ abstract class MangaLivre :
         }
 
         val chapterUrl = "$baseUrl${chapter.url}".toHttpUrl()
-        var ref = chapterUrl.fragment?.let {
-            runCatching { it.parseAs<ChapterReferenceDto>() }.getOrNull()
+        var ref = runCatching { chapter.memo.parseAs<ChapterReferenceDto>() }.getOrNull()
+        if (ref == null) {
+            ref = chapterUrl.fragment?.let {
+                runCatching { it.parseAs<ChapterReferenceDto>() }.getOrNull()
+            }
         }
         val chapterNumber = chapterUrl.pathSegments.last { it.isNotEmpty() }
         val slug = chapterUrl.pathSegments.firstOrNull { it.isNotEmpty() && it != chapterNumber }.orEmpty()
@@ -220,12 +229,125 @@ abstract class MangaLivre :
             ref = fetchChapterReference(slug, chapterNumber)
         }
 
-        val pages = getPageListWithWebView(chapter, ref, chapterNumber)
-        if (pages.isNotEmpty()) {
-            pageListCache[cacheKey] = pages
+        return verificationMutex.withLock {
+            pageListCache[cacheKey]?.takeIf { it.isNotEmpty() }?.let { return@withLock it }
+
+            // 1. Direct API Access: Try fetchReaderAccess first!
+            if (ref != null) {
+                val access = runCatching { fetchReaderAccess(ref) }.getOrNull()
+                if (access != null) {
+                    val pages = resolveAccessPages(access, ref, chapterNumber)
+                    if (pages.isNotEmpty()) {
+                        pageListCache[cacheKey] = pages
+                        Log.d("ToonLivrePerf", "direct_access_success count=${pages.size} t=${SystemClock.elapsedRealtime()}")
+                        return@withLock pages
+                    }
+                }
+            }
+
+            // 2. Headless verification: runWebView (NO Activity, NO visible UI)
+            val readerUrl = chapterUrl.newBuilder().fragment(null).build().toString()
+            val pages = getPageListWithWebView(readerUrl, ref, chapterNumber)
+            if (pages.isNotEmpty()) {
+                pageListCache[cacheKey] = pages
+            }
+            Log.d("ToonLivrePerf", "page_list_ready count=${pages.size} t=${SystemClock.elapsedRealtime()}")
+            pages
         }
-        Log.d("ToonLivrePerf", "page_list_ready count=${pages.size} t=${SystemClock.elapsedRealtime()}")
-        return pages
+    }
+
+    private suspend fun fetchReaderAccess(ref: ChapterReferenceDto): ReaderAccessResponseDto? {
+        Log.d("ToonLivrePerf", "calling_reader_access mangaId=${ref.mangaId} chapterId=${ref.chapterId}")
+        val reqHeaders = headers.newBuilder()
+            .set("Accept", "application/json, text/plain, */*")
+            .set("Content-Type", "application/json")
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/")
+            .apply {
+                runCatching {
+                    val cookieStr = CookieManager.getInstance().getCookie(baseUrl)
+                    val csrf = cookieStr?.split(";")
+                        ?.map { it.trim() }
+                        ?.firstOrNull { it.startsWith("csrf_token=") }
+                        ?.substringAfter("csrf_token=")
+                    if (!csrf.isNullOrEmpty()) {
+                        set("x-csrf-token", csrf)
+                    }
+                }
+            }
+            .build()
+
+        return client.post(
+            "$apiUrl/reader/chapter/access",
+            headers = reqHeaders,
+            body = ref.toJsonRequestBody(),
+            ensureSuccess = false,
+        ).use { response ->
+            Log.d("ToonLivrePerf", "reader_access_code=${response.code}")
+            if (response.isSuccessful) {
+                return@use response.parseAs<ReaderAccessResponseDto>()
+            }
+            val peek = response.peekBody(MAX_PEEK).string()
+            val error = runCatching { response.parseAs<ReaderAccessErrorDto>() }.getOrNull()
+            if (response.code == 403 && (error?.error == READER_VERIFICATION_REQUIRED || error?.requiresTurnstile == true || peek.contains("Reader verification required"))) {
+                return@use null
+            }
+            throw IOException(error?.error ?: "HTTP ${response.code}: $peek")
+        }
+    }
+
+    private suspend fun resolveAccessPages(
+        access: ReaderAccessResponseDto,
+        ref: ChapterReferenceDto,
+        chapterNumber: String,
+    ): List<Page> {
+        val directPages = access.chapter?.pages
+        if (!directPages.isNullOrEmpty()) {
+            val pages = directPages.toPageList(ref.mangaId, chapterNumber)
+            if (pages.isNotEmpty()) return pages
+        }
+
+        if (access.protectedPages == true && access.firstHandle?.token != null) {
+            val count = access.chapter?.pageCount ?: ref.pageCount ?: access.firstHandle.pageCount ?: 200
+            val urls = fetchProtectedPagesViaOkHttp(access.firstHandle, count)
+            if (urls.isNotEmpty()) {
+                return urls.toPageList(ref.mangaId, chapterNumber)
+            }
+        }
+
+        return emptyList()
+    }
+
+    private suspend fun fetchProtectedPagesViaOkHttp(
+        firstHandle: HandleDto,
+        maxCount: Int,
+    ): List<String> {
+        val urls = mutableListOf<String>()
+        var cur: HandleDto? = firstHandle
+        val reqHeaders = headers.newBuilder()
+            .set("Accept", "application/json, text/plain, */*")
+            .set("Referer", "$baseUrl/")
+            .build()
+
+        while (cur != null && cur.token.isNotEmpty() && urls.size < maxCount) {
+            val token = cur.token
+            val pageResp = runCatching {
+                val encodedToken = URLEncoder.encode(token, "UTF-8")
+                client.get(
+                    "$apiUrl/reader/p/$encodedToken",
+                    headers = reqHeaders,
+                ).parseJson<PageResponseDto>()
+            }.getOrNull() ?: break
+
+            val imgUrl = pageResp.imageUrl
+            if (!imgUrl.isNullOrEmpty()) {
+                urls.add(imgUrl)
+                cur = pageResp.nextHandle
+            } else {
+                break
+            }
+        }
+        return urls
     }
 
     private fun prewarmCdnConnection() {
@@ -241,71 +363,43 @@ abstract class MangaLivre :
     }
 
     private suspend fun getPageListWithWebView(
-        chapter: SChapter,
+        readerUrl: String,
         ref: ChapterReferenceDto?,
         chapterNumber: String,
     ): List<Page> {
-        val chapterUrl = "$baseUrl${chapter.url}".toHttpUrl()
         val mangaId = ref?.mangaId.orEmpty()
         val expectedCount = ref?.pageCount
-        val readerUrl = chapterUrl.newBuilder().fragment(null).build().toString()
         val imageUrls = Collections.synchronizedSet(LinkedHashSet<String>())
+        val dynamicPageCount = AtomicInteger(expectedCount ?: -1)
         val bridgeName = (1..(10..20).random())
             .map { (('a'..'z') + ('A'..'Z')).random() }
             .joinToString("")
         val collectImageUrlsScript = collectImageUrlsScript(bridgeName)
         val hookFetchScript = hookFetchScript(bridgeName)
 
-        val emptyImageBytes = ByteArray(0)
         val emptyTextBytes = ByteArray(0)
-
         val emptyTextHeaders = mapOf(
             "Access-Control-Allow-Origin" to "*",
             "Access-Control-Allow-Methods" to "GET, POST, OPTIONS, HEAD",
             "Access-Control-Allow-Headers" to "*",
         )
-
-        fun createEmptyImageResponse(): WebResourceResponse = WebResourceResponse("image/webp", "UTF-8", ByteArrayInputStream(emptyImageBytes))
-
         fun createEmptyTextResponse(): WebResourceResponse = WebResourceResponse("text/plain", "UTF-8", 200, "OK", emptyTextHeaders, ByteArrayInputStream(emptyTextBytes))
-
         fun create404Response(): WebResourceResponse = WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyTextHeaders, ByteArrayInputStream(emptyTextBytes))
 
-        Log.d("ToonLivrePerf", "webview_create_start url=$readerUrl t=${SystemClock.elapsedRealtime()}")
+        Log.d("ToonLivrePerf", "headless_webview_start url=$readerUrl t=${SystemClock.elapsedRealtime()}")
         prewarmCdnConnection()
 
         try {
             return runWebView(timeout = WEBVIEW_TIMEOUT) {
                 var previousCount = 0
                 var stablePolls = 0
-                var turnstileStarted = false
-                var chapterAccessStarted = false
-
-                val dynamicPageCount = AtomicInteger(-1)
 
                 javaScriptEnabled = true
                 domStorageEnabled = true
 
-                fun tryResolveDerived(firstCdnUrl: String): Boolean {
-                    val count = expectedCount ?: dynamicPageCount.get().takeIf { it > 0 }
-                    if (count != null && count > 0) {
-                        val resolvedMangaId = mangaId.ifEmpty {
-                            firstCdnUrl.toHttpUrlOrNull()?.pathSegments?.getOrNull(1).orEmpty()
-                        }
-                        val derived = derivePages(firstCdnUrl, resolvedMangaId, chapterNumber, count)
-                        if (derived.isNotEmpty()) {
-                            Log.d("ToonLivrePerf", "chapter_access_done derived_count=${derived.size} t=${SystemClock.elapsedRealtime()}")
-                            resolve(derived)
-                            return true
-                        }
-                    }
-                    return false
-                }
-
                 fun collect(rawUrl: String) {
-                    val imageUrl = rawUrl.toCdnImageUrl() ?: return
+                    val imageUrl = rawUrl.toValidImageUrl() ?: return
                     if (!imageUrl.isChapterImage(mangaId, chapterNumber)) return
-                    if (tryResolveDerived(imageUrl)) return
                     if (imageUrls.add(imageUrl)) {
                         val count = expectedCount ?: dynamicPageCount.get().takeIf { it > 0 }
                         if (count != null && imageUrls.size >= count) {
@@ -318,99 +412,50 @@ abstract class MangaLivre :
                 interceptRequest { request ->
                     val urlStr = request.url.toString()
                     val host = request.url.host.orEmpty()
-                    Log.d("ToonLivreReq", "REQ host=$host url=${urlStr.take(120)}")
 
-                    // 1. Chapter images / proxy: derive & resolve immediately
-                    val cdnUrl = urlStr.toCdnImageUrl()
-                    if (cdnUrl != null) {
-                        if (cdnUrl.isChapterImage(mangaId, chapterNumber)) {
-                            Log.d("ToonLivrePerf", "seen_chapter_image: ${cdnUrl.take(80)}")
-                            if (!tryResolveDerived(cdnUrl)) {
-                                collect(cdnUrl)
-                            }
-                        }
-                        return@interceptRequest createEmptyImageResponse()
-                    }
-
-                    // 2. Cloudflare Turnstile / challenge platform: ALWAYS allow all resources
-                    if (host.contains("challenges.cloudflare.com") || host.contains("cloudflare.com")) {
-                        if (!turnstileStarted && host.contains("challenges.cloudflare.com")) {
-                            turnstileStarted = true
-                            Log.d("ToonLivrePerf", "turnstile_start t=${SystemClock.elapsedRealtime()}")
+                    // 1. Allow Cloudflare Turnstile, ToonLivre API and edge CDN
+                    if (isAllowedHost(host)) {
+                        // Fonts: return 404 to avoid OTS font corruption warnings
+                        if (urlStr.endsWith(".woff2") || urlStr.endsWith(".ttf") || urlStr.endsWith(".woff")) {
+                            return@interceptRequest create404Response()
                         }
                         return@interceptRequest null
                     }
 
-                    // 3. Cloudflare Interactive fallback detection: fail-fast!
-                    if (urlStr.contains("/api/reader/turnstile/interactive")) {
-                        Log.w("ToonLivrePerf", "detected_interactive_turnstile t=${SystemClock.elapsedRealtime()}")
-                        clearToonLivreCookies()
-                        reject(IOException("Cloudflare solicitou verificação interativa."))
-                        return@interceptRequest createEmptyTextResponse()
-                    }
-
-                    // 4. Chapter access timing
-                    if (urlStr.contains("/api/reader/chapter/access")) {
-                        if (!chapterAccessStarted) {
-                            chapterAccessStarted = true
-                            Log.d("ToonLivrePerf", "turnstile_done t=${SystemClock.elapsedRealtime()}")
-                            Log.d("ToonLivrePerf", "chapter_access_start t=${SystemClock.elapsedRealtime()}")
-                        }
-                        return@interceptRequest null
-                    }
-
-                    // 5. Block CDN ads
-                    if (host == CDN_HOST && (urlStr.endsWith(".js") || urlStr.contains(".js?"))) {
-                        return@interceptRequest createEmptyTextResponse()
-                    }
-
-                    // 6. Block third-party ad networks, trackers
-                    if (!isAllowedHost(host) || urlStr.contains("ptag.js") || urlStr.contains("pubadx") ||
+                    // 2. Block third-party ad networks, trackers
+                    if (urlStr.contains("ptag.js") || urlStr.contains("pubadx") ||
                         urlStr.contains("googletagmanager") || urlStr.contains("cloudflareinsights") ||
                         urlStr.contains("whos.amung.us")
                     ) {
                         return@interceptRequest createEmptyTextResponse()
                     }
 
-                    // 7. Fonts: return 404 so browser uses system font without OTS corruption
-                    if (urlStr.endsWith(".woff2") || urlStr.endsWith(".ttf") || urlStr.endsWith(".woff")) {
-                        return@interceptRequest create404Response()
-                    }
-
                     null
                 }
 
                 jsBridge(bridgeName) { payload ->
-                    if (payload.contains("interactivePending")) {
-                        Log.w("ToonLivrePerf", "detected_interactive_pending t=${SystemClock.elapsedRealtime()}")
-                        clearToonLivreCookies()
-                        return@jsBridge
-                    }
-                    if (payload.contains("\"pageCount\"")) {
-                        val count = Regex(""""count":\s*(\d+)""").find(payload)?.groupValues?.get(1)?.toIntOrNull()
-                        if (count != null && count > 0) {
-                            dynamicPageCount.set(count)
-                            Log.d("ToonLivrePerf", "captured_dynamic_pageCount count=$count t=${SystemClock.elapsedRealtime()}")
-                        }
-                    }
-                    if (payload.contains("\"first_page\"")) {
-                        val urlMatch = Regex(""""imageUrl":\s*"([^"]+)"""").find(payload)?.groupValues?.get(1)
-                        val pcMatch = Regex(""""pageCount":\s*(\d+)""").find(payload)?.groupValues?.get(1)?.toIntOrNull()
-                        if (pcMatch != null && pcMatch > 0) dynamicPageCount.set(pcMatch)
-                        if (urlMatch != null) {
-                            val cdnUrl = urlMatch.replace("\\/", "/").toCdnImageUrl()
-                            if (cdnUrl != null && tryResolveDerived(cdnUrl)) {
-                                return@jsBridge
+                    try {
+                        val json = Json.parseToJsonElement(payload).jsonObject
+                        val type = json["type"]?.jsonPrimitive?.content
+                        if (type == "PAGES") {
+                            val list = json["pages"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
+                            if (list.isNotEmpty()) {
+                                Log.d("ToonLivrePerf", "bridge_received_pages count=${list.size} t=${SystemClock.elapsedRealtime()}")
+                                val pages = list.toPageList(mangaId, chapterNumber)
+                                if (pages.isNotEmpty()) {
+                                    resolve(pages)
+                                    return@jsBridge
+                                }
                             }
                         }
-                    }
-                    val urls = runCatching { payload.parseAs<List<String>>() }.getOrNull()
-                    if (urls != null) {
-                        urls.forEach(::collect)
-                        val count = expectedCount ?: dynamicPageCount.get().takeIf { it > 0 }
-                        if (count != null && imageUrls.size >= count) {
-                            Log.d("ToonLivrePerf", "chapter_access_done t=${SystemClock.elapsedRealtime()}")
-                            resolve(imageUrls.toPageList(mangaId, chapterNumber))
+                    } catch (e: Exception) {
+                        val rawList = runCatching { payload.parseAs<List<String>>() }.getOrNull()
+                        if (rawList != null) {
+                            rawList.forEach(::collect)
+                            val count = expectedCount ?: dynamicPageCount.get().takeIf { it > 0 }
+                            if (count != null && imageUrls.size >= count) {
+                                resolve(imageUrls.toPageList(mangaId, chapterNumber))
+                            }
                         }
                     }
                 }
@@ -450,8 +495,7 @@ abstract class MangaLivre :
             if (imageUrls.isNotEmpty()) {
                 return imageUrls.toPageList(mangaId, chapterNumber)
             }
-            clearToonLivreCookies()
-            throw error
+            throw IOException("Tempo esgotado na verificação automática do leitor (${error.message ?: "timeout"})")
         } finally {
             runCatching {
                 CookieManager.getInstance().flush()
@@ -463,15 +507,20 @@ abstract class MangaLivre :
         if (page.index == 0) {
             Log.d("ToonLivrePerf", "first_image_request page=0 t=${SystemClock.elapsedRealtime()}")
         }
-        val imageHeaders = headers.newBuilder()
+        val builder = headers.newBuilder()
             .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
             .set("Sec-Fetch-Dest", "image")
             .set("Sec-Fetch-Mode", "no-cors")
-            .set("Sec-Fetch-Site", "cross-site")
             .set("X-Page-Index", page.index.toString())
-            .set("Referer", "$baseUrl/")
-            .build()
-        return GET(page.imageUrl!!, imageHeaders)
+
+        val imgUrl = page.imageUrl
+        val httpUrl = imgUrl?.toHttpUrlOrNull()
+        if (httpUrl != null && httpUrl.host.endsWith("edgecompute.app")) {
+            builder.removeAll("Referer")
+        } else {
+            builder.set("Referer", "$baseUrl/")
+        }
+        return GET(imgUrl!!, builder.build())
     }
 
     // ============================== Filters =======================================
@@ -527,7 +576,7 @@ abstract class MangaLivre :
 
     companion object {
         private const val STABLE_POLLS = 2
-        private val WEBVIEW_TIMEOUT = 25.seconds
+        private val WEBVIEW_TIMEOUT = 10.seconds
         private const val CDN_HOST = "cdn.toonlivre.net"
         private const val PROXY_HOST = "slightly-free-mayfly.edgecompute.app"
         private val PAGE_NUMBER_REGEX = Regex("""[-_](\d+)\.[^.]+$""")
@@ -537,6 +586,7 @@ abstract class MangaLivre :
         private const val MAX_PEEK = 1024L
         private const val NON_JSON_MESSAGE =
             "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
+        private const val READER_VERIFICATION_REQUIRED = "Reader verification required"
 
         private const val SORT_POPULAR = "popular"
         private const val SORT_RELEASE = "release"
@@ -570,66 +620,108 @@ abstract class MangaLivre :
     private fun isAllowedHost(host: String): Boolean = host.isEmpty() ||
         host == "toonlivre.net" ||
         host.endsWith(".toonlivre.net") ||
+        host == "edgecompute.app" ||
+        host.endsWith(".edgecompute.app") ||
         host == "challenges.cloudflare.com" ||
-        host.endsWith(".cloudflare.com")
+        host.endsWith(".cloudflare.com") ||
+        host.endsWith(".googleapis.com") ||
+        host.endsWith(".gstatic.com")
 
     private fun hookFetchScript(bridgeName: String) =
         """
         (() => {
             if (window.__tl_hooked) return;
             window.__tl_hooked = true;
-            const origFetch = window.fetch;
-            if (!origFetch) return;
-            window.fetch = async function(...args) {
-                const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
-                const urlStr = String(u || '');
-                const isAccess = urlStr.indexOf('/api/reader/chapter/access') !== -1;
-                const isPage = urlStr.indexOf('/api/reader/p/') !== -1;
-                if (isAccess) console.log('__tl_access_calling');
-                const res = await origFetch.apply(this, args);
+
+            const postMessage = (msg) => {
                 try {
-                    if (isAccess) {
-                        console.log('__tl_access_code:' + res.status);
-                        const clone = res.clone();
-                        clone.text().then(body => {
-                            try {
-                                const data = JSON.parse(body);
-                                if (data && data.interactivePending) {
-                                    window['$bridgeName'].post(JSON.stringify({ error: 'interactivePending' }));
-                                    return;
-                                }
-                                const pc = data && (data.pageCount || (data.chapter && data.chapter.pageCount));
-                                if (pc) {
-                                    window['$bridgeName'].post(JSON.stringify({ pageCount: true, count: pc }));
-                                }
-                                const pages = data && data.chapter && data.chapter.pages;
-                                if (Array.isArray(pages) && pages.length > 0) {
-                                    window['$bridgeName'].post(JSON.stringify(pages));
-                                }
-                            } catch(e) {}
-                        }).catch(err => {
-                            console.log('__tl_access_text_err:' + err);
-                        });
-                    } else if (isPage) {
-                        const clone = res.clone();
-                        clone.text().then(body => {
-                            try {
-                                const data = JSON.parse(body);
-                                if (data && data.imageUrl) {
-                                    window['$bridgeName'].post(JSON.stringify({
-                                        first_page: true,
-                                        imageUrl: data.imageUrl,
-                                        pageCount: data.pageCount || (data.nextHandle && data.nextHandle.pageCount) || null
-                                    }));
-                                }
-                            } catch(e) {}
-                        }).catch(err => {});
+                    if (window['$bridgeName'] && window['$bridgeName'].post) {
+                        window['$bridgeName'].post(JSON.stringify(msg));
+                    }
+                } catch(e) {}
+            };
+
+            const fetchAllPages = async (firstHandle, maxCount) => {
+                try {
+                    let cur = firstHandle;
+                    const count = maxCount || cur.pageCount || 200;
+                    const urls = [];
+                    while (cur && cur.token && urls.length < count) {
+                        const pRes = await window.fetch('/api/reader/p/' + encodeURIComponent(cur.token), { cache: 'no-store' });
+                        if (!pRes.ok) break;
+                        const pData = await pRes.json();
+                        if (pData && pData.imageUrl) {
+                            urls.push(pData.imageUrl);
+                            cur = pData.nextHandle;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (urls.length > 0) {
+                        postMessage({ type: 'PAGES', pages: urls });
                     }
                 } catch(e) {
-                    console.log('__tl_access_catch:' + e);
+                    console.log('__tl_fetch_all_err:' + e);
                 }
-                return res;
             };
+
+            const origFetch = window.fetch;
+            if (origFetch) {
+                window.fetch = async function(...args) {
+                    const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
+                    const urlStr = String(u || '');
+                    const isAccess = urlStr.indexOf('/api/reader/chapter/access') !== -1;
+                    const res = await origFetch.apply(this, args);
+
+                    if (isAccess) {
+                        try {
+                            const clone = res.clone();
+                            clone.json().then(async data => {
+                                if (!data) return;
+                                if (data.interactivePending) {
+                                    postMessage({ error: 'interactivePending' });
+                                    return;
+                                }
+
+                                const pages = data.chapter && data.chapter.pages;
+                                if (Array.isArray(pages) && pages.length > 0) {
+                                    postMessage({ type: 'PAGES', pages: pages });
+                                    return;
+                                }
+
+                                if (data.protectedPages && data.firstHandle && data.firstHandle.token) {
+                                    const expectedCount = data.pageCount || (data.chapter && data.chapter.pageCount) || data.firstHandle.pageCount || 200;
+                                    await fetchAllPages(data.firstHandle, expectedCount);
+                                    return;
+                                }
+
+                                if (data.grant && data.grant.token && data.chapter && data.chapter.pageCount) {
+                                    const mId = data.chapter.mangaId || '';
+                                    const cId = data.chapter.id || '';
+                                    const count = data.chapter.pageCount;
+                                    const grantToken = data.grant.token;
+                                    const urls = [];
+                                    for (let p = 1; p <= count; p++) {
+                                        try {
+                                            const pRes = await origFetch('/api/reader/chapter/' + encodeURIComponent(mId) + '/' + encodeURIComponent(cId) + '/page/' + p, {
+                                                headers: { 'x-tl-reader-grant': grantToken }
+                                            });
+                                            if (!pRes.ok) break;
+                                            const pData = await pRes.json();
+                                            if (pData && pData.imageUrl) urls.push(pData.imageUrl);
+                                        } catch(e) { break; }
+                                    }
+                                    if (urls.length > 0) {
+                                        postMessage({ type: 'PAGES', pages: urls });
+                                        return;
+                                    }
+                                }
+                            }).catch(() => {});
+                        } catch(e) {}
+                    }
+                    return res;
+                };
+            }
         })();
         """.trimIndent()
 
@@ -645,23 +737,33 @@ abstract class MangaLivre :
             if (window.performance && performance.getEntriesByType) {
                 performance.getEntriesByType('resource').forEach((entry) => urls.add(entry.name));
             }
-            $bridgeName.post(JSON.stringify(Array.from(urls)));
+            try {
+                if (window['$bridgeName'] && window['$bridgeName'].post) {
+                    window['$bridgeName'].post(JSON.stringify(Array.from(urls)));
+                }
+            } catch(e) {}
         })();
         """.trimIndent()
 
-    private fun String.toCdnImageUrl(): String? {
+    private fun String.toValidImageUrl(): String? {
         val url = toHttpUrlOrNull() ?: return null
-        val candidate = when (url.host) {
-            CDN_HOST -> url
-            PROXY_HOST -> url.queryParameter("url")?.toHttpUrlOrNull()
-            else -> null
-        } ?: return null
-
-        return candidate.takeIf { it.isHttps && it.host == CDN_HOST }?.toString()
+        if (!url.isHttps) return null
+        val host = url.host
+        if (host == CDN_HOST || host.endsWith("edgecompute.app")) return this
+        val queryUrl = url.queryParameter("url")?.toHttpUrlOrNull()
+        if (queryUrl != null && queryUrl.isHttps && (queryUrl.host == CDN_HOST || queryUrl.host.endsWith("edgecompute.app"))) {
+            return queryUrl.toString()
+        }
+        return null
     }
 
     private fun String.isChapterImage(mangaId: String, chapterNumber: String): Boolean {
-        val pathSegments = toHttpUrlOrNull()?.pathSegments ?: return false
+        val url = toHttpUrlOrNull() ?: return false
+        val host = url.host
+        if (host.endsWith("edgecompute.app")) {
+            return url.pathSegments.size >= 2 && url.pathSegments[0] == "reader" && url.pathSegments[1] == "image"
+        }
+        val pathSegments = url.pathSegments
         return pathSegments.size >= 4 &&
             pathSegments[0] == "obras" &&
             (mangaId.isEmpty() || pathSegments[1] == mangaId) &&
@@ -670,14 +772,20 @@ abstract class MangaLivre :
     }
 
     private fun Collection<String>.toPageList(mangaId: String, chapterNumber: String): List<Page> = synchronized(this) {
-        val sortedUrls = asSequence()
-            .mapNotNull { it.toCdnImageUrl() }
+        val validUrls = asSequence()
+            .mapNotNull { it.toValidImageUrl() }
             .filter { it.isChapterImage(mangaId, chapterNumber) }
             .distinct()
-            .sortedWith(
+            .toList()
+
+        val hasNumericPages = validUrls.any { it.pageNumber() != null }
+        val sortedUrls = if (hasNumericPages) {
+            validUrls.sortedWith(
                 compareBy<String>({ it.pageNumber() ?: Int.MAX_VALUE }, { it }),
             )
-            .toList()
+        } else {
+            validUrls
+        }
         sortedUrls.mapIndexed { index, imageUrl -> Page(index, url = imageUrl, imageUrl = imageUrl) }
     }
 
