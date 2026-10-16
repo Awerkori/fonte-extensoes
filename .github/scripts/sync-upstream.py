@@ -106,11 +106,96 @@ def path_exists(ref: str, path: str) -> bool:
     ).returncode == 0
 
 
+_UPSTREAM_HISTORY_CACHE: dict[tuple[str, str, str], bool] = {}
+
+
+def unit_existed_in_upstream_history(
+    unit: str,
+    upstream_ref: str,
+    base: str | None = None,
+) -> bool:
+    """Check if unit ever existed in upstream history."""
+    repo_key = os.path.abspath(".")
+    rev_key = git("rev-parse", upstream_ref, check=False).strip()
+    cache_key = (repo_key, rev_key, unit)
+    if cache_key in _UPSTREAM_HISTORY_CACHE:
+        return _UPSTREAM_HISTORY_CACHE[cache_key]
+
+    if path_exists(upstream_ref, unit):
+        _UPSTREAM_HISTORY_CACHE[cache_key] = True
+        return True
+
+    if base is None:
+        base = git("merge-base", "HEAD", upstream_ref, check=False).strip()
+    if base and path_exists(base, unit):
+        _UPSTREAM_HISTORY_CACHE[cache_key] = True
+        return True
+
+    output = git("rev-list", "-1", upstream_ref, "--", unit, check=False).strip()
+    existed = bool(output)
+    _UPSTREAM_HISTORY_CACHE[cache_key] = existed
+    return existed
+
+
+def is_nox_exclusive(
+    unit: str,
+    upstream_ref: str,
+    base: str | None = None,
+    local_ref: str | None = "HEAD",
+) -> bool:
+    """Return whether a unit is exclusive to Project Nox (created locally, never existed upstream)."""
+    if not (unit.startswith("src/") or unit.startswith("lib-multisrc/")):
+        return False
+
+    has_local = (
+        (local_ref is not None and path_exists(local_ref, unit))
+        or Path(unit).is_dir()
+    )
+    if not has_local:
+        return False
+
+    if path_exists(upstream_ref, unit):
+        return False
+
+    return not unit_existed_in_upstream_history(unit, upstream_ref, base=base)
+
+
 _VERSION_CODE_RE = re.compile(r"(versionCode\s*=\s*)(\d+)")
 _THEME_RE = re.compile(r"""theme\s*=\s*["']([^"']+)["']""")
 _LIB_VERSION_RE = re.compile(r"""libVersion\s*=\s*["']([^"']+)["']""")
 _BASE_VERSION_CODE_RE = re.compile(r"baseVersionCode\s*=\s*(\d+)")
 _LOCAL_PROJECT_RE = re.compile(r"""project\s*\(\s*(?:path\s*=\s*)?["'](:[^"']+)["']""")
+_MULTISRC_IMPORT_RE = re.compile(r"eu\.kanade\.tachiyomi\.multisrc\.([a-zA-Z0-9_]+)")
+_PROJECT_DEP_RE = re.compile(r"""project\s*\(\s*(?:path\s*=\s*)?["']:lib-multisrc:([^"']+)["']""")
+
+
+def unit_required_theme(unit: str, ref: str | None = None) -> str | None:
+    """Detect if sources require a specific multisrc theme based on imports."""
+    if ref is None:
+        unit_dir = Path(unit)
+        if not unit_dir.is_dir():
+            return None
+        for kt_file in unit_dir.rglob("*.kt"):
+            if "build" in kt_file.parts:
+                continue
+            try:
+                content = kt_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            match = _MULTISRC_IMPORT_RE.search(content)
+            if match:
+                return match.group(1)
+        return None
+
+    tree_output = git("ls-tree", "-r", "--name-only", ref, unit, check=False)
+    for path in tree_output.splitlines():
+        if path.endswith(".kt"):
+            content = _read_file_text(ref, path)
+            if content:
+                match = _MULTISRC_IMPORT_RE.search(content)
+                if match:
+                    return match.group(1)
+    return None
 
 
 def _read_file_text(ref: str | None, path: str) -> str | None:
@@ -223,6 +308,9 @@ def pending_sync_units(
     for unit in diff_units:
         if unit in protected:
             print(f"Expected Nox divergence: preserving protected {unit}")
+            continue
+        if is_nox_exclusive(unit, upstream_ref):
+            print(f"NOX_EXCLUSIVE: preserving {unit}")
             continue
         if local_version_ahead_of_upstream(unit, upstream_ref) is not None:
             if has_newer_upstream_for_version_only_unit(unit, upstream_ref):
@@ -337,7 +425,11 @@ def classify_extension_sync_state(
     is_protected = unit in set(protected)
 
     if not path_exists(upstream_ref, f"{unit}/build.gradle.kts"):
-        return "NOX_EXCLUSIVE" if is_protected else "UPSTREAM_REMOVED"
+        if is_nox_exclusive(unit, upstream_ref, base=base):
+            return "NOX_EXCLUSIVE"
+        if is_protected:
+            return "NOX_EXCLUSIVE"
+        return "UPSTREAM_REMOVED"
 
     local_info = effective_version_code(None, unit)
     upstream_info = effective_version_code(upstream_ref, unit)
@@ -519,10 +611,21 @@ def apply_structural_metadata_to_path(
     text = gradle_path.read_text()
     original = text
 
+    if theme is None:
+        unit_parts = gradle_path.parts
+        if "src" in unit_parts:
+            src_idx = unit_parts.index("src")
+            if len(unit_parts) > src_idx + 2:
+                unit_dir = Path(*unit_parts[:src_idx + 3])
+                req = unit_required_theme(str(unit_dir))
+                if req is not None:
+                    curr = _THEME_RE.search(text)
+                    theme = curr.group(1) if curr else req
+
     def replace_or_insert(value: str | None, pattern: re.Pattern[str], key: str) -> None:
         nonlocal text
         if value is None:
-            text = pattern.sub("", text)
+            text = re.sub(r"(?m)^[ \t]*" + pattern.pattern + r"[ \t]*\r?\n?", "", text)
             return
         replacement = f'{key} = "{value}"'
         if pattern.search(text):
@@ -706,10 +809,20 @@ def merge_structural_metadata(unit: str, upstream_ref: str) -> bool:
     if not local_path.exists() or upstream is None:
         return False
 
+    local = structural_metadata(None, unit)
+    local_theme = local[0] if local else None
     upstream_theme, upstream_lib = upstream
-    changed = apply_structural_metadata_to_path(local_path, upstream_theme, upstream_lib)
+
+    required_theme = unit_required_theme(unit)
+    target_theme = upstream_theme
+    if required_theme is not None:
+        if upstream_theme != required_theme:
+            target_theme = local_theme or required_theme
+            print(f"Structural protection: retaining required theme '{target_theme}' for {unit}")
+
+    changed = apply_structural_metadata_to_path(local_path, target_theme, upstream_lib)
     if changed:
-        print(f"Structural metadata: {unit} -> theme={upstream_theme or 'none'}, libVersion={upstream_lib or 'none'}")
+        print(f"Structural metadata: {unit} -> theme={target_theme or 'none'}, libVersion={upstream_lib or 'none'}")
     return changed
 
 
@@ -750,6 +863,24 @@ def validate_multisrc_compatibility() -> list[str]:
         content = gradle_path.read_text()
         theme_match = _THEME_RE.search(content)
         lib_match = _LIB_VERSION_RE.search(content)
+
+        # Check if source code requires a multisrc theme
+        required_theme = unit_required_theme(unit)
+        configured_theme = theme_match.group(1) if theme_match else None
+        has_project_dep = bool(_PROJECT_DEP_RE.search(content))
+
+        if required_theme:
+            if not configured_theme and not has_project_dep:
+                errors.append(
+                    f"{unit}: fontes requerem multisrc '{required_theme}', mas 'theme' está ausente no build.gradle.kts",
+                )
+                continue
+            if configured_theme and configured_theme != required_theme:
+                errors.append(
+                    f"{unit}: fontes requerem multisrc '{required_theme}', mas build.gradle.kts especifica '{configured_theme}'",
+                )
+                continue
+
         if not theme_match or not lib_match:
             continue
 
@@ -1287,6 +1418,9 @@ def _apply_units(
     for unit in units:
         if unit in proven_paths:
             continue
+        if is_nox_exclusive(unit, upstream_ref, base=base):
+            print(f"NOX_EXCLUSIVE: preserving local {unit}")
+            continue
         # A protected source is only changed through a separately proven
         # multisrc candidate. It must never enter a generic full restore.
         if unit in protected_set:
@@ -1346,6 +1480,15 @@ def _apply_units(
                     git("add", "--", f"{unit}/build.gradle.kts")
             if unit not in version_only_units:
                 continue
+
+        if not path_exists(upstream_ref, unit):
+            if not unit_existed_in_upstream_history(unit, upstream_ref, base=base):
+                print(f"NOX_EXCLUSIVE: preserving local {unit} (never existed upstream)")
+                continue
+            if unit in protected_set:
+                print(f"Protected Nox unit: preserving local {unit} (removed upstream)")
+                continue
+            print(f"UPSTREAM_REMOVED: removing {unit} (historical upstream deletion)")
 
         print(f"Applying {unit}")
         git("rm", "-r", "--ignore-unmatch", "--quiet", "--", unit)

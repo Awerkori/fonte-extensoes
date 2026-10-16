@@ -1746,6 +1746,238 @@ class SyncScenariosTest(GitFixture):
         self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "custom patch\n")
 
 
+class NoxOriginAndStructuralIntegrityTest(GitFixture):
+    """Automated verification for Project Nox exclusive origin detection and structural integrity (Scenarios A-G)."""
+
+    def test_scenario_a_new_nox_extension_preserved_zero_deletes(self):
+        """CENÁRIO A: Nova extensão Nox nunca existiu no upstream; é classificada como NOX_EXCLUSIVE e preservada sem deletes."""
+        unit = "src/pt/noxexclusive"
+        self.write("base.txt", "common base\n")
+        base = self.commit("common base")
+
+        # Upstream branch advances without noxexclusive
+        self.git("checkout", "-qb", "upstream")
+        self.write("src/en/other/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write("src/en/other/Source.kt", "other\n")
+        self.commit("upstream commit without noxexclusive")
+
+        # Return to nox branch and create noxexclusive (never in base, never in upstream)
+        self.git("checkout", "-q", "-B", "nox", base)
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "exclusive source\n")
+        self.commit("nox created exclusive unit")
+
+        # 1. Origin detection
+        self.assertTrue(sync_upstream.is_nox_exclusive(unit, "upstream", base=base))
+        self.assertFalse(sync_upstream.unit_existed_in_upstream_history(unit, "upstream", base=base))
+
+        # 2. Classification
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "NOX_EXCLUSIVE")
+
+        # 3. Pending sync units preserves it (zero deletes)
+        pending = sync_upstream.pending_sync_units([unit], [], "upstream")
+        self.assertEqual(pending, [])
+
+        # 4. Applying sync with upstream changes preserves noxexclusive
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", ["src/en/other"], set(), [], [], set(), {})
+
+        self.assertTrue(Path(f"{unit}/build.gradle.kts").is_file())
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "exclusive source\n")
+
+    def test_scenario_b_normal_upstream_extension_syncs(self):
+        """CENÁRIO B: Extensão upstream normal sincroniza normalmente."""
+        unit = "src/pt/normalext"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "initial\n")
+        base = self.commit("base")
+
+        self.git("checkout", "-qb", "upstream")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 2\n')
+        self.write(f"{unit}/Source.kt", "updated by upstream\n")
+        self.commit("upstream update")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        # Not exclusive to Nox
+        self.assertFalse(sync_upstream.is_nox_exclusive(unit, "upstream", base=base))
+        self.assertTrue(sync_upstream.unit_existed_in_upstream_history(unit, "upstream", base=base))
+
+        # Classifies as UPSTREAM_AHEAD
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "UPSTREAM_AHEAD")
+
+        # Syncs cleanly
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertIn("versionCode = 2", Path(f"{unit}/build.gradle.kts").read_text())
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "updated by upstream\n")
+
+    def test_scenario_c_real_upstream_removed_extension_classified_and_deleted(self):
+        """CENÁRIO C: Extensão que existia no upstream e foi removida é classificada como UPSTREAM_REMOVED e deletada."""
+        unit = "src/pt/realdeleted"
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "content\n")
+        base = self.commit("base with real unit")
+
+        self.git("checkout", "-qb", "upstream")
+        self.git("rm", "-r", unit)
+        self.commit("upstream removed real unit")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        # Distinguish: not Nox exclusive, existed upstream
+        self.assertFalse(sync_upstream.is_nox_exclusive(unit, "upstream", base=base))
+        self.assertTrue(sync_upstream.unit_existed_in_upstream_history(unit, "upstream", base=base))
+
+        # Classification
+        state = sync_upstream.classify_extension_sync_state(unit, "upstream", base=base)
+        self.assertEqual(state, "UPSTREAM_REMOVED")
+
+        # Deletion applied when not protected
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        self.assertFalse(Path(f"{unit}/build.gradle.kts").exists())
+
+    def test_scenario_d_protected_nox_extension_retains_patches_on_upstream_removal(self):
+        """CENÁRIO D: Extensão Nox protegida mantém patches mesmo se upstream remover."""
+        unit = "src/pt/noxprotected"
+        self.write(".github/nox-protected.txt", f"{unit}\n")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 5\n')
+        self.write(f"{unit}/Source.kt", "nox custom patches\n")
+        base = self.commit("base")
+
+        self.git("checkout", "-qb", "upstream")
+        self.git("rm", "-r", unit)
+        self.commit("upstream removed unit")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        protected = sync_upstream.get_protected_nox_units(base, "upstream")
+        self.assertIn(unit, protected)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), protected, [], set(), {})
+
+        self.assertTrue(Path(f"{unit}/build.gradle.kts").is_file())
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "nox custom patches\n")
+
+    def test_scenario_e_nox_exclusive_not_in_protected_txt_survives_sync(self):
+        """CENÁRIO E: Extensão exclusiva Nox sobrevive ao sync mesmo sem estar em nox-protected.txt (caso SuperManga)."""
+        unit = "src/pt/supermanga_case"
+        self.write("base.txt", "common base\n")
+        base = self.commit("common base")
+
+        self.git("checkout", "-qb", "upstream")
+        self.write("unrelated.txt", "unrelated upstream change\n")
+        self.commit("upstream unrelated")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+        self.write(".github/nox-protected.txt", "")
+        self.write(f"{unit}/build.gradle.kts", 'libVersion = "1.6"\nversionCode = 1\n')
+        self.write(f"{unit}/Source.kt", "supermanga code\n")
+        self.commit("nox created unit locally")
+
+        # Not in nox-protected
+        protected = sync_upstream.get_protected_nox_units(base, "upstream")
+        self.assertNotIn(unit, protected)
+
+        # Recognized as Nox exclusive
+        self.assertTrue(sync_upstream.is_nox_exclusive(unit, "upstream", base=base))
+        self.assertEqual(sync_upstream.classify_extension_sync_state(unit, "upstream", base=base), "NOX_EXCLUSIVE")
+
+        # pending_sync_units filters it out
+        pending = sync_upstream.pending_sync_units([unit], protected, "upstream")
+        self.assertNotIn(unit, pending)
+
+        # Even if passed directly into apply_units, it is preserved
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit, "unrelated.txt"], set(), protected, [], set(), {})
+
+        self.assertTrue(Path(f"{unit}/build.gradle.kts").is_file())
+        self.assertEqual(Path(f"{unit}/Source.kt").read_text(), "supermanga code\n")
+
+    def test_scenario_f_accidental_theme_removal_detected_and_blocks_commit(self):
+        """CENÁRIO F: Remoção acidental de theme é prevenida e bloqueada por validação estrutural (caso Manga Stop / Point Zero)."""
+        unit = "src/pt/mangastop"
+        self.write("lib-multisrc/mangathemesia/build.gradle.kts", 'libVersion = "1.6"\nbaseVersionCode = 0\n')
+        self.write(
+            f"{unit}/build.gradle.kts",
+            'theme = "mangathemesia"\nlibVersion = "1.6"\nversionCode = 1\n',
+        )
+        self.write(
+            f"{unit}/src/eu/kanade/tachiyomi/extension/pt/mangastop/MangaStop.kt",
+            'package eu.kanade.tachiyomi.extension.pt.mangastop\n'
+            'import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia\n'
+            'class MangaStop : MangaThemesia() {}\n',
+        )
+        base = self.commit("base with mangathemesia theme")
+
+        # 1. Verify unit_required_theme detects mangathemesia
+        self.assertEqual(sync_upstream.unit_required_theme(unit), "mangathemesia")
+
+        # 2. Upstream removed theme = "mangathemesia" (converted upstream to standalone)
+        self.git("checkout", "-qb", "upstream")
+        self.write(
+            f"{unit}/build.gradle.kts",
+            'libVersion = "1.6"\nversionCode = 1\n',
+        )
+        self.commit("upstream converted to standalone")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        # merge_structural_metadata must retain theme = "mangathemesia" because local code requires it
+        changed = sync_upstream.merge_structural_metadata(unit, "upstream")
+        content = Path(f"{unit}/build.gradle.kts").read_text()
+        self.assertIn('theme = "mangathemesia"', content)
+
+        # 3. If theme were stripped manually, validate_multisrc_compatibility must fail closed
+        Path(f"{unit}/build.gradle.kts").write_text('libVersion = "1.6"\nversionCode = 1\n')
+        errors = sync_upstream.validate_multisrc_compatibility()
+        self.assertTrue(any(unit in e and "fontes requerem multisrc 'mangathemesia'" in e for e in errors))
+
+    def test_scenario_g_real_upstream_theme_migration_applied_cleanly(self):
+        """CENÁRIO G: Migração legítima de theme no upstream (com fontes atualizadas) é aplicada com sucesso."""
+        unit = "src/pt/thememigrate"
+        self.write("lib-multisrc/oldtheme/build.gradle.kts", 'libVersion = "1.6"\nbaseVersionCode = 0\n')
+        self.write("lib-multisrc/newtheme/build.gradle.kts", 'libVersion = "1.6"\nbaseVersionCode = 0\n')
+        self.write(
+            f"{unit}/build.gradle.kts",
+            'theme = "oldtheme"\nlibVersion = "1.6"\nversionCode = 1\n',
+        )
+        self.write(
+            f"{unit}/src/eu/kanade/tachiyomi/extension/pt/thememigrate/ThemeMigrate.kt",
+            'import eu.kanade.tachiyomi.multisrc.oldtheme.OldTheme\nclass ThemeMigrate : OldTheme()\n',
+        )
+        base = self.commit("base old theme")
+
+        # Upstream migrates both build.gradle.kts AND source code to newtheme
+        self.git("checkout", "-qb", "upstream")
+        self.write(
+            f"{unit}/build.gradle.kts",
+            'theme = "newtheme"\nlibVersion = "1.6"\nversionCode = 2\n',
+        )
+        self.write(
+            f"{unit}/src/eu/kanade/tachiyomi/extension/pt/thememigrate/ThemeMigrate.kt",
+            'import eu.kanade.tachiyomi.multisrc.newtheme.NewTheme\nclass ThemeMigrate : NewTheme()\n',
+        )
+        self.commit("upstream migrated theme and source")
+
+        self.git("checkout", "-q", "-B", "nox", base)
+
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [unit], set(), [], [], set(), {})
+
+        # Theme updated cleanly
+        content = Path(f"{unit}/build.gradle.kts").read_text()
+        self.assertIn('theme = "newtheme"', content)
+        self.assertIn("versionCode = 2", content)
+        self.assertEqual(sync_upstream.validate_multisrc_compatibility(), [])
+
+
 class BuildMatrixTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
