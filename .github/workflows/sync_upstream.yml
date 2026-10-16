@@ -2,6 +2,11 @@ name: Sync Upstream
 
 on:
   workflow_dispatch:
+    inputs:
+      heartbeat:
+        description: 'Continuar pulse remoto 24/7'
+        type: boolean
+        default: true
   schedule:
     - cron: "*/5 * * * *"
     - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
@@ -110,3 +115,13 @@ jobs:
                 ;;
             esac
           done
+
+      - name: Trigger next check (24/7 cloud pulse)
+        if: always() && !cancelled() && (github.event.inputs.heartbeat != 'false')
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          echo "Waiting 5 minutes before scheduling next remote check..."
+          sleep 300
+          gh workflow run sync_upstream.yml --ref main -R ${{ github.repository }} || true
+
