@@ -1,5 +1,6 @@
 import copy
 import gzip
+import io
 import json
 import os
 from pathlib import Path
@@ -417,6 +418,207 @@ class PublisherTest(unittest.TestCase):
                 # Verify no new release uploads were triggered
                 release_creates = [c for c in calls if c[:2] == ("release", "create")]
                 self.assertEqual(len(release_creates), 0)
+
+                # Verify zero duplicate packages in any catalog representation
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                pkgs = [e.packageName for e in current.extensionList.extensions]
+                self.assertEqual(len(pkgs), len(set(pkgs)))
+                self.assertEqual(len(pkgs), 1)
+
+                legacy_entries = json.loads((root / "index.min.json").read_text())
+                legacy_pkgs = [e["pkg"] for e in legacy_entries]
+                self.assertEqual(len(legacy_pkgs), len(set(legacy_pkgs)))
+
+                assets_data = json.loads((root / "release-assets.json").read_text())
+                self.assertEqual(len(assets_data), 1)
+            finally:
+                os.chdir(previous)
+
+    def test_downgrade_case_a_lower_version_code_fails_with_blocked_log(self):
+        remote_ext = extension("geasscomics", 10)
+        remote_ext.versionCode = 106010
+        remote_ext.versionName = "1.6.10"
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[remote_ext]))
+        old = [legacy(remote_ext)]
+
+        incoming = index_pb2.Extension()
+        incoming.CopyFrom(remote_ext)
+        incoming.versionCode = 106009
+        incoming.versionName = "1.6.9"
+
+        with tempfile.TemporaryDirectory(prefix="nox-downgrade-a-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "pt.geasscomics" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-pt.geasscomics-v1.6.9.{kind}").write_bytes(b"incoming-asset")
+            info = json_format.MessageToDict(incoming, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = incoming.contentWarning
+            info["module"] = "pt.geasscomics"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in incoming.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    with self.assertRaises(ValueError) as ctx:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                output = stdout.getvalue()
+                self.assertIn("VERSION_DOWNGRADE_BLOCKED=eu.kanade.tachiyomi.extension.pt.geasscomics", output)
+                self.assertIn("REMOTE_VERSION_CODE=106010", output)
+                self.assertIn("INCOMING_VERSION_CODE=106009", output)
+                self.assertIn("VERSION_DOWNGRADE_BLOCKED", str(ctx.exception))
+            finally:
+                os.chdir(previous)
+
+    def test_downgrade_case_b_equal_version_code_allowed(self):
+        remote_ext = extension("geasscomics", 10)
+        remote_ext.versionCode = 106010
+        remote_ext.versionName = "1.6.10"
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[remote_ext]))
+        old = [legacy(remote_ext)]
+
+        incoming = index_pb2.Extension()
+        incoming.CopyFrom(remote_ext)
+        incoming.versionCode = 106010
+        incoming.versionName = "1.6.10"
+
+        with tempfile.TemporaryDirectory(prefix="nox-downgrade-b-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "pt.geasscomics" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-pt.geasscomics-v1.6.10.{kind}").write_bytes(b"incoming-asset")
+            info = json_format.MessageToDict(incoming, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = incoming.contentWarning
+            info["module"] = "pt.geasscomics"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in incoming.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertNotIn("VERSION_DOWNGRADE_BLOCKED", output)
+                self.assertIn("PACKAGE_UNIQUENESS_CHECK=PASS", output)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                entries = [e for e in current.extensionList.extensions if e.packageName == PREFIX + "geasscomics"]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0].versionCode, 106010)
+            finally:
+                os.chdir(previous)
+
+    def test_downgrade_case_c_higher_version_code_allowed(self):
+        remote_ext = extension("geasscomics", 10)
+        remote_ext.versionCode = 106010
+        remote_ext.versionName = "1.6.10"
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[remote_ext]))
+        old = [legacy(remote_ext)]
+
+        incoming = index_pb2.Extension()
+        incoming.CopyFrom(remote_ext)
+        incoming.versionCode = 106011
+        incoming.versionName = "1.6.11"
+
+        with tempfile.TemporaryDirectory(prefix="nox-downgrade-c-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "pt.geasscomics" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-pt.geasscomics-v1.6.11.{kind}").write_bytes(b"incoming-asset")
+            info = json_format.MessageToDict(incoming, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = incoming.contentWarning
+            info["module"] = "pt.geasscomics"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in incoming.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertNotIn("VERSION_DOWNGRADE_BLOCKED", output)
+                self.assertIn("PACKAGE_UNIQUENESS_CHECK=PASS", output)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                entries = [e for e in current.extensionList.extensions if e.packageName == PREFIX + "geasscomics"]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0].versionCode, 106011)
+            finally:
+                os.chdir(previous)
+
+    def test_downgrade_case_d_new_package_allowed(self):
+        remote_ext = extension("geasscomics", 10)
+        remote_ext.versionCode = 106010
+        remote_ext.versionName = "1.6.10"
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[remote_ext]))
+        old = [legacy(remote_ext)]
+
+        new_pkg = extension("karikari", 1)
+        new_pkg.versionCode = 106001
+        new_pkg.versionName = "1.6.1"
+
+        with tempfile.TemporaryDirectory(prefix="nox-downgrade-d-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "pt.karikari" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-pt.karikari-v1.6.1.{kind}").write_bytes(b"new-asset")
+            info = json_format.MessageToDict(new_pkg, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = new_pkg.contentWarning
+            info["module"] = "pt.karikari"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in new_pkg.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertNotIn("VERSION_DOWNGRADE_BLOCKED", output)
+                self.assertIn("PACKAGE_UNIQUENESS_CHECK=PASS", output)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                all_pkgs = [e.packageName for e in current.extensionList.extensions]
+                self.assertIn(PREFIX + "karikari", all_pkgs)
+                self.assertIn(PREFIX + "geasscomics", all_pkgs)
+                self.assertEqual(len(all_pkgs), len(set(all_pkgs)))
             finally:
                 os.chdir(previous)
 

@@ -241,6 +241,16 @@ for pkg in deleted_packages:
 replaced_package_count = 0
 added_package_count = 0
 for pkg, (ext, _, _, _, _) in new_by_package.items():
+    if pkg in canonical_remote:
+        remote_ext = canonical_remote[pkg]
+        if ext.versionCode < remote_ext.versionCode:
+            print(f"VERSION_DOWNGRADE_BLOCKED={pkg}")
+            print(f"REMOTE_VERSION_CODE={remote_ext.versionCode}")
+            print(f"INCOMING_VERSION_CODE={ext.versionCode}")
+            raise ValueError(
+                f"VERSION_DOWNGRADE_BLOCKED={pkg}: incoming versionCode {ext.versionCode} "
+                f"< remote versionCode {remote_ext.versionCode}"
+            )
     if pkg in final_by_package:
         replaced_package_count += 1
     else:
@@ -272,7 +282,23 @@ print(f"DUPLICATE_PACKAGE_COUNT={len(all_pkgs) - len(unique_pkgs)}")
 print(f"REPLACED_PACKAGE_COUNT={replaced_package_count}")
 print(f"ADDED_PACKAGE_COUNT={added_package_count}")
 print(f"REMOVED_PACKAGE_COUNT={removed_package_count}")
-print("IDEMPOTENCY_CHECK=PASS")
+print("PACKAGE_UNIQUENESS_CHECK=PASS")
+
+# Real comparison for idempotency:
+# Only log PASS if artifacts were processed and matched existing catalog entries with zero diff
+if len(new_extensions) > 0 and len(canonical_remote) > 0:
+    is_idempotent = (
+        added_package_count == 0
+        and removed_package_count == 0
+        and len(canonical_remote) == len(final_by_package)
+        and not changed_extensions
+        and all(
+            canonical_remote.get(p) == ext
+            for p, ext in final_by_package.items()
+        )
+    )
+    if is_idempotent:
+        print("IDEMPOTENCY_LIVE_CHECK=PASS")
 
 legacy_path = REPO_DIR / "index.min.json"
 legacy_entries = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.exists() else []

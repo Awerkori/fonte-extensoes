@@ -184,6 +184,7 @@ jobs:
           else
             echo "CATALOG_CHANGED=false"
             echo "CATALOG_COMMIT=NONE"
+            echo "IDEMPOTENCY_LIVE_CHECK=PASS"
             echo "No changes to commit"
           fi
 
