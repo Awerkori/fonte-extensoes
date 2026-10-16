@@ -31,6 +31,29 @@ abstract class LycanToons : KeiSource() {
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         rateLimit(2)
+        addInterceptor { chain ->
+            val request = chain.request()
+            val host = request.url.host
+            if (host.contains("lycantoons.com")) {
+                val isCdn = host.startsWith("cdn.")
+                val builder = request.newBuilder()
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                    .header("Origin", baseUrl)
+                    .header("Sec-Fetch-Site", if (isCdn) "same-site" else "same-origin")
+                    .header("Sec-Fetch-Mode", if (isCdn) "no-cors" else "cors")
+                    .header("Sec-Fetch-Dest", if (isCdn) "image" else "empty")
+
+                if (request.header("Referer") == null) {
+                    builder.header("Referer", "$baseUrl/")
+                }
+                if (isCdn) {
+                    builder.header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                }
+                chain.proceed(builder.build())
+            } else {
+                chain.proceed(request)
+            }
+        }
     }
 
     override fun Headers.Builder.configureHeaders(): Headers.Builder = this
@@ -38,10 +61,14 @@ abstract class LycanToons : KeiSource() {
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
         .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .set("Sec-Fetch-Site", "same-site")
+        .set("Sec-Fetch-Mode", "no-cors")
+        .set("Sec-Fetch-Dest", "image")
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val catalogClient by lazy { network.client.newBuilder().build() }
+    private val catalogClient by lazy { client.newBuilder().build() }
     private val fetchDispatcher by lazy { Executors.newFixedThreadPool(4) }
 
     @Volatile
@@ -362,6 +389,10 @@ abstract class LycanToons : KeiSource() {
         headers = headers.newBuilder()
             .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
             .set("Referer", "$baseUrl/")
+            .set("Origin", baseUrl)
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-site")
             .build(),
     )
 
