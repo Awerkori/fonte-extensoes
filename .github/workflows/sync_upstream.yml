@@ -3,13 +3,17 @@ name: Sync Upstream
 on:
   workflow_dispatch:
     inputs:
-      heartbeat:
-        description: 'Continuar pulse remoto 24/7'
-        type: boolean
-        default: true
+      trigger_source:
+        description: 'Origem do disparo (heartbeat, watchdog, manual)'
+        required: false
+        default: 'manual'
+        type: choice
+        options:
+          - manual
+          - heartbeat
+          - watchdog
   schedule:
-    - cron: "*/5 * * * *"
-    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+    - cron: "*/15 * * * *"
 
 concurrency:
   group: sync-upstream
@@ -24,6 +28,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_PAT }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,12 +39,22 @@ jobs:
           token: ${{ secrets.SYNC_PAT }}
           persist-credentials: true
 
+      - name: Watchdog guard & mode detection
+        id: guard
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || 'manual' }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: python .github/scripts/pulse_guard.py watchdog-check
+
       - name: Configure Git
+        if: steps.guard.conclusion == 'success' && steps.guard.outputs.should_run_sync == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Sync upstream
+        if: steps.guard.conclusion == 'success' && steps.guard.outputs.should_run_sync == 'true'
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -117,11 +133,9 @@ jobs:
           done
 
       - name: Trigger next check (24/7 cloud pulse)
-        if: always() && !cancelled() && (github.event.inputs.heartbeat != 'false')
+        if: always() && !cancelled() && steps.guard.conclusion == 'success' && steps.guard.outputs.should_run_sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
-        run: |
-          echo "Waiting 5 minutes before scheduling next remote check..."
-          sleep 300
-          gh workflow run sync_upstream.yml --ref main -R ${{ github.repository }} || true
-
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || 'manual' }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: python .github/scripts/pulse_guard.py pulse-dispatch --sleep-seconds 300
