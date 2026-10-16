@@ -4,9 +4,24 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.time.Instant
+
+fun isRscPointer(text: String?): Boolean {
+    if (text.isNullOrBlank()) return false
+    val trimmed = text.trim()
+    return trimmed.startsWith("$") && (trimmed.matches(RSC_REGEX) || trimmed.length <= 6)
+}
+
+fun cleanSynopsis(text: String?): String? {
+    if (text.isNullOrBlank()) return null
+    if (isRscPointer(text)) return null
+    return text.trim()
+}
+
+private val RSC_REGEX = Regex("""^\${'$'}L?\d+$""")
 
 @Serializable
 class SeriesDto(
@@ -30,7 +45,7 @@ class SeriesDto(
         genre = this@SeriesDto.genre?.takeIf { it.isNotEmpty() }
             ?.map { tagMapping[it] ?: it }
             ?.joinToString()
-        description = this@SeriesDto.description ?: this@SeriesDto.synopsis
+        description = cleanSynopsis(this@SeriesDto.description ?: this@SeriesDto.synopsis)
         status = parseStatus(this@SeriesDto.status)
         initialized = true
     }
@@ -66,6 +81,32 @@ class ChapterDto(
         url = "/series/$slug/$numberString$query"
         date_upload = Instant.tryParse(createdAt)
         chapter_number = numberString.toFloatOrNull() ?: -1f
+    }
+}
+
+@Serializable
+class ChapterApiResponse(
+    val chapters: List<ChapterDto> = emptyList(),
+    val total: Int? = null,
+)
+
+@Serializable
+class BookSchemaDto(
+    val name: String? = null,
+    val description: String? = null,
+    val genre: JsonElement? = null,
+) {
+    fun getGenres(): List<String> {
+        val element = genre ?: return emptyList()
+        return try {
+            if (element is JsonArray) {
+                element.map { it.jsonPrimitive.content }
+            } else {
+                listOf(element.jsonPrimitive.content)
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 }
 

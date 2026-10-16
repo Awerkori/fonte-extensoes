@@ -11,6 +11,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.applicationContext
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -20,11 +21,12 @@ import kotlinx.serialization.json.JsonElement
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.jsoup.parser.Parser
 import java.io.File
-import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
+import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class LycanToons : KeiSource() {
@@ -152,8 +154,8 @@ abstract class LycanToons : KeiSource() {
             filtered = filtered.filter { s ->
                 s.title.lowercase().contains(q) ||
                     s.slug.lowercase().contains(q) ||
-                    (s.synopsis?.lowercase()?.contains(q) == true) ||
-                    (s.description?.lowercase()?.contains(q) == true)
+                    (cleanSynopsis(s.synopsis)?.lowercase()?.contains(q) == true) ||
+                    (cleanSynopsis(s.description)?.lowercase()?.contains(q) == true)
             }
         }
 
@@ -202,24 +204,125 @@ abstract class LycanToons : KeiSource() {
         fetchChapters: Boolean,
     ): SMangaUpdate = withContext(Dispatchers.IO) {
         val slug = manga.slug()
-        val request = GET("$baseUrl/series/$slug", headers)
-        val response = client.newCall(request).execute()
-        val html = response.body.string()
 
-        val updatedDetails = if (fetchDetails) {
+        var fetchedChapters: List<SChapter> = emptyList()
+
+        // 1. If fetching chapters, attempt direct internal API call first (take=500 returns all chapters instantly with 0 Cloudflare challenge on JVM/desktop)
+        if (fetchChapters) {
+            try {
+                val apiReq = GET(
+                    url = "$baseUrl/api/series/$slug/chapters?skip=0&take=500",
+                    headers = headers.newBuilder()
+                        .set("Accept", "application/json, text/plain, */*")
+                        .set("Referer", "$baseUrl/series/$slug")
+                        .set("Sec-Fetch-Site", "same-origin")
+                        .set("Sec-Fetch-Mode", "cors")
+                        .set("Sec-Fetch-Dest", "empty")
+                        .build(),
+                )
+                val apiResp = client.newCall(apiReq).execute()
+                if (apiResp.isSuccessful) {
+                    val apiBody = apiResp.body.string().trim()
+                    if (apiBody.startsWith("{")) {
+                        val apiData = json.decodeFromString<ChapterApiResponse>(apiBody)
+                        if (apiData.chapters.isNotEmpty()) {
+                            fetchedChapters = apiData.chapters
+                                .map { it.toSChapter(slug) }
+                                .sortedByDescending { it.chapter_number }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                // OkHttp challenged or network error
+            }
+        }
+
+        // 2. Fetch HTML for details (or for chapters fallback if API call didn't yield chapters)
+        var html = ""
+        val needsHtml = fetchDetails || (fetchChapters && fetchedChapters.isEmpty())
+
+        if (needsHtml) {
+            try {
+                val req = GET(
+                    url = "$baseUrl/series/$slug",
+                    headers = headers.newBuilder()
+                        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                        .set("Referer", "$baseUrl/")
+                        .set("Sec-Fetch-Site", "same-origin")
+                        .set("Sec-Fetch-Mode", "navigate")
+                        .set("Sec-Fetch-Dest", "document")
+                        .build(),
+                )
+                val resp = client.newCall(req).execute()
+                if (resp.isSuccessful) {
+                    val body = resp.body.string()
+                    if (!body.contains("challenges.cloudflare.com") &&
+                        !body.contains("<title>Just a moment...") &&
+                        (body.contains("application/ld+json") || body.contains("lycantoons"))
+                    ) {
+                        html = body
+                    }
+                }
+            } catch (_: Throwable) {
+                // OkHttp challenged / CloudflareException
+            }
+
+            // Fallback via WebView on Android (bypasses Cloudflare Turnstile natively)
+            if (html.isBlank()) {
+                try {
+                    html = webFetchHtml("$baseUrl/series/$slug")
+                } catch (_: Throwable) {
+                    // WebView not available (e.g. Suwayomi JVM) or timeout
+                }
+            }
+        }
+
+        val updatedDetails = if (fetchDetails && html.isNotBlank()) {
             SManga.create().apply {
-                title = OG_TITLE_REGEX.find(html)?.groupValues?.get(1) ?: manga.title
+                title = OG_TITLE_REGEX.find(html)?.groupValues?.get(1)?.let { Parser.unescapeEntities(it, false) } ?: manga.title
                 thumbnail_url = OG_IMAGE_REGEX.find(html)?.groupValues?.get(1) ?: manga.thumbnail_url
-                description = OG_DESC_REGEX.find(html)?.groupValues?.get(1) ?: manga.description
 
-                val genresMatch = GENRES_REGEX.find(html)
-                if (genresMatch != null) {
-                    val g = genresMatch.groupValues[1]
-                    genre = """"([^"]+)"""".toRegex().findAll(g).map { it.groupValues[1] }
-                        .map { tagMapping[it] ?: it }
-                        .joinToString()
+                // Parse Book schema from JSON-LD for untruncated synopsis and genres
+                var parsedDesc: String? = null
+                var parsedGenres: List<String>? = null
+
+                for (m in JSON_LD_REGEX.findAll(html)) {
+                    val rawJson = m.groupValues[1].trim()
+                    if (rawJson.contains(""""@type"\s*:\s*"Book"""".toRegex())) {
+                        try {
+                            val book = json.decodeFromString<BookSchemaDto>(rawJson)
+                            if (!book.description.isNullOrBlank() && !isRscPointer(book.description)) {
+                                parsedDesc = Parser.unescapeEntities(book.description.trim(), false)
+                            }
+                            val bg = book.getGenres()
+                            if (bg.isNotEmpty()) {
+                                parsedGenres = bg
+                            }
+                            break
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                if (parsedDesc == null) {
+                    val ogDesc = OG_DESC_REGEX.find(html)?.groupValues?.get(1)
+                    val metaDesc = META_DESC_REGEX.find(html)?.groupValues?.get(1)
+                    parsedDesc = cleanSynopsis(ogDesc) ?: cleanSynopsis(metaDesc)
+                }
+
+                description = parsedDesc ?: cleanSynopsis(manga.description)
+
+                genre = if (!parsedGenres.isNullOrEmpty()) {
+                    parsedGenres.map { tagMapping[it] ?: it }.joinToString()
                 } else {
-                    genre = manga.genre
+                    val genresMatch = GENRES_REGEX.find(html)
+                    if (genresMatch != null) {
+                        val g = genresMatch.groupValues[1]
+                        """"([^"]+)"""".toRegex().findAll(g).map { it.groupValues[1] }
+                            .map { tagMapping[it] ?: it }
+                            .joinToString()
+                    } else {
+                        manga.genre
+                    }
                 }
 
                 status = when (STATUS_REGEX.find(html)?.groupValues?.get(1)?.lowercase()) {
@@ -236,17 +339,21 @@ abstract class LycanToons : KeiSource() {
         }
 
         val updatedChapters = if (fetchChapters) {
-            val chaptersMatch = CHAPTERS_REGEX.find(html) ?: CAPITULOS_REGEX.find(html)
-            if (chaptersMatch != null) {
-                val jsonString = chaptersMatch.groupValues[1]
-                    .replace("\\\"", "\"")
-                    .replace("\\\\", "\\")
-                json.decodeFromString<List<ChapterDto>>(jsonString)
-                    .map { it.toSChapter(slug) }
-                    .sortedByDescending { it.chapter_number }
-            } else {
-                chapters
+            if (fetchedChapters.isEmpty() && html.isNotBlank()) {
+                val chaptersMatch = CHAPTERS_REGEX.find(html) ?: CAPITULOS_REGEX.find(html)
+                if (chaptersMatch != null) {
+                    val jsonString = chaptersMatch.groupValues[1]
+                        .replace("\\\"", "\"")
+                        .replace("\\\\", "\\")
+                    try {
+                        fetchedChapters = json.decodeFromString<List<ChapterDto>>(jsonString)
+                            .map { it.toSChapter(slug) }
+                            .sortedByDescending { it.chapter_number }
+                    } catch (_: Exception) {}
+                }
             }
+
+            if (fetchedChapters.isNotEmpty()) fetchedChapters else chapters
         } else {
             chapters
         }
@@ -273,7 +380,7 @@ abstract class LycanToons : KeiSource() {
 
             if (html.isEmpty()) {
                 try {
-                    html = webFetch(chapterPageUrl)
+                    html = webFetchHtml(chapterPageUrl)
                 } catch (_: Throwable) {}
             }
 
@@ -368,20 +475,58 @@ abstract class LycanToons : KeiSource() {
         return emptyList()
     }
 
-    private suspend fun webFetch(url: String): String = runWebView {
+    private suspend fun webFetch(url: String): String = runWebView(timeout = 30.seconds) {
         userAgent = headers["User-Agent"]!!
-        jsBridge("lycanResult") { resolve(it) }
-        jsBridge("lycanError") { reject(IOException(it)) }
-        onPageFinished {
+        poll(1.seconds) {
             evaluateJs(
                 """
-                fetch('$url')
-                    .then(res => res.text())
-                    .then(res => lycanResult.resolve(res))
-                    .catch(err => lycanError.reject(err.message));
+                (function() {
+                    if (document.title.indexOf('Just a moment') !== -1) return;
+                    if (window.__fetching) return;
+                    window.__fetching = true;
+                    fetch('$url')
+                        .then(function(res) { return res.text(); })
+                        .then(function(text) {
+                            window.__fetchResult = text;
+                        })
+                        .catch(function(err) {
+                            window.__fetching = false;
+                        });
+                })()
                 """.trimIndent(),
             )
+            evaluateJs("window.__fetchResult || null") { value ->
+                val result = value.parseAs<String?>()
+                if (!result.isNullOrBlank()) {
+                    resolve(result)
+                }
+            }
         }
+        loadUrl("$baseUrl/")
+    }
+
+    private suspend fun webFetchHtml(url: String): String = runWebView(timeout = 30.seconds) {
+        userAgent = headers["User-Agent"]!!
+        poll(1.seconds) {
+            evaluateJs(
+                """
+                (function() {
+                    if (document.title.indexOf('Just a moment') !== -1) return null;
+                    var script = document.querySelector('script[type="application/ld+json"]');
+                    if (script || document.querySelector('h1')) {
+                        return document.documentElement.outerHTML;
+                    }
+                    return null;
+                })()
+                """.trimIndent(),
+            ) { value ->
+                val html = value.parseAs<String?>()
+                if (!html.isNullOrBlank() && !html.contains("<title>Just a moment...")) {
+                    resolve(html)
+                }
+            }
+        }
+        loadUrl(url)
     }
 
     override fun imageRequest(page: Page): Request = GET(
@@ -488,17 +633,18 @@ abstract class LycanToons : KeiSource() {
         private val RANKING_ALL_REGEX = """\\"lidas:all\\"\s*:\s*\{.*?\\"rows\\"\s*:\s*(\[\{.*?\}\])\s*\}""".toRegex()
         private val RANKING_WEEKLY_REGEX = """\\"lidas:weekly\\"\s*:\s*\{.*?\\"rows\\"\s*:\s*(\[\{.*?\}\])\s*\}""".toRegex()
         private val TOTAL_PAGES_REGEX = """\\"totalPages\\"\s*:\s*(\d+)""".toRegex()
-        private val CAPITULO_ID_REGEX = """\\?"capituloId\\?"\s*:\s*(\d+)""".toRegex()
         private val EXTRACT_CAPITULO_ID_REGEX = """(?:/api/chapters/|capituloId[^0-9]{1,20})(\d+)""".toRegex()
         private val PRE_REGEX = """<pre[^>]*>(.*?)</pre>""".toRegex(RegexOption.DOT_MATCHES_ALL)
         private val PAGES_ARRAY_REGEX = """\\?"pages\\?"\s*:\s*\[(.*?)\]""".toRegex(RegexOption.DOT_MATCHES_ALL)
         private val IMAGE_URL_REGEX = """"(https?:[^"]+)"""".toRegex()
-        private val CHAPTERS_REGEX = """\\"chapters\\"\s*:\s*(\[\{.*?\}\])""".toRegex()
-        private val CAPITULOS_REGEX = """\\"capitulos\\"\s*:\s*(\[\{.*?\}\])""".toRegex()
+        private val CHAPTERS_REGEX = """\\?"chapters\\?"\s*:\s*(\[\{.*?\}\])""".toRegex(RegexOption.DOT_MATCHES_ALL)
+        private val CAPITULOS_REGEX = """\\?"capitulos\\?"\s*:\s*(\[\{.*?\}\])""".toRegex(RegexOption.DOT_MATCHES_ALL)
+        private val JSON_LD_REGEX = """<script\s+type="application/ld\+json"[^>]*>(.*?)</script>""".toRegex(RegexOption.DOT_MATCHES_ALL)
         private val GENRES_REGEX = """\\"genre\\":\[(.*?)\]""".toRegex()
         private val STATUS_REGEX = """\\"status\\"\s*:\s*\\"([^"]+)\\"""".toRegex(RegexOption.IGNORE_CASE)
         private val OG_TITLE_REGEX = """property="og:title"\s*content="([^"]+)"""".toRegex()
         private val OG_IMAGE_REGEX = """property="og:image"\s*content="([^"]+)"""".toRegex()
         private val OG_DESC_REGEX = """property="og:description"\s*content="([^"]+)"""".toRegex()
+        private val META_DESC_REGEX = """<meta\s+name="description"\s+content="([^"]+)"""".toRegex(RegexOption.IGNORE_CASE)
     }
 }
