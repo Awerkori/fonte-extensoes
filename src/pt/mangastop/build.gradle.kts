@@ -10,8 +10,6 @@ keiyoushi {
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 
-    
-
     source {
         lang = "pt-BR"
         baseUrl = "https://mangastop.net"
