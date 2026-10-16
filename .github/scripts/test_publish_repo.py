@@ -622,6 +622,196 @@ class PublisherTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_icon_resolution_own_icon(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("publish_repo", SCRIPT)
+        pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pub)
+
+        url = pub.get_icon_url("pt.geasscomics", None)
+        self.assertEqual(url, f"{pub.ICON_BASE_URL}/src/pt/geasscomics/res/mipmap-xhdpi/ic_launcher.png")
+
+    def test_icon_resolution_theme_icon(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("publish_repo", SCRIPT)
+        pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pub)
+
+        url = pub.get_icon_url("pt.samplewithmadara", "madara")
+        self.assertEqual(url, f"{pub.ICON_BASE_URL}/lib-multisrc/madara/res/mipmap-xhdpi/ic_launcher.png")
+
+    def test_icon_resolution_generic_nox_fallback(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("publish_repo", SCRIPT)
+        pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pub)
+
+        # yabai has no icon and no theme
+        url_yabai = pub.get_icon_url("all.yabai", None)
+        self.assertEqual(url_yabai, pub.DEFAULT_ICON_URL)
+        # apenasumafa has theme zeistmanga which has no res/
+        url_apenas = pub.get_icon_url("pt.apenasumafa", "zeistmanga")
+        self.assertEqual(url_apenas, pub.DEFAULT_ICON_URL)
+
+    def test_no_final_extension_has_empty_icon_url(self):
+        # Package with no icon built as incoming artifact
+        yabai_pkg = "eu.kanade.tachiyomi.extension.all.yabai"
+        ext_yabai = index_pb2.Extension(
+            name="Yabai",
+            packageName=yabai_pkg,
+            extensionLib="1.6",
+            versionCode=106000,
+            versionName="1.6.0",
+            contentWarning=index_pb2.CONTENT_WARNING_NSFW,
+            sources=[index_pb2.Source(id=1928970119194827182, name="Yabai", language="all", homeUrl="https://yabai.si")],
+        )
+
+        with tempfile.TemporaryDirectory(prefix="nox-no-icon-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text('{"extensionList": {"extensions": []}}', encoding="utf-8")
+            (root / "index.min.json").write_text("[]", encoding="utf-8")
+
+            build = root / "apk-artifacts" / "all.yabai" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-all.yabai-v1.6.0.{kind}").write_bytes(b"yabai-asset")
+            info = json_format.MessageToDict(ext_yabai, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = ext_yabai.contentWarning
+            info["module"] = "all.yabai"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in ext_yabai.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT.resolve()), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT.resolve()), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertIn("ICON_URL_VALIDATION=PASS", output)
+                self.assertIn("EXTENSIONS_WITH_MISSING_ICON_URL=0", output)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                self.assertEqual(len(current.extensionList.extensions), 1)
+                final_yabai = current.extensionList.extensions[0]
+                self.assertTrue(len(final_yabai.resources.iconUrl) > 0)
+                self.assertTrue(final_yabai.resources.iconUrl.startswith("https://"))
+            finally:
+                os.chdir(previous)
+
+    def test_publisher_fails_closed_if_icon_url_missing(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("publish_repo", SCRIPT)
+        pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pub)
+
+        bad_ext = extension("geasscomics", 1)
+        bad_ext.resources.iconUrl = ""
+
+        with self.assertRaises(ValueError) as ctx:
+            pub.validate_catalog_integrity([bad_ext])
+        self.assertIn("ICON_URL_VALIDATION=FAIL", str(ctx.exception))
+
+    def test_publisher_fails_closed_if_empty_package_name(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("publish_repo", SCRIPT)
+        pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pub)
+
+        bad_ext = extension("geasscomics", 1)
+        bad_ext.packageName = ""
+
+        with self.assertRaises(ValueError) as ctx:
+            pub.validate_catalog_integrity([bad_ext])
+        self.assertIn("EMPTY_PACKAGE_NAME_DETECTED", str(ctx.exception))
+
+    def test_json_serialization_contains_icon_url_for_all_extensions(self):
+        # Create 2 extensions (one with own icon, one with fallback)
+        geass = extension("geasscomics", 1)
+        geass.versionCode = 106001
+        geass.versionName = "1.6.1"
+        geass.resources.iconUrl = "https://example.org/geass.png"
+
+        yabai = index_pb2.Extension(
+            name="Yabai",
+            packageName="eu.kanade.tachiyomi.extension.all.yabai",
+            extensionLib="1.6",
+            versionCode=106000,
+            versionName="1.6.0",
+            contentWarning=index_pb2.CONTENT_WARNING_NSFW,
+            resources=index_pb2.Resources(iconUrl=""),
+            sources=[index_pb2.Source(id=1928970119194827182, name="Yabai", language="all", homeUrl="https://yabai.si")],
+        )
+
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[geass, yabai]))
+        old = [legacy(geass), legacy(yabai)]
+
+        with tempfile.TemporaryDirectory(prefix="nox-json-check-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT.resolve()), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT.resolve()), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertIn("ICON_URL_VALIDATION=PASS", output)
+
+                raw_json = json.loads((root / "index.json").read_text(encoding="utf-8"))
+                for ext in raw_json["extensionList"]["extensions"]:
+                    self.assertIn("resources", ext)
+                    self.assertIn("iconUrl", ext["resources"])
+                    self.assertTrue(ext["resources"]["iconUrl"].startswith("https://"))
+            finally:
+                os.chdir(previous)
+
+    def test_catalog_multiple_extensions_no_duplicate_package_name(self):
+        ext1 = extension("geasscomics", 1)
+        ext1.versionCode = 106001
+        ext1.versionName = "1.6.1"
+
+        ext2 = extension("karikari", 1)
+        ext2.versionCode = 106001
+        ext2.versionName = "1.6.1"
+
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[ext1, ext2]))
+        old = [legacy(ext1), legacy(ext2)]
+
+        with tempfile.TemporaryDirectory(prefix="nox-multi-check-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT.resolve()), "[]", "fixture-sha"]), patch("sys.stdout", stdout):
+                    try:
+                        runpy.run_path(str(SCRIPT.resolve()), run_name="__main__")
+                    except SystemExit as e:
+                        self.assertEqual(e.code, 0)
+                output = stdout.getvalue()
+                self.assertIn("PACKAGE_UNIQUENESS_CHECK=PASS", output)
+                self.assertIn("CATALOG_STRUCTURAL_VALIDATION=PASS", output)
+                self.assertIn("DUPLICATE_PACKAGE_COUNT=0", output)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                pkgs = [e.packageName for e in current.extensionList.extensions]
+                self.assertEqual(len(pkgs), 2)
+                self.assertEqual(len(pkgs), len(set(pkgs)))
+            finally:
+                os.chdir(previous)
+
     def test_remote_catalog_with_duplicates_is_deduplicated_by_highest_version(self):
         # Create remote index with 3 duplicate instances of koharu
         v0 = extension("geasscomics", 1)
