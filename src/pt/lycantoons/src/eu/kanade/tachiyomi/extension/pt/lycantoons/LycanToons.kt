@@ -11,6 +11,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.applicationContext
+import keiyoushi.utils.runWebView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -20,6 +21,7 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
@@ -228,47 +230,131 @@ abstract class LycanToons : KeiSource() {
     // =====================Pages========================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> = withContext(Dispatchers.IO) {
-        val capituloId = chapter.url.substringAfter("?capituloId=", "")
+        var capituloId = chapter.url.substringAfter("?capituloId=", "")
             .ifEmpty { chapter.url.substringAfter("&capituloId=", "") }
             .substringBefore("&")
 
-        val body = if (capituloId.isNotEmpty()) {
-            val req = GET("$baseUrl/api/chapters/$capituloId/view-pages", headers)
-            client.newCall(req).execute().body.string()
-        } else {
-            val req = GET("$baseUrl${chapter.url}", headers)
-            client.newCall(req).execute().body.string()
+        if (capituloId.isEmpty()) {
+            val chapterPageUrl = "$baseUrl${chapter.url}"
+            var html = try {
+                val req = GET(chapterPageUrl, headers)
+                val resp = client.newCall(req).execute()
+                if (resp.isSuccessful) resp.body.string() else ""
+            } catch (_: Throwable) {
+                ""
+            }
+
+            if (html.isEmpty()) {
+                try {
+                    html = webFetch(chapterPageUrl)
+                } catch (_: Throwable) {}
+            }
+
+            capituloId = EXTRACT_CAPITULO_ID_REGEX.find(html)?.groupValues?.get(1) ?: ""
         }
 
-        // 1. Resposta direta da API JSON (/api/chapters/{id}/view-pages)
-        if (body.trimStart().startsWith("{")) {
+        if (capituloId.isEmpty()) {
+            throw Exception("Nenhuma página encontrada!")
+        }
+
+        val apiUrl = "$baseUrl/api/chapters/$capituloId/view-pages"
+        var pages = emptyList<String>()
+
+        // 1. Requisição direta via OkHttp (compatível com Suwayomi + FlareSolverr / proxy)
+        try {
+            val req = GET(
+                url = apiUrl,
+                headers = headers.newBuilder()
+                    .set("Accept", "application/json, text/plain, */*")
+                    .set("Referer", "$baseUrl${chapter.url}")
+                    .build(),
+            )
+            val response = client.newCall(req).execute()
+            if (response.isSuccessful) {
+                val body = response.body.string()
+                pages = extractPageUrls(body)
+            }
+        } catch (_: Throwable) {
+            // Se falhar via OkHttp (ex: 403 Cloudflare no Android sem FlareSolverr), tenta fallback
+        }
+
+        // 2. Fallback via WebView (funciona no Android / Mobile contornando Cloudflare com same-origin fetch)
+        if (pages.isEmpty()) {
             try {
-                val pageListDto = json.decodeFromString<ChapterPagesDto>(body)
-                if (pageListDto.pages.isNotEmpty()) {
-                    return@withContext pageListDto.pages.mapIndexed { index, imageUrl ->
-                        Page(index, imageUrl = imageUrl)
-                    }
-                }
-            } catch (_: Exception) {}
+                val webBody = webFetch(apiUrl)
+                pages = extractPageUrls(webBody)
+            } catch (_: Throwable) {
+                // WebView não disponível no ambiente (ex: Suwayomi sem WebView nativo) ou erro
+            }
         }
 
-        // 2. Fallback para HTML (/series/{slug}/{number})
-        val capituloIdMatch = CAPITULO_ID_REGEX.find(body)
-        if (capituloIdMatch != null) {
-            val id = capituloIdMatch.groupValues[1]
-            val apiUrl = "$baseUrl/api/chapters/$id/view-pages"
-            val apiRequest = GET(apiUrl, headers)
-            val apiResponse = client.newCall(apiRequest).execute()
-            val apiJson = apiResponse.body.string()
-            val pageListDto = json.decodeFromString<ChapterPagesDto>(apiJson)
-            if (pageListDto.pages.isNotEmpty()) {
-                return@withContext pageListDto.pages.mapIndexed { index, imageUrl ->
-                    Page(index, imageUrl = imageUrl)
-                }
+        if (pages.isNotEmpty()) {
+            return@withContext pages.mapIndexed { index, imageUrl ->
+                Page(index, imageUrl = imageUrl)
             }
         }
 
         throw Exception("Nenhuma página encontrada!")
+    }
+
+    private fun extractPageUrls(body: String): List<String> {
+        val trimmed = body.trim()
+
+        // 1. JSON puro
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+                val dto = json.decodeFromString<ChapterPagesDto>(trimmed)
+                if (dto.pages.isNotEmpty()) return dto.pages
+            } catch (_: Exception) {}
+        }
+
+        // 2. Encapsulado em <pre> (retorno do FlareSolverr / Chromium para application/json)
+        val preMatch = PRE_REGEX.find(body)
+        if (preMatch != null) {
+            val preContent = preMatch.groupValues[1].trim()
+            try {
+                val dto = json.decodeFromString<ChapterPagesDto>(preContent)
+                if (dto.pages.isNotEmpty()) return dto.pages
+            } catch (_: Exception) {}
+        }
+
+        // 3. Objeto JSON externo contendo "pages"
+        val firstBrace = body.indexOf('{')
+        val lastBrace = body.lastIndexOf('}')
+        if (firstBrace != -1 && lastBrace > firstBrace) {
+            val candidate = body.substring(firstBrace, lastBrace + 1)
+            try {
+                val dto = json.decodeFromString<ChapterPagesDto>(candidate)
+                if (dto.pages.isNotEmpty()) return dto.pages
+            } catch (_: Exception) {}
+        }
+
+        // 4. Regex fallback diretamente no array "pages": [...]
+        val pagesMatch = PAGES_ARRAY_REGEX.find(body)
+        if (pagesMatch != null) {
+            val urls = IMAGE_URL_REGEX.findAll(pagesMatch.groupValues[1])
+                .map { it.groupValues[1].replace("\\/", "/") }
+                .toList()
+            if (urls.isNotEmpty()) return urls
+        }
+
+        return emptyList()
+    }
+
+    private suspend fun webFetch(url: String): String = runWebView {
+        userAgent = headers["User-Agent"]!!
+        jsBridge("lycanResult") { resolve(it) }
+        jsBridge("lycanError") { reject(IOException(it)) }
+        onPageFinished {
+            evaluateJs(
+                """
+                fetch('$url')
+                    .then(res => res.text())
+                    .then(res => lycanResult.resolve(res))
+                    .catch(err => lycanError.reject(err.message));
+                """.trimIndent(),
+            )
+        }
     }
 
     override fun imageRequest(page: Page): Request = GET(
@@ -372,6 +458,10 @@ abstract class LycanToons : KeiSource() {
         private val RANKING_WEEKLY_REGEX = """\\"lidas:weekly\\"\s*:\s*\{.*?\\"rows\\"\s*:\s*(\[\{.*?\}\])\s*\}""".toRegex()
         private val TOTAL_PAGES_REGEX = """\\"totalPages\\"\s*:\s*(\d+)""".toRegex()
         private val CAPITULO_ID_REGEX = """\\?"capituloId\\?"\s*:\s*(\d+)""".toRegex()
+        private val EXTRACT_CAPITULO_ID_REGEX = """(?:/api/chapters/|capituloId[^0-9]{1,20})(\d+)""".toRegex()
+        private val PRE_REGEX = """<pre[^>]*>(.*?)</pre>""".toRegex(RegexOption.DOT_MATCHES_ALL)
+        private val PAGES_ARRAY_REGEX = """\\?"pages\\?"\s*:\s*\[(.*?)\]""".toRegex(RegexOption.DOT_MATCHES_ALL)
+        private val IMAGE_URL_REGEX = """"(https?:[^"]+)"""".toRegex()
         private val CHAPTERS_REGEX = """\\"chapters\\"\s*:\s*(\[\{.*?\}\])""".toRegex()
         private val CAPITULOS_REGEX = """\\"capitulos\\"\s*:\s*(\[\{.*?\}\])""".toRegex()
         private val GENRES_REGEX = """\\"genre\\":\[(.*?)\]""".toRegex()
