@@ -60,7 +60,15 @@ def parse_name_status(output: str) -> list[tuple[str, list[str]]]:
 
 
 def is_preserved(path: str) -> bool:
-    return path == ".github" or path.startswith(".github/")
+    if path == ".github" or path.startswith(".github/"):
+        return True
+    if path in {
+        "gradle/libs.versions.toml",
+        "gradle/build-logic/src/main/kotlin/io/github/keiyoushi/gradle/internal/Constant.kt",
+        "compiler/src/main/kotlin/keiyoushi/processor/SourceProcessor.kt",
+    }:
+        return True
+    return False
 
 
 def sync_unit(path: str) -> str | None:

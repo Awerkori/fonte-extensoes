@@ -74,3 +74,6 @@ src/pt/zinnes
 src/pt/karikari
 src/pt/onereader
 src/pt/maidscan
+gradle/libs.versions.toml
+gradle/build-logic/src/main/kotlin/io/github/keiyoushi/gradle/internal/Constant.kt
+compiler/src/main/kotlin/keiyoushi/processor/SourceProcessor.kt

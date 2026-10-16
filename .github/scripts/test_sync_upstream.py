@@ -235,6 +235,9 @@ class StructuralMetadataTest(unittest.TestCase):
 
     def test_github_paths_and_source_are_preserved(self):
         self.assertIsNone(sync_upstream.sync_unit(".github/workflows/sync_upstream.yml"))
+        self.assertIsNone(sync_upstream.sync_unit("gradle/libs.versions.toml"))
+        self.assertIsNone(sync_upstream.sync_unit("gradle/build-logic/src/main/kotlin/io/github/keiyoushi/gradle/internal/Constant.kt"))
+        self.assertIsNone(sync_upstream.sync_unit("compiler/src/main/kotlin/keiyoushi/processor/SourceProcessor.kt"))
         result, _ = self.apply('libVersion = "1.4"\nsource {\n baseUrl = "https://nox"\n}\n', 'libVersion = "1.6"\n')
         self.assertIn("https://nox", result)
 
