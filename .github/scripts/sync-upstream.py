@@ -1634,6 +1634,61 @@ def _write_step_summary(protected_units: list[str], bumped: list[str]) -> None:
         f.writelines(lines)
 
 
+def print_observability_header(
+    project: str,
+    trigger: str,
+    local_head: str,
+    upstream_remote: str,
+    upstream_branch: str,
+    upstream_head: str,
+    last_synced_upstream: str,
+    new_units: list[str],
+    updated_units: list[str],
+    removed_units: list[str],
+    core_changed: bool,
+    multisrc_changed: bool,
+    no_changes: bool,
+) -> None:
+    print("==================================================")
+    print("PROJECT NOX — UPSTREAM SYNC")
+    print("==================================================")
+    print(f"SYNC_PROJECT={project}")
+    print(f"SYNC_TRIGGER={trigger}")
+    print(f"LOCAL_HEAD={local_head}")
+    print(f"UPSTREAM_REMOTE={upstream_remote}")
+    print(f"UPSTREAM_BRANCH={upstream_branch}")
+    print(f"UPSTREAM_HEAD={upstream_head}")
+    print(f"LAST_SYNCED_UPSTREAM={last_synced_upstream}")
+    print(f"NEW_COUNT={len(new_units)}")
+    print(f"UPDATED_COUNT={len(updated_units)}")
+    print(f"REMOVED_COUNT={len(removed_units)}")
+    print(f"CORE_CHANGED={str(core_changed).lower()}")
+    print(f"MULTISRC_CHANGED={str(multisrc_changed).lower()}")
+    print(f"NO_CHANGES={str(no_changes).lower()}")
+    print("==================================================")
+    if not no_changes:
+        print("Detected units:")
+        if new_units:
+            print(f"  NEW ({len(new_units)}): {', '.join(sorted(new_units))}")
+        if updated_units:
+            print(f"  UPDATED ({len(updated_units)}): {', '.join(sorted(updated_units))}")
+        if removed_units:
+            print(f"  REMOVED ({len(removed_units)}): {', '.join(sorted(removed_units))}")
+        print("==================================================")
+
+
+def print_observability_footer(
+    sync_result: str,
+    push_result: str,
+    publication_result: str,
+) -> None:
+    print("==================================================")
+    print(f"SYNC_RESULT={sync_result}")
+    print(f"PUSH_RESULT={push_result}")
+    print(f"PUBLICATION_RESULT={publication_result}")
+    print("==================================================")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -1724,10 +1779,6 @@ def main() -> None:
     diff_units, _ = collect_units(diff_entries)
     effective_diff = pending_sync_units(diff_units, protected_units, upstream_ref)
 
-    if not upstream_units and not load_deferred_migrations() and not effective_diff:
-        print("No upstream changes to apply")
-        return
-        
     if not upstream_units and effective_diff:
         print(f"Sync branch is up to date, but main is missing {len(effective_diff)} updates. Proceeding.")
         upstream_units = effective_diff
@@ -1740,8 +1791,59 @@ def main() -> None:
         effective_diff, protected_units, upstream_ref,
     ))
 
+    # Observability: categorize detected units
+    new_units = []
+    updated_units = []
+    removed_units = []
+    for unit in upstream_units:
+        if path_exists(base, unit) and not path_exists(upstream_ref, unit):
+            removed_units.append(unit)
+        elif not path_exists(base, unit) and path_exists(upstream_ref, unit):
+            new_units.append(unit)
+        else:
+            updated_units.append(unit)
+
+    core_changed = any(
+        path in {"core", "common"} or path.startswith(("core/", "common/", "gradle/"))
+        for _, paths in upstream_entries
+        for path in paths
+    )
+    multisrc_changed = any(
+        path.startswith("lib-multisrc/")
+        for _, paths in upstream_entries
+        for path in paths
+    )
+    no_changes = (not upstream_units and not load_deferred_migrations() and not effective_diff)
+
+    trigger = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
+    local_head = git("rev-parse", "HEAD").strip()
+    upstream_head = git("rev-parse", upstream_ref).strip()
+    last_synced = git("rev-parse", "origin/sync", check=False).strip() or base
+
+    print_observability_header(
+        project="manga",
+        trigger=trigger,
+        local_head=local_head,
+        upstream_remote=UPSTREAM_URL,
+        upstream_branch=UPSTREAM_BRANCH,
+        upstream_head=upstream_head,
+        last_synced_upstream=last_synced,
+        new_units=new_units,
+        updated_units=updated_units,
+        removed_units=removed_units,
+        core_changed=core_changed,
+        multisrc_changed=multisrc_changed,
+        no_changes=no_changes,
+    )
+
+    if no_changes:
+        print("No upstream changes to apply")
+        print_observability_footer("NO_CHANGES", "SKIPPED", "SKIPPED")
+        return
+
     if args.dry_run or not (args.push or args.apply_no_push):
         print("Dry run only; no changes were applied")
+        print_observability_footer("SUCCESS", "SKIPPED", "SKIPPED")
         return
 
     proven, multisrc_deferred = prove_protected_multisrc(base, upstream_ref, protected_units, preflight_blocked)
@@ -1778,11 +1880,14 @@ def main() -> None:
     if args.push:
         try:
             publish_sync(upstream_ref, start_main)
+            print_observability_footer("SUCCESS", "SUCCESS", "TRIGGERED")
         except RuntimeError as error:
             print(f"Publish aborted: {error}", file=sys.stderr)
+            print_observability_footer("FAILED", "FAILED", "FAILED")
             sys.exit(1)
     else:
         print("Applied and validated locally; no push requested")
+        print_observability_footer("SUCCESS", "SKIPPED", "SKIPPED")
 
 
 if __name__ == "__main__":

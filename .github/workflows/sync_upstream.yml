@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "*/5 * * * *"
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
 
 concurrency:
   group: sync-upstream
@@ -33,6 +34,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Sync upstream
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           MAX_ATTEMPTS=3
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do

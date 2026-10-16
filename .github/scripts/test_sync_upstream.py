@@ -2020,5 +2020,104 @@ class BuildMatrixTest(unittest.TestCase):
         ))
 
 
+class UpstreamBatchAndObservabilityTest(unittest.TestCase):
+    def test_observability_formatting(self):
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            sync_upstream.print_observability_header(
+                project="manga",
+                trigger="schedule",
+                local_head="loc123",
+                upstream_remote="https://github.com/keiyoushi/extensions-source.git",
+                upstream_branch="main",
+                upstream_head="up456",
+                last_synced_upstream="last789",
+                new_units=["src/pt/newone"],
+                updated_units=["src/en/updone"],
+                removed_units=["src/vi/delone"],
+                core_changed=False,
+                multisrc_changed=True,
+                no_changes=False,
+            )
+            sync_upstream.print_observability_footer(
+                sync_result="SUCCESS",
+                push_result="SUCCESS",
+                publication_result="TRIGGERED",
+            )
+        output = f.getvalue()
+        self.assertIn("SYNC_PROJECT=manga", output)
+        self.assertIn("SYNC_TRIGGER=schedule", output)
+        self.assertIn("LOCAL_HEAD=loc123", output)
+        self.assertIn("UPSTREAM_HEAD=up456", output)
+        self.assertIn("LAST_SYNCED_UPSTREAM=last789", output)
+        self.assertIn("NEW_COUNT=1", output)
+        self.assertIn("UPDATED_COUNT=1", output)
+        self.assertIn("REMOVED_COUNT=1", output)
+        self.assertIn("CORE_CHANGED=false", output)
+        self.assertIn("MULTISRC_CHANGED=true", output)
+        self.assertIn("NO_CHANGES=false", output)
+        self.assertIn("SYNC_RESULT=SUCCESS", output)
+        self.assertIn("PUSH_RESULT=SUCCESS", output)
+        self.assertIn("PUBLICATION_RESULT=TRIGGERED", output)
+
+    def test_upstream_advances_multiple_commits_batch_detected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            
+            def rgit(*args):
+                res = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr)
+                return res.stdout.strip()
+
+            rgit("init", "-b", "main")
+            rgit("config", "user.name", "Tester")
+            rgit("config", "user.email", "tester@test.local")
+            
+            # Base commit
+            (repo / "src/en/updext").mkdir(parents=True)
+            (repo / "src/en/updext/build.gradle.kts").write_text("extVersionCode = 1\n")
+            (repo / "src/vi/delext").mkdir(parents=True)
+            (repo / "src/vi/delext/build.gradle.kts").write_text("extVersionCode = 1\n")
+            rgit("add", ".")
+            rgit("commit", "-m", "base")
+            base_sha = rgit("rev-parse", "HEAD")
+
+            # Upstream branch
+            rgit("branch", "upstream-branch")
+            rgit("checkout", "upstream-branch")
+
+            # Upstream commit 1: add new extension
+            (repo / "src/pt/newext").mkdir(parents=True)
+            (repo / "src/pt/newext/build.gradle.kts").write_text("extVersionCode = 1\n")
+            rgit("add", ".")
+            rgit("commit", "-m", "upstream commit 1: add newext")
+
+            # Upstream commit 2: update existing extension
+            (repo / "src/en/updext/build.gradle.kts").write_text("extVersionCode = 2\n")
+            rgit("add", ".")
+            rgit("commit", "-m", "upstream commit 2: update updext")
+
+            # Upstream commit 3: remove dead extension
+            rgit("rm", "-r", "src/vi/delext")
+            rgit("commit", "-m", "upstream commit 3: remove delext")
+
+            # Switch back to local main
+            rgit("checkout", "main")
+
+            # Verify that changed_entries across the range captures all 3 units regardless of commit count
+            raw_diff = subprocess.run(
+                ["git", "diff", "--name-status", "--find-renames", "-z", base_sha, "upstream-branch"],
+                cwd=repo, capture_output=True, text=True,
+            ).stdout
+            entries = sync_upstream.parse_name_status(raw_diff)
+            units, _ = sync_upstream.collect_units(entries)
+
+            self.assertEqual(sorted(units), ["src/en/updext", "src/pt/newext", "src/vi/delext"])
+
+
 if __name__ == "__main__":
     unittest.main()
