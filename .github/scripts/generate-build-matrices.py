@@ -192,7 +192,10 @@ def get_all_modules() -> tuple[list[str], list[str]]:
 
 def main() -> None:
     _, ref, build_type = sys.argv
-    modules, deleted = get_module_list(ref)
+    if os.getenv("FORCE_ALL", "").lower() in ("true", "1", "yes"):
+        modules, deleted = get_all_modules()
+    else:
+        modules, deleted = get_module_list(ref)
 
     chunked = {
         "chunk": [
@@ -205,12 +208,45 @@ def main() -> None:
         ]
     }
 
+    module_count = len(modules)
+    delete_count = len(deleted)
+    has_build_modules = module_count > 0
+    has_deletions = delete_count > 0
+
+    if has_build_modules and has_deletions:
+        publish_reason = "BUILD_AND_DELETE"
+    elif has_build_modules:
+        publish_reason = "BUILD"
+    elif has_deletions:
+        publish_reason = "DELETE"
+    else:
+        publish_reason = "NONE"
+
+    publish_required = has_build_modules or has_deletions
+
+    print("========================================")
+    print(f"BUILD_MATRIX_MODULE_COUNT={module_count}")
+    print(f"DELETE_COUNT={delete_count}")
+    print(f"HAS_BUILD_MODULES={'true' if has_build_modules else 'false'}")
+    print(f"HAS_DELETIONS={'true' if has_deletions else 'false'}")
+    print(f"PUBLISH_REQUIRED={'true' if publish_required else 'false'}")
+    print(f"PUBLISH_REASON={publish_reason}")
+    print("========================================")
+
     print(f"Module chunks to build:\n{json.dumps(chunked, indent=2)}\n\nModule to delete:\n{json.dumps(deleted, indent=2)}")
 
-    if os.getenv("CI") == "true":
-        with open(os.getenv("GITHUB_OUTPUT"), 'a') as out_file:
+    github_output = os.getenv("GITHUB_OUTPUT")
+    if github_output and (os.getenv("CI") == "true" or Path(github_output).exists()):
+        with open(github_output, 'a') as out_file:
             out_file.write(f"matrix={json.dumps(chunked)}\n")
             out_file.write(f"delete={json.dumps(deleted)}\n")
+            out_file.write(f"has_build_modules={'true' if has_build_modules else 'false'}\n")
+            out_file.write(f"has_deletions={'true' if has_deletions else 'false'}\n")
+            out_file.write(f"publish_required={'true' if publish_required else 'false'}\n")
+            out_file.write(f"publish_reason={publish_reason}\n")
+            out_file.write(f"module_count={module_count}\n")
+            out_file.write(f"delete_count={delete_count}\n")
 
 if __name__ == '__main__':
+
     main()

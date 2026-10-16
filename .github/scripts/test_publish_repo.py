@@ -8,11 +8,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from google.protobuf import json_format
+try:
+    from google.protobuf import json_format
+    import index_pb2
+    from legacy_index import update_legacy_index
+    HAS_PROTOBUF = True
+except ImportError:
+    HAS_PROTOBUF = False
+    update_legacy_index = None
 
 import github_utils
-import index_pb2
-from legacy_index import update_legacy_index
+
 
 
 PREFIX = "eu.kanade.tachiyomi.extension.pt."
@@ -20,6 +26,8 @@ SCRIPT = Path(__file__).with_name("publish-repo.py")
 
 
 def extension(slug="geasscomics", version=5):
+    if not HAS_PROTOBUF:
+        return None
     return index_pb2.Extension(
         name={"geasscomics": "Geass Comics", "karikari": "KariKari", "onereader": "OneReader"}.get(slug, slug),
         packageName=PREFIX + slug,
@@ -41,6 +49,7 @@ def legacy(ext):
     }
 
 
+@unittest.skipUnless(HAS_PROTOBUF, "protobuf is required for legacy index tests")
 class LegacyIndexTest(unittest.TestCase):
     def setUp(self):
         self.old = [legacy(extension()), legacy(extension("karikari", 1)), legacy(extension("onereader", 3))]
@@ -102,6 +111,7 @@ class LegacyIndexTest(unittest.TestCase):
             update_legacy_index([], [ext], [])
 
 
+@unittest.skipUnless(HAS_PROTOBUF, "protobuf is required for publisher tests")
 class PublisherTest(unittest.TestCase):
     def simulate(self, modern, old, update=None, deleted=()):
         with tempfile.TemporaryDirectory(prefix="nox-publisher-test-") as directory:

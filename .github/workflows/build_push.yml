@@ -11,6 +11,16 @@ on:
       - '.github/scripts/**'
       - '.github/workflows/build_push.yml'
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Git base commit SHA to diff against (optional, defaults to last successful CI commit)'
+        required: false
+        default: ''
+      force_all:
+        description: 'Force building and publishing all extensions'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -30,6 +40,12 @@ jobs:
     outputs:
       matrix: ${{ steps.generate-matrices.outputs.matrix }}
       delete: ${{ steps.generate-matrices.outputs.delete }}
+      has_build_modules: ${{ steps.generate-matrices.outputs.has_build_modules }}
+      has_deletions: ${{ steps.generate-matrices.outputs.has_deletions }}
+      publish_required: ${{ steps.generate-matrices.outputs.publish_required }}
+      publish_reason: ${{ steps.generate-matrices.outputs.publish_reason }}
+      module_count: ${{ steps.generate-matrices.outputs.module_count }}
+      delete_count: ${{ steps.generate-matrices.outputs.delete_count }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,21 +54,26 @@ jobs:
           persist-credentials: false
 
       - name: Get last successful CI commit
+        if: ${{ !(inputs.base_sha) }}
         uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
         with:
           fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
 
       - id: generate-matrices
         name: Create output matrices
+        env:
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+          FORCE_ALL: ${{ inputs.force_all }}
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+          TARGET_BASE="${INPUT_BASE_SHA:-$NX_BASE}"
+          python ./.github/scripts/generate-build-matrices.py "$TARGET_BASE" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    if: needs.prepare.outputs.has_build_modules == 'true'
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
@@ -103,14 +124,18 @@ jobs:
   publish:
     name: Publish extension repo
     needs: [prepare, build]
-    # Run whenever there's anything to publish, new/changed builds OR only deletions
+    # Run whenever there is anything to publish (new/changed builds OR deletions)
     if: >-
       always() &&
       github.repository == 'Awerkori/fonte-extensoes' &&
       needs.prepare.result == 'success' &&
+      needs.prepare.outputs.publish_required == 'true' &&
+      (
+        needs.prepare.outputs.has_build_modules != 'true' ||
+        needs.build.result == 'success'
+      ) &&
       needs.build.result != 'failure' &&
-      needs.build.result != 'cancelled' &&
-      needs.prepare.outputs.delete != '[]'
+      needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -151,8 +176,14 @@ jobs:
             git add .
             git commit -m "Update extensions repo"
             git push
+            CATALOG_COMMIT=$(git rev-parse HEAD)
+            echo "CATALOG_CHANGED=true"
+            echo "CATALOG_COMMIT=$CATALOG_COMMIT"
             curl https://purge.jsdelivr.net/gh/Awerkori/extensoes@repo/index.json
             curl https://purge.jsdelivr.net/gh/Awerkori/extensoes@repo/index.pb
           else
+            echo "CATALOG_CHANGED=false"
+            echo "CATALOG_COMMIT=NONE"
             echo "No changes to commit"
           fi
+

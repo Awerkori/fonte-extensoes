@@ -68,12 +68,13 @@ def get_icon_url(module: str, theme: str | None) -> str:
         if (SOURCE_DIR / theme_icon).exists():
             return f"{ICON_BASE_URL}/{theme_icon}"
 
-    return f"{ICON_BASE_URL}/core/src/main/{ICON_FILE}"
+artifacts = list(ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json")) if ARTIFACTS_DIR.exists() else []
+print(f"ARTIFACTS_FOUND={len(artifacts)}")
 
-
-for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
+for info_file in artifacts:
     with info_file.open(encoding="utf-8") as f:
         info = json.load(f)
+
     package_name = info["packageName"]
     apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
     if apk is None:
