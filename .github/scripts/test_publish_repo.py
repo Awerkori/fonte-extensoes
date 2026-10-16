@@ -167,6 +167,300 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(removed, old[1:])
         self.assertEqual(calls, [])
 
+    def test_case_a_schalenetwork_replaces_koharu_without_duplicate(self):
+        koharu_pkg = "eu.kanade.tachiyomi.extension.all.koharu"
+        old_koharu = index_pb2.Extension(
+            name="SchaleNetwork",
+            packageName=koharu_pkg,
+            extensionLib="1.6",
+            versionCode=106000,
+            versionName="1.6.0",
+            contentWarning=index_pb2.CONTENT_WARNING_NSFW,
+            resources=index_pb2.Resources(
+                apkUrl=f"https://example.org/tachiyomi-all.koharu-v1.6.0.apk",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
+            ),
+            sources=[index_pb2.Source(id=1484902275639232927, name="SchaleNetwork", language="all", homeUrl="https://shupogaki.moe")],
+        )
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[old_koharu]))
+        old = [legacy(old_koharu)]
+
+        new_koharu = index_pb2.Extension()
+        new_koharu.CopyFrom(old_koharu)
+        new_koharu.versionCode = 106001
+        new_koharu.versionName = "1.6.1"
+
+        with tempfile.TemporaryDirectory(prefix="nox-case-a-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "all.schalenetwork" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-all.koharu-v1.6.1.{kind}").write_bytes(b"new-build")
+
+            info = json_format.MessageToDict(new_koharu, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = new_koharu.contentWarning
+            info["module"] = "all.schalenetwork"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in new_koharu.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), json.dumps(["all.schalenetwork"]), "fixture-sha"]):
+                    runpy.run_path(str(SCRIPT), run_name="__main__")
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                koharu_entries = [e for e in current.extensionList.extensions if e.packageName == koharu_pkg]
+                self.assertEqual(len(koharu_entries), 1)
+                self.assertEqual(koharu_entries[0].versionCode, 106001)
+
+                legacy_entries = json.loads((root / "index.min.json").read_text())
+                legacy_koharu = [e for e in legacy_entries if e["pkg"] == koharu_pkg]
+                self.assertEqual(len(legacy_koharu), 1)
+                self.assertEqual(legacy_koharu[0]["code"], 1)
+
+                html_content = (root / "index.html").read_text()
+                self.assertEqual(html_content.count("Tachiyomi: SchaleNetwork"), 1)
+            finally:
+                os.chdir(previous)
+
+    def test_case_b_brainrotcomics_replaces_aryascans(self):
+        arya_pkg = "eu.kanade.tachiyomi.extension.en.aryascans"
+        old_arya = index_pb2.Extension(
+            name="BrainRotComics",
+            packageName=arya_pkg,
+            extensionLib="1.6",
+            versionCode=106057,
+            versionName="1.6.57",
+            contentWarning=index_pb2.CONTENT_WARNING_MIXED,
+            resources=index_pb2.Resources(
+                apkUrl=f"https://example.org/tachiyomi-en.aryascans-v1.6.57.apk",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/en/brainrotcomics/res/mipmap-xhdpi/ic_launcher.png",
+            ),
+            sources=[index_pb2.Source(id=12345, name="BrainRotComics", language="en", homeUrl="https://brainrot.example")],
+        )
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[old_arya]))
+        old = [legacy(old_arya)]
+
+        new_arya = index_pb2.Extension()
+        new_arya.CopyFrom(old_arya)
+        new_arya.versionCode = 106058
+        new_arya.versionName = "1.6.58"
+
+        with tempfile.TemporaryDirectory(prefix="nox-case-b-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "en.brainrotcomics" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-en.aryascans-v1.6.58.{kind}").write_bytes(b"new-build")
+
+            info = json_format.MessageToDict(new_arya, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = new_arya.contentWarning
+            info["module"] = "en.brainrotcomics"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in new_arya.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), json.dumps(["en.brainrotcomics"]), "fixture-sha"]):
+                    runpy.run_path(str(SCRIPT), run_name="__main__")
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                arya_entries = [e for e in current.extensionList.extensions if e.packageName == arya_pkg]
+                self.assertEqual(len(arya_entries), 1)
+                self.assertEqual(arya_entries[0].versionCode, 106058)
+            finally:
+                os.chdir(previous)
+
+    def test_case_d_removed_module_with_different_pkgname_deletes_cleanly(self):
+        koharu_pkg = "eu.kanade.tachiyomi.extension.all.koharu"
+        old_koharu = index_pb2.Extension(
+            name="SchaleNetwork",
+            packageName=koharu_pkg,
+            extensionLib="1.6",
+            versionCode=106000,
+            versionName="1.6.0",
+            contentWarning=index_pb2.CONTENT_WARNING_NSFW,
+            resources=index_pb2.Resources(
+                apkUrl=f"https://example.org/tachiyomi-all.koharu-v1.6.0.apk",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
+            ),
+            sources=[index_pb2.Source(id=1484902275639232927, name="SchaleNetwork", language="all", homeUrl="https://shupogaki.moe")],
+        )
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[old_koharu, extension("karikari", 1)]))
+        old = [legacy(old_koharu), legacy(extension("karikari", 1))]
+
+        with tempfile.TemporaryDirectory(prefix="nox-case-d-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+            (root / "release-assets.json").write_text(json.dumps({koharu_pkg: {"apk": {"name": "a.apk", "sha256": "123"}}}), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), json.dumps(["all.schalenetwork"]), "fixture-sha"]):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as error:
+                        self.assertEqual(error.code, 0)
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                koharu_entries = [e for e in current.extensionList.extensions if e.packageName == koharu_pkg]
+                self.assertEqual(len(koharu_entries), 0)
+
+                release_assets = json.loads((root / "release-assets.json").read_text())
+                self.assertNotIn(koharu_pkg, release_assets)
+
+                legacy_entries = json.loads((root / "index.min.json").read_text())
+                self.assertNotIn(koharu_pkg, [e["pkg"] for e in legacy_entries])
+            finally:
+                os.chdir(previous)
+
+    def test_case_e_duplicate_artifact_package_aborts(self):
+        ext1 = extension(slug="geasscomics", version=5)
+        ext2 = extension(slug="geasscomics", version=6)
+
+        with tempfile.TemporaryDirectory(prefix="nox-case-e-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(index_pb2.Index()), encoding="utf-8")
+
+            # Create two different artifact folders producing the SAME packageName
+            for i, ext in enumerate((ext1, ext2)):
+                build = root / "apk-artifacts" / f"mod_{i}" / "build"
+                for kind in ("apk", "jar"):
+                    out = build / "outputs" / kind / "release"
+                    out.mkdir(parents=True)
+                    (out / f"tachiyomi-pt.geasscomics-v1.6.{5+i}.{kind}").write_bytes(b"data")
+                info = json_format.MessageToDict(ext, preserving_proto_field_name=True)
+                info["versionCode"] = int(info["versionCode"])
+                info["contentWarning"] = ext.contentWarning
+                info["module"] = "pt.geasscomics"
+                info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in ext.sources]
+                (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.object(Path, "home", return_value=root), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]):
+                    with self.assertRaises(ValueError) as ctx:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    self.assertIn("DUPLICATE_PACKAGE_NAME=", str(ctx.exception))
+            finally:
+                os.chdir(previous)
+
+    def test_idempotency_second_run_produces_zero_diff(self):
+        ext = extension(slug="geasscomics", version=6)
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[extension(slug="geasscomics", version=5)]))
+        old = [legacy(extension(slug="geasscomics", version=5))]
+
+        with tempfile.TemporaryDirectory(prefix="nox-idempotency-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            build = root / "apk-artifacts" / "pt.geasscomics" / "build"
+            for kind in ("apk", "jar"):
+                out = build / "outputs" / kind / "release"
+                out.mkdir(parents=True)
+                (out / f"tachiyomi-pt.geasscomics-v1.6.6.{kind}").write_bytes(b"fixed-asset")
+            info = json_format.MessageToDict(ext, preserving_proto_field_name=True)
+            info["versionCode"] = int(info["versionCode"])
+            info["contentWarning"] = ext.contentWarning
+            info["module"] = "pt.geasscomics"
+            info["sources"] = [{"id": s.id, "name": s.name, "lang": s.language, "baseUrl": s.homeUrl} for s in ext.sources]
+            (build / "keiyoushi-source-info.json").write_text(json.dumps(info), encoding="utf-8")
+
+            calls = []
+            def github(*args, **kwargs):
+                calls.append(args)
+                return '{"assets":[]}' if args[:2] == ("release", "view") and "assets" in args else ""
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                # First publication run
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", side_effect=github), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]):
+                    runpy.run_path(str(SCRIPT), run_name="__main__")
+
+                # Snapshot of all catalog files
+                index_json_1 = (root / "index.json").read_bytes()
+                index_min_1 = (root / "index.min.json").read_bytes()
+                index_pb_1 = (root / "index.pb").read_bytes()
+                release_assets_1 = (root / "release-assets.json").read_bytes()
+                index_html_1 = (root / "index.html").read_bytes()
+
+                calls.clear()
+
+                # Second publication run with the EXACT SAME artifacts
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", side_effect=github), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as error:
+                        self.assertEqual(error.code, 0)
+
+                # Verify byte-for-byte identity
+                self.assertEqual((root / "index.json").read_bytes(), index_json_1)
+                self.assertEqual((root / "index.min.json").read_bytes(), index_min_1)
+                self.assertEqual((root / "index.pb").read_bytes(), index_pb_1)
+                self.assertEqual((root / "release-assets.json").read_bytes(), release_assets_1)
+                self.assertEqual((root / "index.html").read_bytes(), index_html_1)
+
+                # Verify no new release uploads were triggered
+                release_creates = [c for c in calls if c[:2] == ("release", "create")]
+                self.assertEqual(len(release_creates), 0)
+            finally:
+                os.chdir(previous)
+
+    def test_remote_catalog_with_duplicates_is_deduplicated_by_highest_version(self):
+        # Create remote index with 3 duplicate instances of koharu
+        v0 = extension("geasscomics", 1)
+        v0.versionCode = 106001
+        v0.versionName = "1.6.1"
+
+        v1 = extension("geasscomics", 2)
+        v1.versionCode = 106002
+        v1.versionName = "1.6.2"
+
+        v2 = extension("geasscomics", 3)
+        v2.versionCode = 106003
+        v2.versionName = "1.6.3"
+
+        # Modern index contains all 3 copies
+        modern = index_pb2.Index(extensionList=index_pb2.ExtensionList(extensions=[v0, v2, v1]))
+        old = [legacy(v2)]
+
+        with tempfile.TemporaryDirectory(prefix="nox-dedup-") as directory:
+            root = Path(directory)
+            (root / "index.json").write_text(json_format.MessageToJson(modern), encoding="utf-8")
+            (root / "index.min.json").write_text(json.dumps(old), encoding="utf-8")
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                # Run publisher with no new artifacts
+                with patch.object(Path, "home", return_value=root), patch.object(github_utils, "run_gh", return_value='{"assets":[]}'), patch("sys.argv", [str(SCRIPT), "[]", "fixture-sha"]):
+                    try:
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
+                    except SystemExit as error:
+                        self.assertEqual(error.code, 0)
+
+                current = json_format.Parse((root / "index.json").read_text(), index_pb2.Index())
+                geass_entries = [e for e in current.extensionList.extensions if e.packageName == PREFIX + "geasscomics"]
+                self.assertEqual(len(geass_entries), 1)
+                self.assertEqual(geass_entries[0].versionCode, 106003)
+                self.assertEqual(geass_entries[0].versionName, "1.6.3")
+            finally:
+                os.chdir(previous)
+
     @unittest.skipUnless(os.environ.get("NOX_PUBLISHER_SNAPSHOT"), "optional public snapshot")
     def test_public_snapshot_only_geass_changes(self):
         directory = Path(os.environ["NOX_PUBLISHER_SNAPSHOT"])

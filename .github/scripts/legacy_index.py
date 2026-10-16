@@ -6,10 +6,11 @@ import index_pb2
 def update_legacy_index(existing, published, removed_modules):
     """Apply the same explicit publication batch to the historical v1 catalog."""
     previous = {entry["pkg"]: entry for entry in existing}
+    removed_set = set(removed_modules)
     entries = {
         package: entry
         for package, entry in previous.items()
-        if not any(package.endswith(f".{module}") for module in removed_modules)
+        if package not in removed_set and not any(package.endswith(f".{module}") for module in removed_set)
     }
     for extension in published:
         package = extension.packageName
@@ -41,4 +42,7 @@ def update_legacy_index(existing, published, removed_modules):
             "nsfw": int(extension.contentWarning == index_pb2.CONTENT_WARNING_NSFW),
             "sources": sources,
         }
-    return [entries[package] for package in sorted(entries)]
+    result = [entries[package] for package in sorted(entries)]
+    if len(result) != len({e["pkg"] for e in result}):
+        raise ValueError("Duplicate packages detected in legacy index")
+    return result

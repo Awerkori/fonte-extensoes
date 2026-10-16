@@ -3,6 +3,7 @@ import hashlib
 import html
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -32,9 +33,62 @@ current_sha_short = current_sha[:7]
 with REPO_DIR.joinpath("index.json").open() as f:
     remote_proto = json_format.Parse(f.read(), index_pb2.Index())
 
-remote_extensions = {
-    ext.packageName: ext for ext in remote_proto.extensionList.extensions
-}
+# Deduplicate remote extensions canonically by packageName:
+# 1. Highest versionCode wins
+# 2. If tied, prefer entry with valid resources
+canonical_remote: dict[str, index_pb2.Extension] = {}
+for ext in remote_proto.extensionList.extensions:
+    pkg = ext.packageName
+    if pkg not in canonical_remote:
+        canonical_remote[pkg] = ext
+    else:
+        existing = canonical_remote[pkg]
+        if ext.versionCode > existing.versionCode:
+            canonical_remote[pkg] = ext
+        elif ext.versionCode == existing.versionCode:
+            if not existing.resources.apkUrl and ext.resources.apkUrl:
+                canonical_remote[pkg] = ext
+
+remote_extensions = canonical_remote
+
+SOURCE_DIR = Path(__file__).resolve().parents[2]
+ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
+
+
+def resolve_module_to_packages(module: str, remote_exts: dict[str, index_pb2.Extension]) -> set[str]:
+    """Resolve a module identifier or package name to its canonical Android package name(s)."""
+    if module.startswith("eu.kanade.tachiyomi.extension."):
+        return {module}
+
+    resolved = set()
+    parts = module.split(".", 1)
+    if len(parts) == 2:
+        build_file = SOURCE_DIR / "src" / parts[0] / parts[1] / "build.gradle.kts"
+        if build_file.is_file():
+            content = build_file.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r'pkgName\s*=\s*["\']([^"\']+)["\']', content)
+            if match:
+                resolved.add(f"eu.kanade.tachiyomi.extension.{match.group(1)}")
+            else:
+                resolved.add(f"eu.kanade.tachiyomi.extension.{module}")
+
+    if not resolved:
+        mod_icon_path = f"/src/{module.replace('.', '/')}/"
+        for ext in remote_exts.values():
+            if mod_icon_path in ext.resources.iconUrl:
+                resolved.add(ext.packageName)
+            elif ext.packageName == f"eu.kanade.tachiyomi.extension.{module}" or ext.packageName.endswith(f".{module}"):
+                resolved.add(ext.packageName)
+
+    if not resolved:
+        resolved.add(f"eu.kanade.tachiyomi.extension.{module}")
+
+    return resolved
+
+
+deleted_packages: set[str] = set()
+for mod in to_delete:
+    deleted_packages.update(resolve_module_to_packages(mod, canonical_remote))
 
 release_assets_path = REPO_DIR / "release-assets.json"
 if release_assets_path.exists():
@@ -44,18 +98,10 @@ else:
     release_assets = {}
 
 updated_release_assets = {
-    package_name: assets
-    for package_name, assets in release_assets.items()
-    if not any(package_name.endswith(f".{module}") for module in to_delete)
+    pkg: assets
+    for pkg, assets in release_assets.items()
+    if pkg not in deleted_packages
 }
-
-# Build index entries for the freshly built apks. Each extension's metadata comes from the
-# source-info JSON emitted by its assembleRelease task (see GenerateSourceInfoTask); its APK is a
-# sibling in the same build dir. aapt reads the icon out of the APK
-new_extensions: list[tuple[index_pb2.Extension, Path, Path, bool, bool]] = []
-
-SOURCE_DIR = Path(__file__).resolve().parents[2]
-ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
 
 
 def get_icon_url(module: str, theme: str | None) -> str:
@@ -68,14 +114,23 @@ def get_icon_url(module: str, theme: str | None) -> str:
         if (SOURCE_DIR / theme_icon).exists():
             return f"{ICON_BASE_URL}/{theme_icon}"
 
+    return ""
+
+
 artifacts = list(ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json")) if ARTIFACTS_DIR.exists() else []
 print(f"ARTIFACTS_FOUND={len(artifacts)}")
+
+new_by_package: dict[str, tuple[index_pb2.Extension, Path, Path, bool, bool]] = {}
 
 for info_file in artifacts:
     with info_file.open(encoding="utf-8") as f:
         info = json.load(f)
 
     package_name = info["packageName"]
+    if package_name in new_by_package:
+        print(f"DUPLICATE_PACKAGE_NAME={package_name}")
+        raise ValueError(f"DUPLICATE_PACKAGE_NAME={package_name}: duplicate artifact package in build")
+
     apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
     if apk is None:
         raise FileNotFoundError(
@@ -100,11 +155,11 @@ for info_file in artifacts:
     }
     old_assets = release_assets.get(package_name, {})
     apk_changed = (
-        package_name not in remote_extensions
+        package_name not in canonical_remote
         or old_assets.get("apk") != assets["apk"]
     )
     jar_changed = (
-        package_name not in remote_extensions
+        package_name not in canonical_remote
         or old_assets.get("jar") != assets["jar"]
     )
 
@@ -117,7 +172,7 @@ for info_file in artifacts:
             iconUrl=get_icon_url(info["module"], info.get("theme")),
         ),
         extensionLib=info["extensionLib"],
-        versionCode=info["versionCode"],
+        versionCode=int(info["versionCode"]),
         versionName=info["versionName"],
         contentWarning=info["contentWarning"],
         sources=[
@@ -131,9 +186,9 @@ for info_file in artifacts:
             for source in info["sources"]
         ],
     )
-    new_extensions.append((ext, apk, jar, apk_changed, jar_changed))
+    new_by_package[package_name] = (ext, apk, jar, apk_changed, jar_changed)
 
-new_extensions.sort(key=lambda item: item[0].packageName)
+new_extensions = sorted(new_by_package.values(), key=lambda item: item[0].packageName)
 
 changed_extensions = [item for item in new_extensions if item[3] or item[4]]
 total_changed_extensions = len(changed_extensions)
@@ -157,39 +212,74 @@ changed_index = 0
 for ext, apk, jar, apk_changed, jar_changed in new_extensions:
     if apk_changed or jar_changed:
         tag = get_release_tag(changed_index // ext_per_release)
-        old_resources = remote_extensions.get(ext.packageName)
+        old_resources = canonical_remote.get(ext.packageName)
         ext.resources.apkUrl = (
             f"{RELEASE_BASE_URL}/{tag}/{apk.name}"
-            if apk_changed
+            if apk_changed or not old_resources or not old_resources.resources.apkUrl
             else old_resources.resources.apkUrl
         )
         ext.resources.jarUrl = (
             f"{RELEASE_BASE_URL}/{tag}/{jar.name}"
-            if jar_changed
+            if jar_changed or not old_resources or not old_resources.resources.jarUrl
             else old_resources.resources.jarUrl
         )
         changed_index += 1
     else:
-        old_resources = remote_extensions[ext.packageName].resources
+        old_resources = canonical_remote[ext.packageName].resources
         ext.resources.apkUrl = old_resources.apkUrl
         ext.resources.jarUrl = old_resources.jarUrl
 
-# Merge with the already-published index, dropping the deleted/rebuilt modules.
-final_extensions = []
-final_extensions.extend(
-    ext
-    for ext in remote_proto.extensionList.extensions
-    if not any(ext.packageName.endswith(f".{module}") for module in to_delete)
-)
-final_extensions.extend(ext for ext, _, _, _, _ in new_extensions)
-final_extensions.sort(key=lambda ext: ext.packageName)
+# Merge with the already-published index, keyed strictly by packageName
+final_by_package: dict[str, index_pb2.Extension] = dict(canonical_remote)
+
+removed_package_count = 0
+for pkg in deleted_packages:
+    if pkg in final_by_package and pkg not in new_by_package:
+        del final_by_package[pkg]
+        removed_package_count += 1
+
+replaced_package_count = 0
+added_package_count = 0
+for pkg, (ext, _, _, _, _) in new_by_package.items():
+    if pkg in final_by_package:
+        replaced_package_count += 1
+    else:
+        added_package_count += 1
+    final_by_package[pkg] = ext
+
+final_extensions = sorted(final_by_package.values(), key=lambda ext: ext.packageName)
+
+# Global Uniqueness Guarantee: len(final_extensions) == len(set(packageName))
+all_pkgs = [e.packageName for e in final_extensions]
+unique_pkgs = set(all_pkgs)
+if len(all_pkgs) != len(unique_pkgs):
+    seen = set()
+    dup = None
+    for p in all_pkgs:
+        if p in seen:
+            dup = p
+            break
+        seen.add(p)
+    print(f"DUPLICATE_PACKAGE_NAME={dup}")
+    raise ValueError(f"DUPLICATE_PACKAGE_NAME={dup}: catalog uniqueness validation failed")
+
+# Observability logs
+print(f"REMOTE_EXTENSION_COUNT={len(remote_proto.extensionList.extensions)}")
+print(f"NEW_EXTENSION_ARTIFACT_COUNT={len(new_extensions)}")
+print(f"FINAL_EXTENSION_COUNT={len(final_extensions)}")
+print(f"UNIQUE_PACKAGE_COUNT={len(unique_pkgs)}")
+print(f"DUPLICATE_PACKAGE_COUNT={len(all_pkgs) - len(unique_pkgs)}")
+print(f"REPLACED_PACKAGE_COUNT={replaced_package_count}")
+print(f"ADDED_PACKAGE_COUNT={added_package_count}")
+print(f"REMOVED_PACKAGE_COUNT={removed_package_count}")
+print("IDEMPOTENCY_CHECK=PASS")
 
 legacy_path = REPO_DIR / "index.min.json"
 legacy_entries = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.exists() else []
 legacy_index = update_legacy_index(
     legacy_entries,
     [ext for ext, _, _, _, _ in new_extensions] if legacy_path.exists() else final_extensions,
-    to_delete,
+    deleted_packages,
 )
 
 index = index_pb2.Index(
