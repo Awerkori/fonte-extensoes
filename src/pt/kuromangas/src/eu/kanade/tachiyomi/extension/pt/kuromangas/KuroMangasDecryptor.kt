@@ -6,8 +6,8 @@ import keiyoushi.utils.asJsoup
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.readIntBigEndian
 import keiyoushi.utils.readIntLittleEndian
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -20,9 +20,9 @@ import java.time.ZoneOffset
 
 const val HOSTNAME_PART = "kuromangas.com::v2"
 const val ANTIBOT = "x9_4v2_b"
-const val DEFAULT_ENC_KEY = "i9ato8l6sai74jyIHfE2oeshoforanuYTusF4jKdqEwhUEft9dsadcxzsaipnjm8"
-const val TOKEN_COOKIE = "_kn"
-const val TOKEN_HEADER = "X-Client-Token"
+const val DEFAULT_ENC_KEY = "8at7vo8l6sai74jyIHfE2oeshoforanuYTusF4jKdqEwhUEft9dsadcxzsaipnjm8"
+const val TOKEN_COOKIE = "_vx"
+const val TOKEN_HEADER = "X-Request-Ctx"
 private const val LOGIN_EXPIRED_MESSAGE = "Sessão recusada pelo site. Refaça o login no WebView ou revise email e senha nas configurações."
 
 private val encKeyRegex = Regex("""ENCRYPTION_KEY\s*[:=]\s*["']([^"']+)["']""")
@@ -46,7 +46,8 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
                 val reason = runCatching { response.peekBody(512).string() }.getOrDefault("")
                 response.close()
                 if (retried) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
-                reloadCredentials(true)
+                val relogged = reloadCredentials(true)
+                if (!relogged) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
                 return execute(newRequest(), true)
             }
 
@@ -65,6 +66,7 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
             }
 
             return response.newBuilder()
+                .removeHeader("Content-Length")
                 .body(decrypted.toResponseBody(response.body.contentType()))
                 .build()
         }
@@ -72,23 +74,36 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
         execute(newRequest(), false)
     }
 
-    fun reloadCredentials(login: Boolean = false) {
-        if (login) relogin().also { return }
+    fun reloadCredentials(login: Boolean = false): Boolean {
+        if (login) return relogin()
 
-        val indexJsUrl = client.newCall(GET(baseUrl)).execute()
-            .asJsoup()
-            .selectFirst("script[src*=index]")
-            ?.absUrl("src") ?: return
+        val indexJsUrl = runCatching {
+            client.newCall(GET(baseUrl)).execute().use { response ->
+                response.asJsoup()
+                    .selectFirst("script[src*=index]")
+                    ?.absUrl("src")
+            }
+        }.getOrNull() ?: return false
 
-        val js = client.newCall(GET(indexJsUrl)).execute().body.string()
+        val js = runCatching {
+            client.newCall(GET(indexJsUrl)).execute().use { response ->
+                response.body.string()
+            }
+        }.getOrNull() ?: return false
 
         encKeyRegex.find(js)?.groupValues?.get(1)?.let { viteApiEncKey = it }
+        return true
     }
 
     // index-*.js: Ik2() + Hk2()
     fun decrypt(vSecure: String, dataKey: String): String? {
         val password = derivePassword()
-        val encrypted = Base64.decode(vSecure, Base64.DEFAULT)
+        val encrypted = runCatching {
+            android.util.Base64.decode(vSecure, android.util.Base64.DEFAULT)
+        }.getOrElse {
+            java.util.Base64.getDecoder().decode(vSecure.trim())
+        }
+        if (encrypted.size < 16) return null
         val salt = encrypted.copyOfRange(8, 16)
         val ciphertext = encrypted.copyOfRange(16, encrypted.size)
 
@@ -101,11 +116,11 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
         val jsonStr = String(plaintext, Charsets.UTF_8)
 
         val wrapper = try {
-            jsonStr.parseAs<JsonElement>()
+            Json.parseToJsonElement(jsonStr)
         } catch (e: Exception) {
             return null
         }
-        val inner = wrapper.jsonObject[dataKey] ?: return null
+        val inner = (wrapper as? JsonObject)?.get(dataKey) ?: wrapper
         return inner.toString()
     }
 
@@ -115,7 +130,7 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
             .digest(toHash.toByteArray())
             .joinToString("") { "%02x".format(it) }
             .substring(0, 8)
-        return viteApiEncKey + md5Part
+        return (viteApiEncKey ?: DEFAULT_ENC_KEY) + md5Part
     }
 
     fun evpBytesToKey(password: ByteArray, salt: ByteArray, keyLen: Int = 16, ivLen: Int = 8): Pair<ByteArray, ByteArray> {

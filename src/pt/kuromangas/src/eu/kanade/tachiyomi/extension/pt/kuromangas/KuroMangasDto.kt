@@ -11,9 +11,11 @@ import kotlin.time.Instant
  * Builds the thumbnail URL, removing /uploads/ prefix if present.
  */
 internal fun buildThumbnailUrl(cdnUrl: String, path: String): String {
+    if (path.startsWith("http://") || path.startsWith("https://")) return path
     val cleanPath = path
         .removePrefix("/")
         .removePrefix("uploads/")
+        .removePrefix("/")
     return "$cdnUrl/$cleanPath"
 }
 
@@ -31,7 +33,7 @@ class MangaListResponse(
 @Serializable
 class PaginationDto(
     val page: Int,
-    val limit: Int,
+    val limit: Int = 0,
     val totalPages: Int? = null,
     val hasNext: Boolean? = null,
 ) {

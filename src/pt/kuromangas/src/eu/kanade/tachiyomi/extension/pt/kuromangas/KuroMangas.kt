@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.kuromangas
 
+import android.content.SharedPreferences
+import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.POST
@@ -21,6 +23,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -37,6 +40,10 @@ abstract class KuroMangas :
     private val apiUrl get() = "$baseUrl/api"
 
     private val cdnUrl = "https://cdn.kuromangas.com"
+
+    private val authLock = Any()
+    private var lastFailedEmail = ""
+    private var lastFailedPassword = ""
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor { chain ->
@@ -56,6 +63,7 @@ abstract class KuroMangas :
     override fun Headers.Builder.configureHeaders() = apply {
         set("Accept", "application/json, text/plain, */*")
         set("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
+        set("Origin", baseUrl)
         set("Referer", "$baseUrl/catalogo")
         set("Sec-Fetch-Dest", "empty")
         set("Sec-Fetch-Mode", "cors")
@@ -107,6 +115,18 @@ abstract class KuroMangas :
         } ?: run {
             url.addQueryParameter("sort", "view_count")
             url.addQueryParameter("order", "DESC")
+        }
+
+        filters.filterIsInstance<StatusFilter>().firstOrNull()?.let { filter ->
+            if (filter.selected.isNotEmpty()) {
+                url.addQueryParameter("status", filter.selected)
+            }
+        }
+
+        filters.filterIsInstance<TypeFilter>().firstOrNull()?.let { filter ->
+            if (filter.selected.isNotEmpty()) {
+                url.addQueryParameter("type", filter.selected)
+            }
         }
 
         val result = client.get(url.build()).parseAs<MangaListResponse>()
@@ -174,7 +194,8 @@ abstract class KuroMangas :
         ).parseAs<ChapterPagesResponse>()
         return chapterResponse.pages.mapIndexed { index, pageUrl ->
             val fixedUrl = pageUrl.replaceFirst("^/uploads/".toRegex(), "/")
-            val imageUrl = if (fixedUrl.startsWith("http")) fixedUrl else "$cdnUrl$fixedUrl"
+            val path = if (fixedUrl.startsWith("/")) fixedUrl else "/$fixedUrl"
+            val imageUrl = if (fixedUrl.startsWith("http://") || fixedUrl.startsWith("https://")) fixedUrl else "$cdnUrl$path"
             Page(index, imageUrl = imageUrl)
         }
     }
@@ -196,36 +217,92 @@ abstract class KuroMangas :
 
     // ============================= Auth ===================================
 
-    private fun checkLogin(): Boolean {
+    private fun checkLogin(): Boolean = synchronized(authLock) {
         if (hasSession()) return true
         return login()
     }
 
-    // The site rejects requests carrying a session without its matching token.
-    private fun hasSession(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null && client.getCookie(baseUrl, TOKEN_COOKIE) != null
+    private fun hasClientCookies(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null && client.getCookie(baseUrl, TOKEN_COOKIE) != null
 
-    // Implicit set-cookie: kuro_session + _kn
+    private fun syncWebViewCookies(): Boolean {
+        val httpUrl = baseUrl.toHttpUrl()
+        val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return false
+        val cookieStr = cookieManager.getCookie(baseUrl).orEmpty()
+        if (cookieStr.isEmpty()) return false
+
+        val cookies = cookieStr.split(';')
+            .mapNotNull { Cookie.parse(httpUrl, it.trim()) }
+        if (cookies.isNotEmpty()) {
+            client.cookieJar.saveFromResponse(httpUrl, cookies)
+        }
+        return hasClientCookies()
+    }
+
+    // The site rejects requests carrying a session without its matching token.
+    private fun hasSession(): Boolean {
+        if (hasClientCookies()) return true
+        return syncWebViewCookies()
+    }
+
+    // Implicit set-cookie: kuro_session + _vx
     private fun login(): Boolean {
-        val email = preferences.getString(PREF_EMAIL, "") ?: ""
-        val password = preferences.getString(PREF_PASSWORD, "") ?: ""
+        val email = preferences.getString(PREF_EMAIL, "").orEmpty().trim()
+        val password = preferences.getString(PREF_PASSWORD, "").orEmpty()
         if (email.isEmpty() || password.isEmpty()) {
+            return false
+        }
+        if (email == lastFailedEmail && password == lastFailedPassword) {
             return false
         }
 
         val payload = buildJsonObject {
             put("email", email)
             put("password", password)
+            put("rememberMe", true)
         }.toString()
         val requestBody = payload.toRequestBody(JSON_MEDIA_TYPE)
-        val request = POST("$apiUrl/auth/login", headers, requestBody)
-        network.client.newCall(request).execute().close()
+        val loginHeaders = headers.newBuilder()
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/login")
+            .build()
+        val request = POST("$apiUrl/auth/login", loginHeaders, requestBody)
 
-        return hasSession()
+        val success = runCatching {
+            network.client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
+                    response.headers("Set-Cookie").forEach { header ->
+                        cookieManager?.setCookie(baseUrl, header)
+                    }
+                    cookieManager?.flush()
+                    lastFailedEmail = ""
+                    lastFailedPassword = ""
+                    true
+                } else {
+                    lastFailedEmail = email
+                    lastFailedPassword = password
+                    false
+                }
+            }
+        }.getOrDefault(false)
+
+        return success && hasSession()
     }
 
     // ============================= Preferences ============================
 
     private val preferences = getPreferences()
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == PREF_EMAIL || key == PREF_PASSWORD) {
+            lastFailedEmail = ""
+            lastFailedPassword = ""
+        }
+    }
+
+    init {
+        preferences.registerOnSharedPreferenceChangeListener(prefListener)
+    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val warning = "⚠️ Os dados inseridos nesta seção serão usados somente para realizar o login na fonte"
