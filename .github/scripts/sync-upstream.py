@@ -152,12 +152,9 @@ def is_nox_exclusive(
     local_ref: str | None = "HEAD",
 ) -> bool:
     """Return whether a unit is exclusive to Project Nox (created locally, never existed upstream)."""
-    if not (unit.startswith("src/") or unit.startswith("lib-multisrc/")):
-        return False
-
     has_local = (
         (local_ref is not None and path_exists(local_ref, unit))
-        or Path(unit).is_dir()
+        or Path(unit).exists()
     )
     if not has_local:
         return False
@@ -305,6 +302,7 @@ def pending_sync_units(
     diff_units: list[str],
     protected_units: list[str],
     upstream_ref: str,
+    base: str | None = None,
 ) -> list[str]:
     """Return HEAD/upstream differences which still need a sync attempt.
 
@@ -312,12 +310,18 @@ def pending_sync_units(
     expected divergences, not missing upstream updates.
     """
     protected = set(protected_units)
+    if base is None:
+        base = git("merge-base", "HEAD", upstream_ref, check=False).strip()
+    multisrc_bases = protected_multisrc_bases(base, upstream_ref) if base else {}
     pending = []
     for unit in diff_units:
         if unit in protected:
             print(f"Expected Nox divergence: preserving protected {unit}")
             continue
-        if is_nox_exclusive(unit, upstream_ref):
+        if unit.startswith("lib-multisrc/") and unit.split("/", 1)[1] in multisrc_bases:
+            print(f"Expected Nox divergence: preserving protected multisrc {unit}")
+            continue
+        if is_nox_exclusive(unit, upstream_ref, base=base):
             print(f"NOX_EXCLUSIVE: preserving {unit}")
             continue
         if local_version_ahead_of_upstream(unit, upstream_ref) is not None:
@@ -1040,13 +1044,18 @@ def merge_multisrc(sandbox: Path, theme: str, base: str, upstream_ref: str) -> N
 
 
 def prove_protected_multisrc(
-    base: str, upstream_ref: str, protected_units: list[str], blocked: set[str],
+    base: str,
+    upstream_ref: str,
+    protected_units: list[str],
+    blocked: set[str],
+    candidate_units: list[str] | set[str] | None = None,
 ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     bases = protected_multisrc_bases(base, upstream_ref)
     backlog = load_deferred_migrations()
     changed = set(collect_units(changed_entries(base, upstream_ref))[0])
     local_changed = set(collect_units(changed_entries(base, "HEAD"))[0])
     local_deps, upstream_deps = dependency_map(None), dependency_map(upstream_ref)
+    candidates = set(candidate_units) if candidate_units is not None else None
     accepted, deferred = {}, {}
     for theme, patch_base in bases.items():
         unit = f"lib-multisrc/{theme}"
@@ -1055,7 +1064,13 @@ def prove_protected_multisrc(
             dependent in changed and structural_metadata(None, dependent) != structural_metadata(upstream_ref, dependent)
             for dependent in dependents
         )
-        if unit not in changed and theme not in backlog and not selector_changed:
+        needs_proof = (
+            unit in changed
+            or theme in backlog
+            or selector_changed
+            or (candidates is not None and unit in candidates)
+        )
+        if not needs_proof:
             continue
         entry = {"patch_base": patch_base, "upstream_ref": git("rev-parse", upstream_ref).strip(), "units": dependents}
         if theme in blocked:
@@ -1785,7 +1800,7 @@ def main() -> None:
     # Determine effective differences between HEAD and upstream_ref
     diff_entries = changed_entries("HEAD", upstream_ref)
     diff_units, _ = collect_units(diff_entries)
-    effective_diff = pending_sync_units(diff_units, protected_units, upstream_ref)
+    effective_diff = pending_sync_units(diff_units, protected_units, upstream_ref, base=base)
 
     if not upstream_units and effective_diff:
         print(f"Sync branch is up to date, but main is missing {len(effective_diff)} updates. Proceeding.")
@@ -1854,7 +1869,9 @@ def main() -> None:
         print_observability_footer("SUCCESS", "SKIPPED", "SKIPPED")
         return
 
-    proven, multisrc_deferred = prove_protected_multisrc(base, upstream_ref, protected_units, preflight_blocked)
+    proven, multisrc_deferred = prove_protected_multisrc(
+        base, upstream_ref, protected_units, preflight_blocked, candidate_units=upstream_units
+    )
     verified_blocked, verified_proven = verify_migration_plan(
         {theme: rows for theme, rows in preflight.items() if theme not in preflight_blocked and theme not in protected_multisrc},
         upstream_ref,

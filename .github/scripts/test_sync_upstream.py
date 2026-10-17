@@ -1384,6 +1384,41 @@ class ProtectedMultisrcTest(unittest.TestCase):
         self.assertFalse(proven)
         self.assertIn("removed upstream", deferred[self.theme]["reason"])
 
+    def test_p_protected_multisrc_unchanged_upstream_with_candidate_is_proven_and_preserved(self):
+        self.nox_patch()
+        self.assertEqual(sync_upstream.protected_multisrc_bases(self.base, "upstream"), {self.theme: self.base})
+        proven, deferred = sync_upstream.prove_protected_multisrc(
+            self.base, "upstream", [], set(), candidate_units=[self.unit]
+        )
+        self.assertFalse(deferred)
+        self.assertIn(self.theme, proven)
+        self.assertEqual(proven[self.theme]["units"], self.extensions)
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), deferred, proven)
+        self.assertIn("reader = nox", Path(f"{self.unit}/Reader.kt").read_text())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_q_protected_multisrc_unknown_unproven_divergence_fails_closed(self):
+        self.nox_patch()
+        with self.assertRaisesRegex(RuntimeError, "Unproven protected multisrc"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), {})
+
+    def test_r_pending_sync_units_recognizes_protected_multisrc_as_expected_divergence(self):
+        self.nox_patch()
+        pending = sync_upstream.pending_sync_units([self.unit], [], "upstream")
+        self.assertNotIn(self.unit, pending)
+        self.assertEqual(pending, [])
+
+    def test_s_mangotheme_specifically_proven_and_no_unproven_error(self):
+        self.nox_patch()
+        proven, deferred = sync_upstream.prove_protected_multisrc(
+            self.base, "upstream", [], set(), candidate_units=[self.unit]
+        )
+        self.assertIn(self.theme, proven)
+        with patch.object(sync_upstream, "validate_affected_builds"):
+            sync_upstream.apply_units("upstream", [self.unit], {self.unit}, [], [], set(), deferred, proven)
+        self.assertIn("reader = nox", Path(f"{self.unit}/Reader.kt").read_text())
+
 
 class BladeToonsRegressionTest(GitFixture):
     theme = "mangotheme"
