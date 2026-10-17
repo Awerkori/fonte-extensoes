@@ -149,9 +149,12 @@ abstract class MangoTheme :
             .build()
     }
 
+    protected open fun OkHttpClient.Builder.configureSubclassClient(): OkHttpClient.Builder = this
+
     override fun OkHttpClient.Builder.configureClient() = addInterceptor(authInterceptor)
         .addInterceptor(decryptInterceptor)
         .rateLimit(2)
+        .configureSubclassClient()
 
     override fun Headers.Builder.configureHeaders() = addMangoThemeHeaders()
 
