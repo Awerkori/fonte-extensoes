@@ -21,6 +21,19 @@ fun cleanSynopsis(text: String?): String? {
     return text.trim()
 }
 
+fun normalizeImageUrl(url: String?, baseUrl: String = "https://lycantoons.com"): String? {
+    if (url.isNullOrBlank()) return null
+    val trimmed = url.trim().replace("\\/", "/").trimEnd('\\', '"', '\'')
+    return when {
+        trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
+        trimmed.startsWith("//") -> "https:$trimmed"
+        trimmed.startsWith("/file/") -> "https://cdn.lycantoons.com$trimmed"
+        trimmed.startsWith("/") -> "${baseUrl.trimEnd('/')}$trimmed"
+        trimmed.startsWith("file/") -> "https://cdn.lycantoons.com/$trimmed"
+        else -> "${baseUrl.trimEnd('/')}/$trimmed"
+    }
+}
+
 private val RSC_REGEX = Regex("""^\${'$'}L?\d+$""")
 
 @Serializable
@@ -36,16 +49,20 @@ class SeriesDto(
     val status: String? = null,
     val seriesType: String? = null,
 ) {
+    val canonicalUrl: String get() = "/series/$slug"
+    val normalizedThumbnailUrl: String? get() = normalizeImageUrl(coverUrl, "https://lycantoons.com")
+    val cleanedDescription: String? get() = cleanSynopsis(description ?: synopsis)
+
     fun toSManga() = SManga.create().apply {
         title = this@SeriesDto.title
-        url = "/series/$slug"
-        thumbnail_url = coverUrl
+        url = canonicalUrl
+        thumbnail_url = normalizedThumbnailUrl
         author = this@SeriesDto.author?.takeIf { it.isNotBlank() && it != "-" }
         artist = this@SeriesDto.artist?.takeIf { it.isNotBlank() && it != "-" }
         genre = this@SeriesDto.genre?.takeIf { it.isNotEmpty() }
             ?.map { tagMapping[it] ?: it }
             ?.joinToString()
-        description = cleanSynopsis(this@SeriesDto.description ?: this@SeriesDto.synopsis)
+        description = cleanedDescription
         status = parseStatus(this@SeriesDto.status)
         initialized = true
     }
@@ -57,10 +74,13 @@ class RankingRowDto(
     val slug: String,
     val coverUrl: String? = null,
 ) {
+    val canonicalUrl: String get() = "/series/$slug"
+    val normalizedThumbnailUrl: String? get() = normalizeImageUrl(coverUrl, "https://lycantoons.com")
+
     fun toSManga() = SManga.create().apply {
         title = this@RankingRowDto.title
-        url = "/series/$slug"
-        thumbnail_url = coverUrl
+        url = canonicalUrl
+        thumbnail_url = normalizedThumbnailUrl
         initialized = true
     }
 }
@@ -68,19 +88,26 @@ class RankingRowDto(
 @Serializable
 class ChapterDto(
     val id: Int? = null,
-    private val numero: JsonElement,
-    private val createdAt: String? = null,
-    private val pageCount: Int? = null,
+    val numero: JsonElement,
+    val createdAt: String? = null,
+    val pageCount: Int? = null,
 ) {
-    fun toSChapter(slug: String) = SChapter.create().apply {
+    val chapterName: String get() = "Capítulo ${numero.jsonPrimitive.content}"
+    val chapterNumber: Float get() = numero.jsonPrimitive.content.toFloatOrNull() ?: -1f
+
+    fun canonicalUrl(slug: String): String {
         val numberString = numero.jsonPrimitive.content
-        name = "Capítulo $numberString"
         val capituloParam = id?.let { "capituloId=$it" }
         val pagesParam = pageCount?.let { "pages=$it" }
         val query = listOfNotNull(capituloParam, pagesParam).joinToString("&").let { if (it.isNotEmpty()) "?$it" else "" }
-        url = "/series/$slug/$numberString$query"
+        return "/series/$slug/$numberString$query"
+    }
+
+    fun toSChapter(slug: String) = SChapter.create().apply {
+        name = chapterName
+        url = canonicalUrl(slug)
         date_upload = Instant.tryParse(createdAt)
-        chapter_number = numberString.toFloatOrNull() ?: -1f
+        chapter_number = chapterNumber
     }
 }
 
@@ -113,6 +140,32 @@ class BookSchemaDto(
 @Serializable
 class ChapterPagesDto(
     val pages: List<String> = emptyList(),
+)
+
+@Serializable
+class SeriesSearchRequest(
+    val search: String = "",
+    val limit: Int = 20,
+    val page: Int = 1,
+    val seriesType: String? = null,
+    val status: String? = null,
+    val genre: List<String>? = null,
+)
+
+@Serializable
+class SeriesSearchResponse(
+    val series: List<SeriesDto> = emptyList(),
+    val pagination: PaginationDto? = null,
+)
+
+@Serializable
+class PaginationDto(
+    val currentPage: Int = 1,
+    val totalPages: Int = 1,
+    val totalItems: Int = 0,
+    val itemsPerPage: Int = 20,
+    val hasNextPage: Boolean = false,
+    val hasPrevPage: Boolean = false,
 )
 
 private fun parseStatus(status: String?) = when (status?.lowercase()) {

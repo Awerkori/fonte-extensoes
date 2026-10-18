@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Lycan Toons"
-    versionCode = 2
+    versionCode = 3
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 
@@ -14,4 +14,20 @@ keiyoushi {
         lang = "pt-BR"
         baseUrl = "https://lycantoons.com"
     }
+}
+
+android {
+    sourceSets.named("test") {
+        kotlin.directories.add("test")
+    }
+}
+
+dependencies {
+    testImplementation(libs.junit)
+    testImplementation(libs.bundles.common)
+    testImplementation(libs.tachiyomi.lib.v16)
+}
+
+tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") }.configureEach {
+    enabled = false
 }
