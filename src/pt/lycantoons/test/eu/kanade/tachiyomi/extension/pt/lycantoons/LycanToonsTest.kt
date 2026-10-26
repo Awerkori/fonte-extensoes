@@ -11,12 +11,18 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class LycanToonsTest {
 
     private val json = Json { ignoreUnknownKeys = true }
     private val baseUrl = "https://lycantoons.com"
+
+    @Before
+    fun setUp() {
+        LycanCircuitBreaker.reset()
+    }
 
     // =========================================================================
     // 1. URL Normalization Tests
@@ -153,7 +159,7 @@ class LycanToonsTest {
         assertEquals("image", interceptedDest)
         assertEquals("no-cors", interceptedMode)
         assertEquals("same-site", interceptedSite)
-        assertEquals("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", interceptedAccept)
+        assertEquals("image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5", interceptedAccept)
         assertEquals("https://lycantoons.com/", interceptedReferer)
         assertNotNull(interceptedUserAgent)
     }
@@ -161,12 +167,18 @@ class LycanToonsTest {
     @Test
     fun clientInterceptorRemovesOriginFromMainDomainGetRequests() {
         var interceptedOrigin: String? = "SHOULD_BE_REMOVED"
+        var interceptedSecFetchSite: String? = null
+        var interceptedSecFetchMode: String? = null
+        var interceptedSecFetchDest: String? = null
 
         val client = OkHttpClient.Builder()
             .addInterceptor(LycanToonsInterceptor(baseUrl))
             .addInterceptor { chain ->
                 val intercepted = chain.request()
                 interceptedOrigin = intercepted.header("Origin")
+                interceptedSecFetchSite = intercepted.header("Sec-Fetch-Site")
+                interceptedSecFetchMode = intercepted.header("Sec-Fetch-Mode")
+                interceptedSecFetchDest = intercepted.header("Sec-Fetch-Dest")
                 okhttp3.Response.Builder()
                     .request(intercepted)
                     .protocol(okhttp3.Protocol.HTTP_2)
@@ -185,6 +197,18 @@ class LycanToonsTest {
         client.newCall(req).execute().close()
 
         assertNull("Origin must be stripped for lycantoons.com GET requests", interceptedOrigin)
+        assertEquals("same-origin", interceptedSecFetchSite)
+        assertEquals("cors", interceptedSecFetchMode)
+        assertEquals("empty", interceptedSecFetchDest)
+    }
+
+    @Test
+    fun extractChapterIdExtractsFromQueryParameters() {
+        assertEquals("1378", extractChapterId("/series/slug/146?capituloId=1378&pages=20"))
+        assertEquals("1378", extractChapterId("/series/slug/146?pages=20&capituloId=1378"))
+        assertEquals("5488", extractChapterId("/series/slug/179?id=5488&pages=13"))
+        assertEquals("5488", extractChapterId("/series/slug/179?pages=13&id=5488"))
+        assertEquals("", extractChapterId("/series/slug/146"))
     }
 
     @Test
@@ -472,6 +496,43 @@ class LycanToonsTest {
 
         val resp = client.newCall(req).execute()
         assertEquals(403, resp.code)
+    }
+
+    @Test
+    fun circuitBreakerTripsAndBlocksLocally() {
+        LycanCircuitBreaker.reset()
+        assertTrue(!LycanCircuitBreaker.isBlocked)
+
+        LycanCircuitBreaker.trip(5)
+        assertTrue(LycanCircuitBreaker.isBlocked)
+        assertTrue(LycanCircuitBreaker.remainingSeconds > 0)
+
+        var reachedNetwork = false
+        val client = OkHttpClient.Builder()
+            .addInterceptor(LycanToonsInterceptor(baseUrl))
+            .addInterceptor { chain ->
+                reachedNetwork = true
+                okhttp3.Response.Builder()
+                    .request(chain.request())
+                    .protocol(okhttp3.Protocol.HTTP_2)
+                    .code(200)
+                    .message("OK")
+                    .body("{}".toResponseBody(null))
+                    .build()
+            }
+            .build()
+
+        val req = Request.Builder().url("https://lycantoons.com/api/series").build()
+        try {
+            client.newCall(req).execute()
+            org.junit.Assert.fail("Expected LycanAntiAbuseException")
+        } catch (_: LycanAntiAbuseException) {
+            // Expected
+        }
+        assertTrue("Circuit breaker must intercept before network call", !reachedNetwork)
+
+        LycanCircuitBreaker.reset()
+        assertTrue(!LycanCircuitBreaker.isBlocked)
     }
 
     // =========================================================================
