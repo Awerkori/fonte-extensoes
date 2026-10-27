@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -29,6 +30,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 
@@ -46,16 +48,56 @@ abstract class KuroMangas :
     private var lastFailedPassword = ""
 
     override fun OkHttpClient.Builder.configureClient() = apply {
+        // Strip Tadami's conflicting application interceptors:
+        // - CompressionInterceptor adds Accept-Encoding: zstd, br, gzip and runs AFTER
+        //   vSecureInterceptor on the response path, passing raw Brotli/Gzip bytes to
+        //   vSecureInterceptor and causing "Failed to decrypt".
+        // - CloudflareInterceptor interferes with API responses and headless Turnstile challenges.
+        interceptors().removeAll {
+            val name = it.javaClass.simpleName
+            name == "CompressionInterceptor" || name == "CloudflareInterceptor"
+        }
+
+        // Require active session/login only for API calls
         addInterceptor { chain ->
-            if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
-            return@addInterceptor chain.proceed(chain.request())
+            val request = chain.request()
+            val baseHost = runCatching { baseUrl.toHttpUrl().host }.getOrDefault("kuromangas.com")
+            if (request.url.host == baseHost && request.url.encodedPath.startsWith("/api/")) {
+                if (!checkLogin()) throw IOException(LOGIN_REQUIRED_MESSAGE)
+            }
+            chain.proceed(request)
+        }
+
+        // Sanitize CDN and image requests: remove Origin and Sec-Fetch-Dest: empty which
+        // trigger Cloudflare WAF 403 on cdn.kuromangas.com, and supply clean image headers.
+        addInterceptor { chain ->
+            val request = chain.request()
+            val host = request.url.host
+            val isCdn = host == "cdn.kuromangas.com" || (host.endsWith(".kuromangas.com") && host != baseUrl.toHttpUrl().host)
+            val isImage = request.header("Accept")?.contains("image/") == true ||
+                request.url.encodedPath.matches(IMAGE_EXT_REGEX)
+
+            if (isCdn || isImage) {
+                val newRequest = request.newBuilder()
+                    .removeHeader("Origin")
+                    .removeHeader(TOKEN_HEADER)
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .header("Referer", "$baseUrl/")
+                    .header("Sec-Fetch-Dest", "image")
+                    .header("Sec-Fetch-Mode", "no-cors")
+                    .header("Sec-Fetch-Site", "same-site")
+                    .build()
+                return@addInterceptor chain.proceed(newRequest)
+            }
+            chain.proceed(request)
         }
 
         addInterceptor(
             KuroMangasDecryptor(
-                baseUrl,
-                network.client,
-                ::login,
+                baseUrl = baseUrl,
+                client = network.client,
+                relogin = ::login,
+                tokenProvider = ::getToken,
             ).vSecureInterceptor(),
         )
     }
@@ -187,6 +229,18 @@ abstract class KuroMangas :
 
     // ============================= Pages ==================================
 
+    override fun imageRequest(page: Page): Request {
+        val imageHeaders = headers.newBuilder()
+            .removeAll("Origin")
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Referer", "$baseUrl/")
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-site")
+            .build()
+        return GET(page.imageUrl!!, imageHeaders)
+    }
+
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.url.substringAfterLast("/")
         val chapterResponse = client.get(
@@ -217,25 +271,48 @@ abstract class KuroMangas :
 
     // ============================= Auth ===================================
 
+    private fun getToken(): String? = getCookieValue(TOKEN_COOKIE)
+
+    private fun getCookieValue(name: String): String? {
+        val fromJar = client.getCookie(baseUrl, name)
+        if (!fromJar.isNullOrBlank()) return fromJar
+
+        val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return null
+        val cookieStr = cookieManager.getCookie(baseUrl)
+            ?: cookieManager.getCookie("$baseUrl/")
+            ?: return null
+
+        return extractCookieFromHeader(cookieStr, name)
+    }
+
     private fun checkLogin(): Boolean = synchronized(authLock) {
         if (hasSession()) return true
         return login()
     }
 
-    private fun hasClientCookies(): Boolean = client.getCookie(baseUrl, SESSION_COOKIE) != null && client.getCookie(baseUrl, TOKEN_COOKIE) != null
+    private fun hasClientCookies(): Boolean {
+        val session = getCookieValue(SESSION_COOKIE)
+        val token = getCookieValue(TOKEN_COOKIE)
+        return !session.isNullOrBlank() && !token.isNullOrBlank()
+    }
 
     private fun syncWebViewCookies(): Boolean {
         val httpUrl = baseUrl.toHttpUrl()
         val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return false
-        val cookieStr = cookieManager.getCookie(baseUrl).orEmpty()
-        if (cookieStr.isEmpty()) return false
+        val cookieStr = cookieManager.getCookie(baseUrl) ?: cookieManager.getCookie("$baseUrl/").orEmpty()
+        if (cookieStr.isBlank()) return false
 
-        val cookies = cookieStr.split(';')
-            .mapNotNull { Cookie.parse(httpUrl, it.trim()) }
-        if (cookies.isNotEmpty()) {
-            client.cookieJar.saveFromResponse(httpUrl, cookies)
-        }
-        return hasClientCookies()
+        val session = extractCookieFromHeader(cookieStr, SESSION_COOKIE)
+        val token = extractCookieFromHeader(cookieStr, TOKEN_COOKIE)
+        if (session.isNullOrBlank() || token.isNullOrBlank()) return false
+
+        val cookies = listOfNotNull(
+            Cookie.Builder().domain(httpUrl.host).path("/").name(SESSION_COOKIE).value(session).build(),
+            Cookie.Builder().domain(httpUrl.host).path("/").name(TOKEN_COOKIE).value(token).build(),
+        )
+        client.cookieJar.saveFromResponse(httpUrl, cookies)
+        cookieManager.flush()
+        return true
     }
 
     // The site rejects requests carrying a session without its matching token.
@@ -271,8 +348,14 @@ abstract class KuroMangas :
             network.client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
+                    val httpUrl = baseUrl.toHttpUrl()
+                    val parsedCookies = mutableListOf<Cookie>()
                     response.headers("Set-Cookie").forEach { header ->
                         cookieManager?.setCookie(baseUrl, header)
+                        Cookie.parse(httpUrl, header)?.let { parsedCookies.add(it) }
+                    }
+                    if (parsedCookies.isNotEmpty()) {
+                        client.cookieJar.saveFromResponse(httpUrl, parsedCookies)
                     }
                     cookieManager?.flush()
                     lastFailedEmail = ""
@@ -341,6 +424,7 @@ abstract class KuroMangas :
         const val SESSION_COOKIE = "kuro_session"
         const val LOGIN_REQUIRED_MESSAGE = "Faça login no WebView ou insira email e senha nas configurações e tente novamente."
         val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        val IMAGE_EXT_REGEX = Regex(""".*\.(?:jpe?g|png|webp|gif|avif)(?:\?.*)?$""", RegexOption.IGNORE_CASE)
     }
 }
 

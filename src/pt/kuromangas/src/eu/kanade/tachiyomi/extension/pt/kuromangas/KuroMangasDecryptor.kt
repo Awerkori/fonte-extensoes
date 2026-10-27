@@ -8,15 +8,21 @@ import keiyoushi.utils.readIntBigEndian
 import keiyoushi.utils.readIntLittleEndian
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.asResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.GzipSource
+import okio.InflaterSource
+import okio.buffer
 import java.io.IOException
 import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.ZoneOffset
+import java.util.zip.Inflater
 
 const val HOSTNAME_PART = "kuromangas.com::v2"
 const val ANTIBOT = "x9_4v2_b"
@@ -27,31 +33,61 @@ private const val LOGIN_EXPIRED_MESSAGE = "Sessão recusada pelo site. Refaça o
 
 private val encKeyRegex = Regex("""ENCRYPTION_KEY\s*[:=]\s*["']([^"']+)["']""")
 
-class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val relogin: () -> Boolean) {
+class KuroMangasDecryptor(
+    val baseUrl: String,
+    val client: OkHttpClient,
+    val relogin: () -> Boolean,
+    val tokenProvider: (() -> String?)? = null,
+) {
+    constructor(baseUrl: String, client: OkHttpClient, relogin: () -> Boolean) : this(
+        baseUrl = baseUrl,
+        client = client,
+        relogin = relogin,
+        tokenProvider = null,
+    )
+
     private var viteApiEncKey: String? = DEFAULT_ENC_KEY
 
     fun vSecureInterceptor() = Interceptor { chain ->
+        val originalRequest = chain.request()
+        val baseHost = runCatching { baseUrl.toHttpUrl().host }.getOrDefault("kuromangas.com")
+
+        // Decryption and X-Request-Ctx only apply to kuromangas API calls.
+        // Image requests, CDN requests, and static assets are bypassed.
+        if (originalRequest.url.host != baseHost || !originalRequest.url.encodedPath.startsWith("/api/")) {
+            return@Interceptor chain.proceed(originalRequest)
+        }
+
+        fun resolveToken(): String? = tokenProvider?.invoke()
+            ?: client.getCookie(baseUrl, TOKEN_COOKIE)
+            ?: runCatching {
+                val manager = android.webkit.CookieManager.getInstance()
+                val cookieStr = manager.getCookie(baseUrl) ?: manager.getCookie("$baseUrl/")
+                extractCookieFromHeader(cookieStr, TOKEN_COOKIE)
+            }.getOrNull()
 
         fun newRequest(): Request {
-            val token = client.getCookie(baseUrl, TOKEN_COOKIE) ?: return chain.request()
-            return chain.request().newBuilder()
+            val token = resolveToken() ?: return originalRequest
+            return originalRequest.newBuilder()
                 .header(TOKEN_HEADER, token)
                 .build()
         }
 
         fun execute(request: Request, retried: Boolean): Response {
-            val response = chain.proceed(request)
+            val rawResponse = chain.proceed(request)
 
-            if (response.code == 401 || response.code == 403) {
-                val reason = runCatching { response.peekBody(512).string() }.getOrDefault("")
-                response.close()
-                if (retried) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
+            if (rawResponse.code == 401 || rawResponse.code == 403) {
+                val reason = runCatching { rawResponse.peekBody(512).string() }.getOrDefault("")
+                rawResponse.close()
+                if (retried) throw IOException("$LOGIN_EXPIRED_MESSAGE (${rawResponse.code}) $reason")
                 val relogged = reloadCredentials(true)
-                if (!relogged) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
+                if (!relogged) throw IOException("$LOGIN_EXPIRED_MESSAGE (${rawResponse.code}) $reason")
                 return execute(newRequest(), true)
             }
 
-            val dataKey = response.headers["x-kuro-datakey"] ?: return response
+            val dataKey = rawResponse.headers["x-kuro-datakey"] ?: return rawResponse
+
+            val response = rawResponse.decompressIfNeeded()
 
             val decrypted = runCatching {
                 val dto = response.parseAs<SecureDto>()
@@ -97,7 +133,6 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
 
     // index-*.js: Ik2() + Hk2()
     fun decrypt(vSecure: String, dataKey: String): String? {
-        val password = derivePassword()
         val encrypted = runCatching {
             android.util.Base64.decode(vSecure, android.util.Base64.DEFAULT)
         }.getOrElse {
@@ -107,6 +142,31 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
         val salt = encrypted.copyOfRange(8, 16)
         val ciphertext = encrypted.copyOfRange(16, encrypted.size)
 
+        for (date in getCandidateDates()) {
+            val password = derivePassword(date)
+            val decrypted = tryDecryptWithPassword(ciphertext, salt, password, dataKey)
+            if (decrypted != null) return decrypted
+        }
+        return null
+    }
+
+    private fun getCandidateDates(): List<String> {
+        val utcToday = LocalDate.now(ZoneOffset.UTC)
+        val localToday = runCatching { LocalDate.now() }.getOrDefault(utcToday)
+        return listOf(
+            utcToday.toString(),
+            utcToday.minusDays(1).toString(),
+            utcToday.plusDays(1).toString(),
+            localToday.toString(),
+        ).distinct()
+    }
+
+    private fun tryDecryptWithPassword(
+        ciphertext: ByteArray,
+        salt: ByteArray,
+        password: String,
+        dataKey: String,
+    ): String? = runCatching {
         val (key, iv) = evpBytesToKey(password.toByteArray(), salt)
         val rabbit = Rabbit()
         rabbit.setup(key, iv)
@@ -114,15 +174,10 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val rel
         rabbit.crypt(plaintext)
 
         val jsonStr = String(plaintext, Charsets.UTF_8)
-
-        val wrapper = try {
-            Json.parseToJsonElement(jsonStr)
-        } catch (e: Exception) {
-            return null
-        }
+        val wrapper = Json.parseToJsonElement(jsonStr)
         val inner = (wrapper as? JsonObject)?.get(dataKey) ?: wrapper
-        return inner.toString()
-    }
+        inner.toString()
+    }.getOrNull()
 
     fun derivePassword(date: String = LocalDate.now(ZoneOffset.UTC).toString()): String {
         val toHash = "$date$HOSTNAME_PART$ANTIBOT"
@@ -298,4 +353,30 @@ class Rabbit {
     fun unsignedLessThan(a: Int, b: Int) = a.toUInt() < b.toUInt()
 
     data class Quadruple(val s0: Int, val s1: Int, val s2: Int, val s3: Int)
+}
+
+fun Response.decompressIfNeeded(): Response {
+    val encoding = header("Content-Encoding") ?: return this
+    val body = this.body
+    val decompressedSource = when {
+        encoding.equals("gzip", ignoreCase = true) -> GzipSource(body.source())
+        encoding.equals("deflate", ignoreCase = true) -> InflaterSource(body.source(), Inflater())
+        else -> return this
+    }
+    val strippedHeaders = headers.newBuilder()
+        .removeAll("Content-Encoding")
+        .removeAll("Content-Length")
+        .build()
+    return newBuilder()
+        .headers(strippedHeaders)
+        .body(decompressedSource.buffer().asResponseBody(body.contentType(), -1L))
+        .build()
+}
+
+fun extractCookieFromHeader(cookieHeader: String?, name: String): String? {
+    if (cookieHeader.isNullOrBlank()) return null
+    return Regex("""(?:^|;\s*)$name=([^;]+)""")
+        .find(cookieHeader)
+        ?.groupValues?.get(1)?.trim()
+        ?.takeIf { it.isNotEmpty() }
 }

@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.pt.kuromangas
 import kotlinx.serialization.json.Json
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -379,5 +380,64 @@ class KuroMangasTest {
 
         assertEquals("test_token_123", client.getCookie(baseUrl, TOKEN_COOKIE))
         assertEquals("session_abc", client.getCookie(baseUrl, "kuro_session"))
+    }
+
+    @Test
+    fun extractCookieFromHeaderExtractsCorrectly() {
+        val header = "cf_clearance=cf123; kuro_session=sess456; _vx=token789; other=xyz"
+        assertEquals("sess456", extractCookieFromHeader(header, "kuro_session"))
+        assertEquals("token789", extractCookieFromHeader(header, "_vx"))
+        assertEquals("cf123", extractCookieFromHeader(header, "cf_clearance"))
+        assertNull(extractCookieFromHeader(header, "missing_cookie"))
+        assertNull(extractCookieFromHeader(null, "_vx"))
+        assertNull(extractCookieFromHeader("", "_vx"))
+    }
+
+    @Test
+    fun multiDateToleranceDecryptsPayloadFromYesterday() {
+        val decryptor = KuroMangasDecryptor("https://kuromangas.com", OkHttpClient()) { true }
+        val yesterday = java.time.LocalDate.now(java.time.ZoneOffset.UTC).minusDays(1).toString()
+        val yesterdayPassword = decryptor.derivePassword(yesterday)
+
+        val magic = "Salted__".toByteArray(Charsets.US_ASCII)
+        val salt = ByteArray(8) { (it + 5).toByte() }
+
+        val (key, iv) = decryptor.evpBytesToKey(yesterdayPassword.toByteArray(), salt)
+        val rabbit = Rabbit().apply { setup(key, iv) }
+
+        val payloadJson = """{"data":{"manga_id":777,"title":"Yesterday Manga"}}"""
+        val ciphertext = payloadJson.toByteArray(Charsets.UTF_8).copyOf()
+        rabbit.crypt(ciphertext)
+
+        val fullEncrypted = magic + salt + ciphertext
+        val vSecure = JavaBase64.getEncoder().encodeToString(fullEncrypted)
+
+        val decrypted = decryptor.decrypt(vSecure, "data")
+        assertNotNull(decrypted)
+        assertTrue(decrypted!!.contains("\"manga_id\":777"))
+        assertTrue(decrypted.contains("\"title\":\"Yesterday Manga\""))
+    }
+
+    @Test
+    fun decompressIfNeededDecompressesGzipResponse() {
+        val originalText = """{"status":"ok","content":"decompressed_payload"}"""
+        val byteStream = java.io.ByteArrayOutputStream()
+        java.util.zip.GZIPOutputStream(byteStream).use {
+            it.write(originalText.toByteArray(Charsets.UTF_8))
+        }
+        val compressedBytes = byteStream.toByteArray()
+
+        val response = Response.Builder()
+            .request(Request.Builder().url("https://kuromangas.com/api/test").build())
+            .protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .header("Content-Encoding", "gzip")
+            .body(compressedBytes.toResponseBody("application/json".toMediaType()))
+            .build()
+
+        val decompressed = response.decompressIfNeeded()
+        assertNull(decompressed.header("Content-Encoding"))
+        assertEquals(originalText, decompressed.body.string())
     }
 }
