@@ -44,6 +44,7 @@ src/pt/mangaonlinegreen
 src/pt/mangaonlinetv
 src/pt/mangasbrasuka
 src/pt/mangastop
+src/pt/mangaverde
 src/pt/manhastro
 src/pt/megahentai
 src/pt/montetai
