@@ -48,6 +48,7 @@ src/pt/megahentai
 src/pt/montetai
 src/pt/mugiwarasoficial
 src/pt/nexusmangas
+src/pt/neotoons
 src/pt/nhentaibr
 src/pt/osakascan
 src/pt/pointzerotoons
