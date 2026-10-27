@@ -177,7 +177,7 @@ class LittleTyrantTest {
         assertEquals(1, pages.size)
         assertTrue(pages[0].imageUrl!!.startsWith("https://tiraninha.world/wp-content/themes/madara2/image-loader.php?path=1234&t_force=1790656000000#"))
         assertTrue(pages[0].imageUrl!!.contains(parsedToken))
-        assertTrue(pages[0].imageUrl!!.contains(nonce!!))
+        assertTrue(pages[0].imageUrl!!.contains(nonce))
     }
 
     @Test
@@ -245,5 +245,107 @@ class LittleTyrantTest {
         assertEquals("same-origin", headers["Sec-Fetch-Site"])
         assertEquals(chapterUrl, headers["Referer"])
         assertEquals("lt_browser_nonce=$nonce", headers["Cookie"])
+    }
+
+    @Test
+    fun test10_parseReadingNavHtml() {
+        val html = """
+            <label>
+                <select class="c-selectpicker selectpicker_chapter selectpicker single-chapter-select" for="volume-id-0">
+                    <option class="short" data-limit="40" value="" data-redirect="https://tiraninha.world/manga/conforme-o-seu-coracao-guiar/capitulo-66/">Capítulo 66</option>
+                    <option class="short" data-limit="40" value="" data-redirect="https://tiraninha.world/manga/conforme-o-seu-coracao-guiar/capitulo-65/">Capítulo 65</option>
+                    <option class="short" data-limit="40" value="capitulo-64" data-redirect="">Capítulo 64 - Bônus</option>
+                    <option value="">-- Selecione o capítulo --</option>
+                </select>
+            </label>
+        """.trimIndent()
+
+        val doc = Jsoup.parse(html)
+        val entries = LittleTyrant.parseReadingNavEntries(doc, "/manga/conforme-o-seu-coracao-guiar/")
+
+        assertEquals(3, entries.size)
+        assertEquals("/manga/conforme-o-seu-coracao-guiar/capitulo-66/", entries[0].url)
+        assertEquals("Capítulo 66", entries[0].name)
+        assertEquals(66f, entries[0].chapterNumber, 0.01f)
+
+        assertEquals("/manga/conforme-o-seu-coracao-guiar/capitulo-65/", entries[1].url)
+        assertEquals("Capítulo 65", entries[1].name)
+        assertEquals(65f, entries[1].chapterNumber, 0.01f)
+
+        assertEquals("/manga/conforme-o-seu-coracao-guiar/capitulo-64/", entries[2].url)
+        assertEquals("Capítulo 64 - Bônus", entries[2].name)
+        assertEquals(64f, entries[2].chapterNumber, 0.01f)
+    }
+
+    @Test
+    fun test11_parseChapterNumber() {
+        assertEquals(66f, LittleTyrant.parseChapterNumber("Capítulo 66"), 0.01f)
+        assertEquals(131f, LittleTyrant.parseChapterNumber("Capítulo 131 - Fim da Segunda Temporada"), 0.01f)
+        assertEquals(12.5f, LittleTyrant.parseChapterNumber("Cap. 12.5"), 0.01f)
+        assertEquals(3.1f, LittleTyrant.parseChapterNumber("Capitulo 3,1"), 0.01f)
+        assertEquals(-1f, LittleTyrant.parseChapterNumber("Prólogo"), 0.01f)
+    }
+
+    @Test
+    fun test12_mangaIdExtraction() {
+        val html1 = """<link rel='shortlink' href='https://tiraninha.world/?p=5276' />"""
+        val doc1 = Jsoup.parse(html1)
+        val shortlinkId = doc1.selectFirst("link[rel=shortlink]")?.attr("href")?.substringAfter("?p=")?.substringBefore('&')
+        assertEquals("5276", shortlinkId)
+
+        val html2 = """<body class="wp-singular postid-7451 wp-manga-page"></body>"""
+        val doc2 = Jsoup.parse(html2)
+        val postid = doc2.selectFirst("body")?.classNames()?.firstOrNull { it.startsWith("postid-") }?.substringAfter("postid-")
+        assertEquals("7451", postid)
+
+        val html3 = """<button id="btn-load-more-chapters" data-manga-id="2715"></button>"""
+        val doc3 = Jsoup.parse(html3)
+        val dataMangaId = doc3.selectFirst("[data-manga-id]")?.attr("data-manga-id")
+        assertEquals("2715", dataMangaId)
+
+        val html4 = """var manga = {"ajax_url":"https://tiraninha.world/wp-admin/admin-ajax.php","manga_id":"9876"};"""
+        val regex = """(?:["']manga_id["']|manga_id)\s*:\s*["']?(\d+)["']?""".toRegex()
+        val extractedMangaId = regex.find(html4)?.groupValues?.get(1)
+        assertEquals("9876", extractedMangaId)
+    }
+
+    @Test
+    fun test13_dynamicNonceGenerationWhenScriptUsesCryptoRandomValues() {
+        val dynamicScript = """
+            var _themePath = "https:\/\/tiraninha.world\/wp-content\/themes\/madara2".replace(/^https?:\/\/[^\/]+/, '');
+            var _proxyUrls = ["\/wp-content\/themes\/madara2\/image-loader.php?path=1234"];
+            var _nonceBytes = new Uint8Array(24);
+            window.crypto.getRandomValues(_nonceBytes);
+            var _browserNonce = Array.from(_nonceBytes, function(byte) {
+                return byte.toString(16).padStart(2, '0');
+            }).join('');
+        """.trimIndent()
+
+        val nonce = LittleTyrant.extractNonce(dynamicScript)
+        assertNotNull(nonce)
+        assertEquals(48, nonce.length)
+        assertTrue(nonce.all { it in "0123456789abcdef" })
+
+        val headers = LittleTyrant.buildGatekeeperHeaders(
+            okhttp3.Headers.Builder(),
+            nonce,
+            "https://tiraninha.world/manga/test/cap-1/",
+        )
+        assertEquals("lt_browser_nonce=$nonce", headers["Cookie"])
+        assertEquals("tiraninha-web", headers["X-Reader-Sec"])
+    }
+
+    @Test
+    fun test14_cookieParsingAndMerging() {
+        val existing = "cf_clearance=cf123; lt_sec_val=old_val; other=xyz"
+        val parsed = ImageDecoderInterceptor.parseCookies(existing)
+        assertEquals("cf123", parsed["cf_clearance"])
+        assertEquals("old_val", parsed["lt_sec_val"])
+        assertEquals("xyz", parsed["other"])
+
+        val token = "new_token"
+        val nonce = "new_nonce"
+        val merged = ImageDecoderInterceptor.buildCookieHeader(existing, token, nonce)
+        assertEquals("cf_clearance=cf123; lt_sec_val=new_token; other=xyz; lt_browser_nonce=new_nonce", merged)
     }
 }

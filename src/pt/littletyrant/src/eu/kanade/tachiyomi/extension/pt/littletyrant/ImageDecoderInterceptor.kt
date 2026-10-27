@@ -19,11 +19,11 @@ class ImageDecoderInterceptor : Interceptor {
         if (request.url.encodedPath.contains("gatekeeper.php")) {
             val nonce = request.url.queryParameter("browser_nonce")
             val existingCookie = request.header("Cookie")
-            val newCookie = when {
-                existingCookie.isNullOrBlank() -> if (!nonce.isNullOrBlank()) "lt_browser_nonce=$nonce" else ""
-                !existingCookie.contains("lt_browser_nonce") && !nonce.isNullOrBlank() -> "$existingCookie; lt_browser_nonce=$nonce"
-                else -> existingCookie
+            val cookieMap = parseCookies(existingCookie)
+            if (!nonce.isNullOrBlank()) {
+                cookieMap["lt_browser_nonce"] = nonce
             }
+            val newCookie = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
             val newRequest = request.newBuilder()
                 .apply {
                     if (newCookie.isNotBlank()) header("Cookie", newCookie)
@@ -98,6 +98,11 @@ class ImageDecoderInterceptor : Interceptor {
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Site", "same-origin")
+            .apply {
+                if (request.header("Referer").isNullOrBlank()) {
+                    header("Referer", "${url.scheme}://${url.host}/")
+                }
+            }
             .build()
     }
 
@@ -123,18 +128,30 @@ class ImageDecoderInterceptor : Interceptor {
             }.getOrNull()
         }
 
+        internal fun parseCookies(header: String?): MutableMap<String, String> {
+            val map = LinkedHashMap<String, String>()
+            if (header.isNullOrBlank()) return map
+            header.split(";").forEach { part ->
+                val trimmed = part.trim()
+                val idx = trimmed.indexOf('=')
+                if (idx > 0) {
+                    val k = trimmed.substring(0, idx).trim()
+                    val v = trimmed.substring(idx + 1).trim()
+                    map[k] = v
+                }
+            }
+            return map
+        }
+
         internal fun buildCookieHeader(existingCookie: String?, token: String, nonce: String?): String {
-            val parts = mutableListOf<String>()
-            if (!existingCookie.isNullOrBlank()) {
-                parts.add(existingCookie)
+            val cookieMap = parseCookies(existingCookie)
+            if (!nonce.isNullOrBlank()) {
+                cookieMap["lt_browser_nonce"] = nonce
             }
-            if (!nonce.isNullOrBlank() && !parts.any { it.contains("lt_browser_nonce") }) {
-                parts.add("lt_browser_nonce=$nonce")
+            if (token.isNotBlank()) {
+                cookieMap["lt_sec_val"] = token
             }
-            if (!parts.any { it.contains("lt_sec_val") }) {
-                parts.add("lt_sec_val=$token")
-            }
-            return parts.joinToString("; ")
+            return cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
         }
 
         internal fun getKey(token: String): String = token.split(".").getOrNull(1)?.takeIf { it.length >= 20 }?.substring(4, 20)
