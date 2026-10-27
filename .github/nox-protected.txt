@@ -6,6 +6,7 @@ src/all/nhentai
 src/all/pururin
 src/pt/amuy
 src/pt/animexnovel
+src/pt/animy
 src/pt/argoscomics
 src/pt/argosscan
 src/pt/auratoons
@@ -22,6 +23,7 @@ src/pt/geasscomics
 src/pt/hentaifusion
 src/pt/hentaihome
 src/pt/hentaitokyo
+src/pt/hikaricomics
 src/pt/huntersscans
 src/pt/inkscan
 src/pt/instahentai
