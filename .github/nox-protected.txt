@@ -23,6 +23,7 @@ src/pt/geasscomics
 src/pt/hentaifusion
 src/pt/hentaihome
 src/pt/hentaitokyo
+src/pt/hentaitecanet
 src/pt/hikaricomics
 src/pt/huntersscans
 src/pt/inkscan
