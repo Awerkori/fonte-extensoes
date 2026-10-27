@@ -20,6 +20,7 @@ src/pt/dropescan
 src/pt/fliptru
 src/pt/fenixproject
 src/pt/geasscomics
+src/pt/gomangas
 src/pt/hentaifusion
 src/pt/hentaihome
 src/pt/hentaitokyo
