@@ -47,6 +47,7 @@ src/pt/mangasbrasuka
 src/pt/mangastop
 src/pt/mangaverde
 src/pt/manhastro
+src/pt/manhq
 src/pt/megahentai
 src/pt/montetai
 src/pt/mugiwarasoficial
