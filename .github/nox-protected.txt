@@ -38,6 +38,7 @@ src/pt/lycantoons
 src/pt/mangadash
 src/pt/mangalivre
 src/pt/mangalivreblog
+src/pt/mangalivrelat
 src/pt/mangalivreorg
 src/pt/manganyx
 src/pt/mangaonline
