@@ -32,6 +32,7 @@ src/pt/instahentai
 src/pt/jondomingues
 src/pt/kuromangas
 src/pt/leitordemangas
+src/pt/lermangaonline
 src/pt/littletyrant
 src/pt/lycantoons
 src/pt/mangadash
