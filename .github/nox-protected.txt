@@ -67,6 +67,7 @@ src/pt/sexkomix
 src/pt/shadowmanga
 src/pt/shiraiscans
 src/pt/sssscanlator
+src/pt/sukimangas
 src/pt/terceiroz
 src/pt/thehentai
 src/pt/tiamanhwa
