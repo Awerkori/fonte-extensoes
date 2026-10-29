@@ -179,7 +179,7 @@ class PublisherTest(unittest.TestCase):
             contentWarning=index_pb2.CONTENT_WARNING_NSFW,
             resources=index_pb2.Resources(
                 apkUrl=f"https://example.org/tachiyomi-all.koharu-v1.6.0.apk",
-                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/manga-fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
             ),
             sources=[index_pb2.Source(id=1484902275639232927, name="SchaleNetwork", language="all", homeUrl="https://shupogaki.moe")],
         )
@@ -240,7 +240,7 @@ class PublisherTest(unittest.TestCase):
             contentWarning=index_pb2.CONTENT_WARNING_MIXED,
             resources=index_pb2.Resources(
                 apkUrl=f"https://example.org/tachiyomi-en.aryascans-v1.6.57.apk",
-                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/en/brainrotcomics/res/mipmap-xhdpi/ic_launcher.png",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/manga-fonte-extensoes@main/src/en/brainrotcomics/res/mipmap-xhdpi/ic_launcher.png",
             ),
             sources=[index_pb2.Source(id=12345, name="BrainRotComics", language="en", homeUrl="https://brainrot.example")],
         )
@@ -293,7 +293,7 @@ class PublisherTest(unittest.TestCase):
             contentWarning=index_pb2.CONTENT_WARNING_NSFW,
             resources=index_pb2.Resources(
                 apkUrl=f"https://example.org/tachiyomi-all.koharu-v1.6.0.apk",
-                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
+                iconUrl="https://cdn.jsdelivr.net/gh/Awerkori/manga-fonte-extensoes@main/src/all/schalenetwork/res/mipmap-xhdpi/ic_launcher.png",
             ),
             sources=[index_pb2.Source(id=1484902275639232927, name="SchaleNetwork", language="all", homeUrl="https://shupogaki.moe")],
         )

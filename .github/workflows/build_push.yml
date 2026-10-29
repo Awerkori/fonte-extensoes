@@ -108,7 +108,7 @@ jobs:
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "github.repository == 'Awerkori/fonte-extensoes'"
+        if: "github.repository == 'Awerkori/manga-fonte-extensoes'"
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: |
@@ -127,7 +127,7 @@ jobs:
     # Run whenever there is anything to publish (new/changed builds OR deletions)
     if: >-
       always() &&
-      github.repository == 'Awerkori/fonte-extensoes' &&
+      github.repository == 'Awerkori/manga-fonte-extensoes' &&
       needs.prepare.result == 'success' &&
       needs.prepare.outputs.publish_required == 'true' &&
       (
@@ -155,7 +155,7 @@ jobs:
       - name: Checkout repo branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Awerkori/extensoes
+          repository: Awerkori/manga-extensoes
           token: ${{ secrets.SYNC_PAT }}
           ref: repo
           path: repo
@@ -179,8 +179,8 @@ jobs:
             CATALOG_COMMIT=$(git rev-parse HEAD)
             echo "CATALOG_CHANGED=true"
             echo "CATALOG_COMMIT=$CATALOG_COMMIT"
-            curl https://purge.jsdelivr.net/gh/Awerkori/extensoes@repo/index.json
-            curl https://purge.jsdelivr.net/gh/Awerkori/extensoes@repo/index.pb
+            curl https://purge.jsdelivr.net/gh/Awerkori/manga-extensoes@repo/index.json
+            curl https://purge.jsdelivr.net/gh/Awerkori/manga-extensoes@repo/index.pb
           else
             echo "CATALOG_CHANGED=false"
             echo "CATALOG_COMMIT=NONE"

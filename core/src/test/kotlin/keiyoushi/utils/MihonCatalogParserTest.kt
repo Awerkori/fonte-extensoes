@@ -152,7 +152,7 @@ class MihonCatalogParserTest {
     @Test
     fun testNoxPipeline() {
         println("=== TEST NOX PIPELINE ===")
-        val repoJsonBytes = fetch("https://raw.githubusercontent.com/Awerkori/extensoes/repo/repo.json")
+        val repoJsonBytes = fetch("https://raw.githubusercontent.com/Awerkori/manga-extensoes/repo/repo.json")
         val legacyRepo = json.decodeFromString<NetworkLegacyExtensionRepo>(repoJsonBytes.decodeToString())
         println("Nox repo name: ${legacyRepo.meta.name}, index_v2: ${legacyRepo.indexV2}")
         assertNotNull(legacyRepo.indexV2)
@@ -225,7 +225,7 @@ class MihonCatalogParserTest {
     @Test
     fun testAddRepoViaGithubRawPb() {
         println("=== TEST ADD REPO VIA github.com/.../raw/repo/index.pb ===")
-        val store = fetchStore("https://github.com/Awerkori/extensoes/raw/repo/index.pb")
+        val store = fetchStore("https://github.com/Awerkori/manga-extensoes/raw/repo/index.pb")
         println("Fetched store: name=${store.name}, signingKey=${store.signingKey}, exts=${store.extensionList?.extensions?.size}")
         assertNotNull(store.extensionList)
     }
@@ -233,7 +233,7 @@ class MihonCatalogParserTest {
     @Test
     fun testAddRepoViaRawGithubPb() {
         println("=== TEST ADD REPO VIA raw.githubusercontent.com/.../index.pb ===")
-        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/extensoes/repo/index.pb")
+        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/manga-extensoes/repo/index.pb")
         println("Fetched store: name=${store.name}, signingKey=${store.signingKey}, exts=${store.extensionList?.extensions?.size}")
         assertNotNull(store.extensionList)
     }
@@ -241,7 +241,7 @@ class MihonCatalogParserTest {
     @Test
     fun testAddRepoViaRepoJson() {
         println("=== TEST ADD REPO VIA repo.json ===")
-        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/extensoes/repo/repo.json")
+        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/manga-extensoes/repo/repo.json")
         println("Fetched store: name=${store.name}, signingKey=${store.signingKey}, exts=${store.extensionList?.extensions?.size}")
         assertNotNull(store.extensionList)
     }
@@ -249,7 +249,7 @@ class MihonCatalogParserTest {
     @Test
     fun testAddRepoViaIndexMinJson() {
         println("=== TEST ADD REPO VIA index.min.json ===")
-        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/extensoes/repo/index.min.json")
+        val store = fetchStore("https://raw.githubusercontent.com/Awerkori/manga-extensoes/repo/index.min.json")
         println("Fetched store: name=${store.name}, signingKey=${store.signingKey}, exts=${store.extensionList?.extensions?.size}")
         assertNotNull(store.extensionList)
     }

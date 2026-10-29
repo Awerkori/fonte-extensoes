@@ -22,7 +22,7 @@ REPO_DIR = Path.cwd()
 
 SOURCE_DIR = Path(__file__).resolve().parents[2]
 ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
-ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/Awerkori/fonte-extensoes@main"
+ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/Awerkori/manga-fonte-extensoes@main"
 DEFAULT_ICON_URL = f"{ICON_BASE_URL}/core/src/main/{ICON_FILE}"
 RELEASE_BASE_URL = f"https://github.com/{REPO_NAME}/releases/download"
 ASSET_LIMIT = 495  # Actual limit is 1000 but we upload 2 items per extension.
@@ -354,7 +354,7 @@ def main():
         badgeLabel="NOX",
         signingKey="144f44e865cbfae6bde110489ef7ec142f0b1681f627a093a218650e21db5dad",
         contact=index_pb2.Contact(
-            website="https://github.com/Awerkori/fonte-extensoes",
+            website="https://github.com/Awerkori/manga-fonte-extensoes",
         ),
         extensionList=index_pb2.ExtensionList(extensions=final_extensions),
     )
@@ -419,7 +419,7 @@ def main():
             "--title",
             f"Repository Update {tag}",
             "--notes",
-            f"Automated update from Awerkori/fonte-extensoes@{current_sha}",
+            f"Automated update from Awerkori/manga-fonte-extensoes@{current_sha}",
         )
 
 
