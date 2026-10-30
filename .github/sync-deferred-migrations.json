@@ -1,0 +1,10 @@
+{
+  "themes": {
+    "madara": {
+      "units": [
+        "src/pt/yaoifanclub"
+      ],
+      "upstream_ref": "upstream/main"
+    }
+  }
+}
