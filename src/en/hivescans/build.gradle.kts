@@ -7,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Hive Scans"
     pkgName = "en.infernalvoidscans"
-    versionCode = 44
+    versionCode = 45
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
     theme = "iken"
